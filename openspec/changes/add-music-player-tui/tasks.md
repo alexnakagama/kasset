@@ -14,9 +14,9 @@
 
 ## 3. Playback engine
 
-- [ ] 3.1 Implement play-order queue (linear and Fisher–Yates shuffle with current track first) and repeat modes off/all/one; verify unit tests for next/prev, wrap with repeat all, replay with repeat one, stop at end with repeat off, and shuffle visiting every track once
-- [ ] 3.2 Implement `Player` wrapping rodio output stream and sink: play, pause/resume, stop, seek ±5s clamped, volume 0–100% in 5% steps, position, finished detection; verify volume clamping by unit test and playback manually with a local mp3/flac
-- [ ] 3.3 Handle no audio device at startup (clear message, non-zero exit) and decode/open errors (report + skip to next track, stopping if every track fails); verify by playing a deliberately corrupt file and seeing the error and auto-skip, including with repeat one
+- [x] 3.1 Implement play-order queue (linear and Fisher–Yates shuffle with current track first) and repeat modes off/all/one; verify unit tests for next/prev, wrap with repeat all, replay with repeat one, stop at end with repeat off, and shuffle visiting every track once
+- [x] 3.2 Implement `Player` wrapping rodio output stream and sink: play, pause/resume, stop, seek ±5s clamped, volume 0–100% in 5% steps, position, finished detection; verify volume clamping by unit test and playback manually with a local mp3/flac
+- [x] 3.3 Handle no audio device at startup (clear message, non-zero exit) and decode/open errors (report + skip to next track, stopping if every track fails); verify by playing a deliberately corrupt file and seeing the error and auto-skip, including with repeat one
 
 ## 4. Terminal UI
 

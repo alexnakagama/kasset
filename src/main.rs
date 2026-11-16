@@ -2,6 +2,14 @@
 
 mod cli;
 mod library;
+#[allow(dead_code, reason = "driven by the TUI from task group 4")]
+mod playback;
+#[allow(dead_code, reason = "driven by the TUI from task group 4")]
+mod player;
+#[allow(dead_code, reason = "driven by the TUI from task group 4")]
+mod queue;
+#[cfg(test)]
+mod test_support;
 mod text;
 
 use std::process::ExitCode;
@@ -10,6 +18,8 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::Cli;
+use crate::playback::Playback;
+use crate::player::Player;
 use crate::text::display_path;
 
 fn main() -> ExitCode {
@@ -26,6 +36,8 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<()> {
     let root = cli::resolve_root(cli.dir.as_deref())?;
+    // Fail before a potentially long scan when there is nothing to play on.
+    let player = Player::open()?;
     let shown = display_path(&root);
     eprintln!("Scanning {shown}…");
     let library = library::scan(&root)?;
@@ -43,13 +55,14 @@ fn run(cli: &Cli) -> Result<()> {
     if library.truncated {
         eprintln!("kasset: scan stopped early; the folder has too many entries");
     }
-    let tracks = library.tracks;
+    let playback = Playback::new(library.tracks, player);
+    let tracks = playback.tracks();
 
     // Interim output until the TUI lands (task group 4).
     if tracks.is_empty() {
         println!("No music found in {shown}");
     } else {
-        for t in &tracks {
+        for t in tracks {
             let no = t.number.map(|n| format!("{n:>2}. ")).unwrap_or_default();
             println!("{} — {} — {no}{}", t.artist, t.album, t.title);
         }

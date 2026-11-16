@@ -59,6 +59,10 @@ loop:
 - [`sink.get_pos()` drifts slightly after seek on some codecs] → cosmetic only; clamp to duration.
 - [`.opus` not playable] → files are not scanned; documented limitation.
 
+- [Output device lost mid-session (e.g. USB DAC unplugged)] → the stream error is shown as a notice but the device is not reopened; restart `kasset`. Reopening on the next play is a follow-up.
+- [Opening and seeking do blocking file I/O on the UI thread] → fine on local disks; a stalled network mount (NFS/sshfs) can freeze the UI until the I/O returns.
+- [A library entry swapped for a FIFO between scan and play] → only regular files are opened (checked before and after `open`); the small window before `open` could still block. Closing it needs `O_NONBLOCK` via a `libc`/`rustix` dependency.
+
 - [Skip-on-error could loop forever, e.g. repeat one or all with only corrupt files] → a failed track always advances as if repeat were off/all-wrapping once, and playback stops after every track in the order has failed consecutively.
 
 ## Migration Plan
