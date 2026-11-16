@@ -26,7 +26,7 @@ use std::time::SystemTime;
 use crate::library::Track;
 use crate::text::sanitize;
 
-pub use name::{MAX_NAME_BYTES, MAX_NAME_CHARS, NameError, check_new_name, validate_name};
+pub use name::validate_name;
 pub use paths::{Matching, Resolver};
 pub use store::{FsStore, PlaylistInfo, PlaylistStore, SaveOutcome, StoreError};
 
@@ -323,11 +323,6 @@ impl Playlist {
         &self.name
     }
 
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// The folder entries are relative to.
     fn folder(&self) -> &Path {
         self.path.parent().unwrap_or_else(|| Path::new(""))
@@ -340,11 +335,6 @@ impl Playlist {
     /// Returns the reason the playlist is read-only.
     pub const fn editable(&self) -> Result<(), ReadOnlyReason> {
         self.editable
-    }
-
-    #[must_use]
-    pub const fn stamp(&self) -> Option<FileStamp> {
-        self.stamp
     }
 
     /// Library indices of the matched entries, in playlist order (duplicates kept).
@@ -382,6 +372,10 @@ impl Playlist {
     }
 
     /// Line indices of matched entries, i.e. of the rows the user sees.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     fn matched_lines(&self) -> Vec<usize> {
         self.lines
             .iter()
@@ -392,6 +386,10 @@ impl Playlist {
     }
 
     /// The entry at `line` plus the `#EXTINF` right before it, if any.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     fn block(&self, line: usize) -> Range<usize> {
         let start = if line > 0 && self.lines[line - 1].kind == Kind::ExtInf {
             line - 1
@@ -409,6 +407,10 @@ impl Playlist {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     fn has_final_newline(&self) -> bool {
         self.lines.last().is_none_or(|l| l.ending != Ending::None)
     }
@@ -443,6 +445,7 @@ impl Playlist {
         let mut outcome = AddOutcome::default();
         let mut new_lines = Vec::new();
         let folder = self.folder().to_owned();
+        let room = MAX_ENTRIES.saturating_sub(self.entry_count());
 
         for &index in indices {
             let Some(track) = library.get(index) else {
@@ -456,14 +459,16 @@ impl Playlist {
                 outcome.unrepresentable += 1;
                 continue;
             };
+            // Checked as lines are built, so adding a huge selection fails
+            // before building more than the limit allows.
+            if outcome.added >= room {
+                return Err(EditError::TooManyEntries);
+            }
             new_lines.push(Line::new(extinf(track), Kind::ExtInf));
             new_lines.push(Line::new(entry, Kind::Entry(Some(index))));
             outcome.added += 1;
         }
 
-        if self.entry_count().saturating_add(outcome.added) > MAX_ENTRIES {
-            return Err(EditError::TooManyEntries);
-        }
         if outcome.added == 0 {
             return Ok(outcome);
         }
@@ -482,6 +487,10 @@ impl Playlist {
     /// # Errors
     ///
     /// Fails, changing nothing, when the playlist is read-only.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     pub fn remove(&mut self, row: usize) -> Result<bool, EditError> {
         self.check_editable()?;
         let Some(&line) = self.matched_lines().get(row) else {
@@ -502,6 +511,10 @@ impl Playlist {
     /// # Errors
     ///
     /// Fails, changing nothing, when the playlist is read-only.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     pub fn move_entry(&mut self, row: usize, down: bool) -> Result<bool, EditError> {
         self.check_editable()?;
         let matched = self.matched_lines();

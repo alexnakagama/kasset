@@ -6,11 +6,6 @@ mod library;
 mod panic_guard;
 mod playback;
 mod player;
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "wired into the interface in task group 3 of add-playlists"
-)]
 mod playlist;
 mod queue;
 mod terminal;
@@ -29,6 +24,7 @@ use crate::cli::Cli;
 use crate::library::Library;
 use crate::playback::Notice;
 use crate::player::Player;
+use crate::playlist::FsStore;
 use crate::terminal::Exit;
 use crate::text::display_path;
 
@@ -57,7 +53,10 @@ fn run(cli: &Cli) -> Result<Exit> {
     eprintln!("Scanning {shown}…");
     let library = library::scan(&root)?;
     let notice = scan_notice(&library);
-    let mut app = App::new(library.tracks, player, shown, notice);
+    // Playlists live in `<root>/Playlists`; nothing is written there until
+    // the user creates or edits a playlist.
+    let store = Box::new(FsStore::new(&root));
+    let mut app = App::new(library.tracks, player, store, shown, notice);
     terminal::run(&mut app)
 }
 

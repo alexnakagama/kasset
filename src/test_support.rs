@@ -87,3 +87,11 @@ impl crate::player::Audio for SilentAudio {
         None
     }
 }
+
+/// A playlist store over a library root that does not exist: listing finds
+/// nothing and every write fails. For tests that do not involve playlists.
+pub fn no_store() -> Box<dyn crate::playlist::PlaylistStore> {
+    Box::new(crate::playlist::FsStore::new(std::path::Path::new(
+        "/nonexistent/kasset-test-library",
+    )))
+}

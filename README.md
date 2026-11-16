@@ -10,6 +10,8 @@ leaving the terminal.
 - Play, pause, stop, next/previous, seek, volume, automatic advance
 - Shuffle and repeat (off / all / one)
 - Live search with `/` over title, artist and album
+- Playlists saved as `.m3u8` files inside your music folder, playable on
+  their own and readable by other players
 
 ## Requirements
 
@@ -91,6 +93,58 @@ the status bar says how many entries were left out.
 While searching, typed characters go to the query, so letter keys do not act
 as commands until you press `Enter` or `Esc`.
 
+### Playlists
+
+| Key                    | Action                                   |
+| ---------------------- | ---------------------------------------- |
+| `Tab`                  | switch between the library and the playlists; each side keeps its own selection and filter |
+| `a`                    | in the library: add the selected track to a playlist |
+| `A`                    | in the library: add every listed track (after any search) to a playlist |
+| `Enter`                | in the playlists list: open the playlist; in a playlist: play from the selected track |
+| `Esc`                  | in a playlist: clear the filter, then go back to the playlists list |
+
+`a` and `A` open a picker: choose a playlist, or "New playlist…" to type a
+name. Tracks already in the playlist are skipped and the status bar says how
+many. Names may not contain `/ \ : * ? " < > |` or control characters, may
+not start with `.`, are at most 100 characters (and 200 bytes) long and must
+differ from existing playlist names ignoring case.
+
+Playing a track from an open playlist makes that playlist the play order:
+next, previous, automatic advance, shuffle and repeat stay within it. Adding
+tracks to the playlist that is playing extends the play order at once.
+Playing a track from the library makes the whole library the play order
+again. The playing marker shows in an open playlist only when it is the one
+playing.
+
+## Playlists on disk
+
+Playlists are stored as UTF-8 `<name>.m3u8` files in a `Playlists` folder
+directly inside the music folder (for example `~/Music/Playlists/Running.m3u8`).
+The folder is created when the first playlist is saved; other files in it
+(`.m3u`, `.pls`, …) are ignored.
+
+Entries are written as paths relative to the playlist file with `/` as
+separator (`../Band/Album/01 Song.flac`), so the music folder can be moved or
+copied elsewhere — or opened from another machine — and its playlists still
+work, in kasset and in other players such as mpv or VLC. Absolute paths and
+Windows-style `\` separators in playlists written by other programs are read
+too.
+
+Every change is saved immediately and atomically: the file on disk is always
+either the old or the new complete playlist. kasset never overwrites a
+playlist another program changed since kasset read it; it reloads the
+playlist instead and says so. Entries that do not match a track in the
+library (a moved file, a hand-written line) are kept in place, never dropped,
+and reported when the playlist is opened. Comments, a byte order mark,
+Windows line endings, a missing final newline and the file's permission bits
+are kept; a playlist that is a symbolic link stays a link and its target is
+updated.
+
+This is the only place kasset writes to: nothing outside `Playlists/` (or the
+target of a symlinked playlist) is ever modified, and only when you add to or
+create a playlist. Saving writes a dot-prefixed temporary file next to the
+playlist and renames it over the original.
+
 Shuffle plays every track once, in random order, before any repeats; the
 current track stays current when you turn it on. The search filter only
 changes the visible list, not the play order.
@@ -117,8 +171,25 @@ and the last error stays visible.
 
 - **Opus (`.opus`) is not supported**; such files are not listed. The decoder
   used (symphonia) has no Opus support.
-- No playlists (m3u), album art, streaming sources, configuration file, media
-  keys / MPRIS or saved state between runs.
+- No album art, streaming sources, configuration file, media keys / MPRIS or
+  saved state between runs (other than playlists). Only `.m3u8` playlists in
+  the `Playlists` folder are read; `.m3u` and `.pls` files are not.
+- Playlists that are not valid UTF-8, or that are over 16 MiB or 100 000
+  entries, can be opened and played but are read-only.
+- Saving a playlist replaces its file: permission bits are kept and the owner
+  and group are restored when allowed, but extended attributes and ACLs are
+  not kept, and other hard links to the old file no longer share its content.
+- A playlist entry that points to a hard link of a library file (rather than
+  the path the library lists) is shown as not found in the library; it is
+  kept in the file.
+- On filesystems without hard links (FAT, exFAT, some network mounts),
+  creating a playlist checks that the name is free and then renames into
+  place; another program creating the same file in between could be
+  overwritten.
+- Changes made by another program within the same second and keeping the
+  same file size may go unnoticed on filesystems with coarse timestamps.
+- Playlist files are read and written on the UI thread, like audio files, so
+  a stalled network mount can freeze the interface until the I/O returns.
 - No gapless playback, crossfade or equaliser.
 - The library is scanned on every start; very large libraries take longer to
   open. The scan stops at 64 folder levels and 2 million entries.
