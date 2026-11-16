@@ -17,7 +17,7 @@ pub const MAX_TEXT_CHARS: usize = 256;
 ///
 /// ZWNJ (U+200C) and the Mongolian variation selectors are kept: Persian, Indic
 /// and Mongolian text needs them for correct shaping.
-const fn is_invisible_format(c: char) -> bool {
+pub const fn is_invisible_format(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::Metadata;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, Tag};
 use walkdir::WalkDir;
 
+use crate::panic_guard::quietly;
 use crate::text::{display_path, sanitize};
 
 /// File extensions (lower case) the player can decode.
@@ -234,7 +235,7 @@ fn read_tagged(path: &Path) -> Option<TaggedFile> {
     };
     // The closure only touches `path` and owned locals, so no broken invariant
     // can be observed after an unwind. Requires `panic = "unwind"` (Cargo.toml).
-    catch_unwind(AssertUnwindSafe(parse)).ok().flatten()
+    quietly(AssertUnwindSafe(parse)).ok().flatten()
 }
 
 /// All tags of the file, primary tag first.
