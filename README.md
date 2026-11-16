@@ -102,6 +102,10 @@ as commands until you press `Enter` or `Esc`.
 | `A`                    | in the library: add every listed track (after any search) to a playlist |
 | `Enter`                | in the playlists list: open the playlist; in a playlist: play from the selected track |
 | `Esc`                  | in a playlist: clear the filter, then go back to the playlists list |
+| `d`                    | in a playlist: remove the selected entry (only that occurrence) |
+| `J` / `K`              | in a playlist: move the selected entry down / up (not while filtered) |
+| `R`                    | in the playlists list: rename the selected playlist (changing only the letter case is allowed) |
+| `D`                    | in the playlists list: delete the selected playlist after a `y` confirmation; any other key cancels |
 
 `a` and `A` open a picker: choose a playlist, or "New playlist…" to type a
 name. Tracks already in the playlist are skipped and the status bar says how
@@ -109,9 +113,15 @@ many. Names may not contain `/ \ : * ? " < > |` or control characters, may
 not start with `.`, are at most 100 characters (and 200 bytes) long and must
 differ from existing playlist names ignoring case.
 
+Every edit is saved at once. Deleting a playlist removes only its `.m3u8`
+file (for a symlinked playlist, only the link), never a song.
+
 Playing a track from an open playlist makes that playlist the play order:
 next, previous, automatic advance, shuffle and repeat stay within it. Adding
-tracks to the playlist that is playing extends the play order at once.
+tracks to the playlist that is playing extends the play order at once, and
+so do removing and moving its entries. Removing the track that is playing
+lets it finish, then goes on with the entry that followed it. Renaming or
+deleting the playing playlist does not interrupt playback.
 Playing a track from the library makes the whole library the play order
 again. The playing marker shows in an open playlist only when it is the one
 playing.
@@ -141,8 +151,8 @@ are kept; a playlist that is a symbolic link stays a link and its target is
 updated.
 
 This is the only place kasset writes to: nothing outside `Playlists/` (or the
-target of a symlinked playlist) is ever modified, and only when you add to or
-create a playlist. Saving writes a dot-prefixed temporary file next to the
+target of a symlinked playlist) is ever modified, and only when you create,
+edit, rename or delete a playlist. Saving writes a dot-prefixed temporary file next to the
 playlist and renames it over the original.
 
 Shuffle plays every track once, in random order, before any repeats; the
@@ -175,7 +185,8 @@ and the last error stays visible.
   saved state between runs (other than playlists). Only `.m3u8` playlists in
   the `Playlists` folder are read; `.m3u` and `.pls` files are not.
 - Playlists that are not valid UTF-8, or that are over 16 MiB or 100 000
-  entries, can be opened and played but are read-only.
+  entries, can be opened and played but are read-only: entries cannot be
+  added, removed or moved (the file can still be renamed or deleted).
 - Saving a playlist replaces its file: permission bits are kept and the owner
   and group are restored when allowed, but extended attributes and ACLs are
   not kept, and other hard links to the old file no longer share its content.
@@ -183,9 +194,9 @@ and the last error stays visible.
   the path the library lists) is shown as not found in the library; it is
   kept in the file.
 - On filesystems without hard links (FAT, exFAT, some network mounts),
-  creating a playlist checks that the name is free and then renames into
-  place; another program creating the same file in between could be
-  overwritten.
+  creating or renaming a playlist checks that the name is free and then
+  renames into place; another program creating the same file in between
+  could be overwritten.
 - Changes made by another program within the same second and keeping the
   same file size may go unnoticed on filesystems with coarse timestamps.
 - Playlist files are read and written on the UI thread, like audio files, so

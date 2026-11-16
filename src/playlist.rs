@@ -372,10 +372,6 @@ impl Playlist {
     }
 
     /// Line indices of matched entries, i.e. of the rows the user sees.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     fn matched_lines(&self) -> Vec<usize> {
         self.lines
             .iter()
@@ -386,10 +382,6 @@ impl Playlist {
     }
 
     /// The entry at `line` plus the `#EXTINF` right before it, if any.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     fn block(&self, line: usize) -> Range<usize> {
         let start = if line > 0 && self.lines[line - 1].kind == Kind::ExtInf {
             line - 1
@@ -407,10 +399,6 @@ impl Playlist {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     fn has_final_newline(&self) -> bool {
         self.lines.last().is_none_or(|l| l.ending != Ending::None)
     }
@@ -487,10 +475,6 @@ impl Playlist {
     /// # Errors
     ///
     /// Fails, changing nothing, when the playlist is read-only.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     pub fn remove(&mut self, row: usize) -> Result<bool, EditError> {
         self.check_editable()?;
         let Some(&line) = self.matched_lines().get(row) else {
@@ -511,10 +495,6 @@ impl Playlist {
     /// # Errors
     ///
     /// Fails, changing nothing, when the playlist is read-only.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     pub fn move_entry(&mut self, row: usize, down: bool) -> Result<bool, EditError> {
         self.check_editable()?;
         let matched = self.matched_lines();

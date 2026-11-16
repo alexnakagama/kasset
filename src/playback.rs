@@ -60,16 +60,8 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {
     /// The entry at this position was removed.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     Remove(usize),
     /// The entry at `from` was moved to `to`.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     Move { from: usize, to: usize },
     /// These tracks were added at the end.
     Append(Vec<usize>),
@@ -563,10 +555,6 @@ impl<A: Audio> Playback<A> {
     }
 
     /// Follows a rename of playlist `old` to `new` if it is the one playing.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     pub fn playlist_renamed(&mut self, old: &str, new: &str) {
         if self.is_playing_playlist(old) {
             self.source = Source::Playlist(new.to_owned());

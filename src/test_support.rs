@@ -38,13 +38,19 @@ pub fn track(title: &str, artist: &str, album: &str) -> crate::library::Track {
 }
 
 /// An audio output that plays nothing: loads succeed (unless `broken`) and
-/// the position is whatever the test sets.
+/// the position is whatever the test sets. Setting `ended` makes the loaded
+/// track end (until the next load).
 #[derive(Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent switches each test sets directly"
+)]
 pub struct SilentAudio {
     pub loaded: bool,
     pub broken: bool,
     pub paused: bool,
     pub position: std::time::Duration,
+    pub ended: bool,
 }
 
 impl crate::player::Audio for SilentAudio {
@@ -58,6 +64,7 @@ impl crate::player::Audio for SilentAudio {
             anyhow::bail!("not a playable audio file");
         }
         self.loaded = true;
+        self.ended = false;
         self.paused = paused;
         self.position = start;
         Ok(())
@@ -77,7 +84,9 @@ impl crate::player::Audio for SilentAudio {
         None
     }
     fn status(&self) -> crate::player::Status {
-        if self.loaded {
+        if self.loaded && self.ended {
+            crate::player::Status::Ended
+        } else if self.loaded {
             crate::player::Status::Active
         } else {
             crate::player::Status::Idle

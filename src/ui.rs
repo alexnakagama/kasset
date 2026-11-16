@@ -28,14 +28,18 @@ const NOW_PLAYING_HEIGHT: u16 = 6;
 const KEYS_LIBRARY: &str = "Enter play · Space pause · s stop · n/p next/prev · ←/→ seek · \
                             +/- volume · z shuffle · r repeat · / search · \
                             a/A add to playlist · Tab playlists · q quit";
-const KEYS_PLAYLISTS: &str = "Enter open · / search · Tab library · Space pause · s stop · \
-                              n/p next/prev · ←/→ seek · +/- volume · z shuffle · r repeat · q quit";
-const KEYS_PLAYLIST: &str = "Enter play · Esc back · / search · Tab library · Space pause · \
-                             s stop · n/p next/prev · ←/→ seek · +/- volume · z shuffle · \
-                             r repeat · q quit";
+const KEYS_PLAYLISTS: &str = "Enter open · R rename · D delete · / search · Tab library · \
+                              Space pause · s stop · n/p next/prev · ←/→ seek · +/- volume · \
+                              z shuffle · r repeat · q quit";
+// The edit keys come first: the bar is cut at the terminal's width.
+const KEYS_PLAYLIST: &str = "Enter play · d remove · J/K move · Esc back · / search · \
+                             Tab library · Space pause · s stop · n/p next/prev · ←/→ seek · \
+                             +/- volume · z shuffle · r repeat · q quit";
 const KEYS_SEARCH: &str = "type to filter · Enter keep · Esc clear · ↑/↓ move · Ctrl+C quit";
 const KEYS_PICKER: &str = "↑/↓ choose · Enter add · Esc cancel";
 const KEYS_NAME: &str = "type a name · Enter create · Esc cancel";
+const KEYS_RENAME: &str = "type a name · Enter rename · Esc cancel";
+const KEYS_CONFIRM: &str = "y delete · any other key cancel";
 
 /// Start of the library title, before the library root.
 const TITLE_PREFIX: &str = " kasset · ";
@@ -122,7 +126,11 @@ fn key_help<A: Audio>(app: &App<A>) -> &'static str {
     match app.mode() {
         Mode::Search => KEYS_SEARCH,
         Mode::Picker(_) => KEYS_PICKER,
-        Mode::NameInput(_) => KEYS_NAME,
+        Mode::NameInput(input) => match input.purpose() {
+            NamePurpose::Create(_) => KEYS_NAME,
+            NamePurpose::Rename(_) => KEYS_RENAME,
+        },
+        Mode::ConfirmDelete(_) => KEYS_CONFIRM,
         Mode::Normal => match app.view() {
             Screen::Library => KEYS_LIBRARY,
             Screen::Playlists => KEYS_PLAYLISTS,
@@ -153,6 +161,7 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
     match app.mode() {
         Mode::Picker(picker) => render_picker(frame, picker, list),
         Mode::NameInput(input) => render_name_input(frame, input, list),
+        Mode::ConfirmDelete(name) => render_confirm_delete(frame, name, list),
         Mode::Normal | Mode::Search => {}
     }
 }
@@ -469,8 +478,9 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
 }
 
 fn render_name_input(frame: &mut Frame, input: &NameInput, area: Rect) {
-    let title = match input.purpose() {
-        NamePurpose::Create(_) => " New playlist ",
+    let (title, hint) = match input.purpose() {
+        NamePurpose::Create(_) => (" New playlist ", "Enter to create, Esc to cancel"),
+        NamePurpose::Rename(_) => (" Rename playlist ", "Enter to rename, Esc to cancel"),
     };
     let popup = centered(area, POPUP_MAX_WIDTH, 4);
     let block = Block::bordered()
@@ -491,10 +501,30 @@ fn render_name_input(frame: &mut Frame, input: &NameInput, area: Rect) {
         frame.set_cursor_position(Position::new(x.min(text_line.right() - 1), text_line.y));
     }
     let message = input.error().map_or_else(
-        || Line::from("Enter to create, Esc to cancel").dark_gray(),
+        || Line::from(hint).dark_gray(),
         |error| Line::styled(error, Style::new().fg(Color::Red)),
     );
     frame.render_widget(message, message_line);
+}
+
+/// The "delete playlist?" question.
+fn render_confirm_delete(frame: &mut Frame, name: &str, area: Rect) {
+    let popup = centered(area, POPUP_MAX_WIDTH, 4);
+    let block = Block::bordered()
+        .padding(Padding::horizontal(1))
+        .title(" Delete playlist ".bold());
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let [question_line, hint_line] = Layout::vertical([Constraint::Length(1); 2]).areas(inner);
+    // `Delete "` and `"?` around the name, which is cut to fit.
+    let room = usize::from(question_line.width).saturating_sub(10);
+    let question = format!("Delete \"{}\"?", elide_end(&shown_name(name), room));
+    frame.render_widget(Line::from(question), question_line);
+    frame.render_widget(
+        Line::from("y deletes the file (songs stay), other keys cancel").dark_gray(),
+        hint_line,
+    );
 }
 
 /// The first row to show so that `selected` is on screen, moving the previous
@@ -1049,7 +1079,7 @@ mod tests {
         assert!(screen_contains(&screen, "▶ B"), "{screen:#?}");
         assert!(!screen_contains(&screen, "▶ C"), "{screen:#?}");
         assert!(
-            screen[19].starts_with("Enter play · Esc back"),
+            screen[19].starts_with("Enter play · d remove · J/K move · Esc back"),
             "{screen:#?}"
         );
 
@@ -1087,6 +1117,67 @@ mod tests {
         let screen = draw(&app, &mut View::default(), 200, 20);
         assert!(screen[19].contains("a/A add to playlist"), "{screen:#?}");
         assert!(screen[19].contains("Tab playlists"), "{screen:#?}");
+    }
+
+    #[test]
+    fn open_playlist_help_bar_shows_the_edit_keys() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        keys(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+        // Narrow enough that the bar is cut: the edit keys come first.
+        let screen = draw(&app, &mut View::default(), 50, 20);
+        let bar = &screen[19];
+        assert!(bar.contains("d remove"), "{screen:#?}");
+        assert!(bar.contains("J/K move"), "{screen:#?}");
+        assert!(bar.contains("Esc back"), "{screen:#?}");
+
+        press(&mut app, KeyCode::Esc);
+        let screen = draw(&app, &mut View::default(), 200, 20);
+        assert!(screen[19].contains("R rename"), "{screen:#?}");
+        assert!(screen[19].contains("D delete"), "{screen:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn rename_prompt_is_prefilled_and_titled() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        keys(&mut app, &[KeyCode::Tab, KeyCode::Down]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        let screen = draw(&app, &mut View::default(), 80, 24);
+        assert!(screen_contains(&screen, " Rename playlist "), "{screen:#?}");
+        assert!(
+            screen_contains(&screen, "│ Running"),
+            "prefilled: {screen:#?}"
+        );
+        assert!(
+            screen_contains(&screen, "Enter to rename, Esc to cancel"),
+            "{screen:#?}"
+        );
+        assert!(
+            screen
+                .last()
+                .is_some_and(|l| l.starts_with("type a name · Enter rename")),
+            "{screen:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delete_confirmation_names_the_playlist() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        keys(&mut app, &[KeyCode::Tab]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        let screen = draw(&app, &mut View::default(), 80, 24);
+        assert!(screen_contains(&screen, " Delete playlist "), "{screen:#?}");
+        assert!(screen_contains(&screen, "Delete \"Gym\"?"), "{screen:#?}");
+        assert!(screen_contains(&screen, "y deletes"), "{screen:#?}");
+        assert!(
+            screen.last().is_some_and(|l| l.starts_with("y delete")),
+            "{screen:#?}"
+        );
+        for (w, h) in [(0, 0), (1, 1), (2, 3), (10, 5), (80, 4), (5, 80), (300, 2)] {
+            draw(&app, &mut View::default(), w, h);
+        }
+        Ok(())
     }
 
     #[test]
