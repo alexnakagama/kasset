@@ -40,6 +40,43 @@ impl PlayState {
     }
 }
 
+/// Where the play order comes from; compared by the interface to decide
+/// whether an open playlist is the one playing.
+#[allow(
+    dead_code,
+    reason = "used by the playlist views in task group 3 of add-playlists"
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Source {
+    /// The whole library, in library order.
+    #[default]
+    Library,
+    /// The saved playlist with this name.
+    Playlist(String),
+    /// A playlist that was deleted while playing: its play order keeps
+    /// going, but it no longer belongs to any playlist.
+    Detached,
+}
+
+/// A change to the list of the playlist that is playing, forwarded with
+/// [`Playback::edit_playlist`]. Positions are item positions (the
+/// playlist's matched entries, in file order); tracks are library indices.
+#[allow(
+    dead_code,
+    reason = "used by the playlist views in task group 3 of add-playlists"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edit {
+    /// The entry at this position was removed.
+    Remove(usize),
+    /// The entry at `from` was moved to `to`.
+    Move { from: usize, to: usize },
+    /// These tracks were added at the end.
+    Append(Vec<usize>),
+    /// The playlist was reloaded and now holds these tracks.
+    Replace(Vec<usize>),
+}
+
 /// How serious a [`Notice`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -79,6 +116,8 @@ pub struct Playback<A: Audio> {
     tracks: Vec<Track>,
     audio: A,
     queue: Queue,
+    /// What `queue` plays: the library or a playlist.
+    source: Source,
     state: PlayState,
     volume: Volume,
     /// Tracks that failed in a row; reset as soon as one plays.
@@ -100,6 +139,7 @@ impl<A: Audio> Playback<A> {
         audio.set_volume(volume);
         Self {
             queue: Queue::new(tracks.len()),
+            source: Source::Library,
             tracks,
             audio,
             state: PlayState::Stopped,
@@ -190,8 +230,17 @@ impl<A: Audio> Playback<A> {
         self.stop_reason.as_ref()
     }
 
-    /// Plays library track `track` from the start, replacing the current one.
+    /// Plays library track `track` from the start, replacing the current one,
+    /// with the whole library as the play order. Out-of-range indices are
+    /// ignored.
     pub fn play(&mut self, track: usize) {
+        if track >= self.tracks.len() {
+            return;
+        }
+        if self.source != Source::Library {
+            self.queue.reset((0..self.tracks.len()).collect());
+            self.source = Source::Library;
+        }
         if self.queue.select(track, &mut rand::rng()) {
             self.failures = 0;
             self.start_current(false);
@@ -339,6 +388,11 @@ impl<A: Audio> Playback<A> {
         }
     }
 
+    /// Whether every entry of `tracks` is a library index.
+    fn valid_tracks(&self, tracks: &[usize]) -> bool {
+        tracks.iter().all(|&t| t < self.tracks.len())
+    }
+
     fn set_volume(&mut self, volume: Volume) {
         self.volume = volume;
         self.audio.set_volume(volume);
@@ -415,7 +469,12 @@ impl<A: Audio> Playback<A> {
     /// or every track in the order failed in a row.
     fn record_failure(&mut self, why: &str) -> bool {
         self.audio.stop();
-        self.failures += 1;
+        // `failures` counts tracks of the play order; a removed track that is
+        // still current is not one of them, so its failure must not use up
+        // an attempt meant for the tracks still in the order.
+        if !self.queue.is_detached() {
+            self.failures += 1;
+        }
         let name = self.current_track().map_or_else(String::new, file_name);
         let mut notice = Notice::error(format!("Cannot play '{name}': {why}"));
 
@@ -430,6 +489,95 @@ impl<A: Audio> Playback<A> {
         }
         self.notice = Some(notice);
         more
+    }
+}
+
+/// Playlists as the play order.
+#[allow(
+    dead_code,
+    reason = "used by the playlist views in task group 3 of add-playlists"
+)]
+impl<A: Audio> Playback<A> {
+    /// Where the play order comes from.
+    #[must_use]
+    pub const fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// Position of the current track in the source's list (for a playlist,
+    /// the index among its matched entries), or `None` when nothing is
+    /// current or the current entry was removed from the list.
+    #[must_use]
+    pub fn current_item(&self) -> Option<usize> {
+        self.queue.current_item()
+    }
+
+    /// Makes `items` (library indices, duplicates allowed) the play order,
+    /// coming from `source`, and plays the item at position `start` from the
+    /// beginning. Shuffle and repeat stay as they are. Returns `false` and
+    /// changes nothing when `start` is out of range or an item is not a
+    /// library index.
+    pub fn play_source(&mut self, source: Source, items: Vec<usize>, start: usize) -> bool {
+        if start >= items.len() || !self.valid_tracks(&items) {
+            return false;
+        }
+        self.queue.reset(items);
+        self.source = source;
+        if self.queue.select(start, &mut rand::rng()) {
+            self.failures = 0;
+            self.start_current(false);
+        }
+        true
+    }
+
+    /// Applies a change made to playlist `name` to the play order, if that
+    /// playlist is the one playing; the current track keeps playing. Returns
+    /// whether the play order changed. Edits with out-of-range positions or
+    /// invalid library indices are ignored (and return `false`).
+    pub fn edit_playlist(&mut self, name: &str, edit: Edit) -> bool {
+        if !self.is_playing_playlist(name) {
+            return false;
+        }
+        match edit {
+            Edit::Remove(item) => self.queue.remove_item(item),
+            Edit::Move { from, to } => self.queue.move_item(from, to),
+            Edit::Append(tracks) => {
+                if !self.valid_tracks(&tracks) {
+                    return false;
+                }
+                self.queue.append_items(&tracks, &mut rand::rng());
+                true
+            }
+            Edit::Replace(tracks) => {
+                if !self.valid_tracks(&tracks) {
+                    return false;
+                }
+                self.queue.replace_items(tracks, &mut rand::rng());
+                true
+            }
+        }
+    }
+
+    /// Follows a rename of playlist `old` to `new` if it is the one playing.
+    pub fn playlist_renamed(&mut self, old: &str, new: &str) {
+        if self.is_playing_playlist(old) {
+            self.source = Source::Playlist(new.to_owned());
+        }
+    }
+
+    /// Follows the deletion of playlist `name`: if it is the one playing,
+    /// playback goes on through its play order, now detached from any
+    /// playlist.
+    pub fn playlist_deleted(&mut self, name: &str) {
+        if self.is_playing_playlist(name) {
+            self.source = Source::Detached;
+        }
+    }
+
+    /// Whether playlist `name` is the play order.
+    #[must_use]
+    pub fn is_playing_playlist(&self, name: &str) -> bool {
+        matches!(&self.source, Source::Playlist(playing) if playing == name)
     }
 }
 
@@ -1043,5 +1191,335 @@ mod tests {
         assert_eq!(clock(Duration::ZERO), "0:00");
         assert_eq!(clock(Duration::from_millis(65_900)), "1:05");
         assert_eq!(clock(secs(4_503)), "75:03");
+    }
+
+    // ---- Playlists as the play order ----
+
+    fn running() -> Source {
+        Source::Playlist("Running".to_owned())
+    }
+
+    /// Ends the current track and lets playback react.
+    fn end_track(p: &mut Playback<FakeAudio>) {
+        p.audio.status = Some(Status::Ended);
+        p.tick();
+    }
+
+    #[test]
+    fn playlist_advance_stops_at_its_end() {
+        let mut p = playback(6, &[]);
+        assert!(p.play_source(running(), vec![4, 1, 3], 1));
+        assert_eq!(p.source(), &running());
+        assert_eq!(p.current(), Some(1));
+        assert_eq!(p.current_item(), Some(1));
+        end_track(&mut p);
+        assert_eq!(
+            p.current(),
+            Some(3),
+            "next in the playlist, not the library"
+        );
+        end_track(&mut p);
+        assert_eq!(p.state(), PlayState::Stopped, "repeat off stops at its end");
+        assert_eq!(p.current(), Some(3));
+    }
+
+    #[test]
+    fn playlist_wraps_with_repeat_all() {
+        let mut p = playback(6, &[]);
+        set_repeat(&mut p, Repeat::All);
+        p.play_source(running(), vec![4, 1, 3], 2);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(4));
+        assert_eq!(p.current_item(), Some(0));
+        p.audio.position = secs(1);
+        p.prev();
+        assert_eq!(p.current(), Some(3), "previous wraps within the playlist");
+    }
+
+    #[test]
+    fn failure_skip_stays_within_playlist() {
+        let mut p = playback(6, &[1]);
+        p.play_source(running(), vec![4, 1, 3], 1);
+        assert_eq!(p.current(), Some(3), "skips 1 to the next playlist entry");
+        assert_eq!(p.state(), PlayState::Playing);
+
+        let mut p = playback(6, &[0, 5]);
+        set_repeat(&mut p, Repeat::All);
+        p.play_source(running(), vec![0, 5], 0);
+        assert_eq!(
+            p.state(),
+            PlayState::Stopped,
+            "playable library tracks are not used"
+        );
+        assert!(
+            p.stop_reason()
+                .is_some_and(|n| n.text.contains("no playable tracks"))
+        );
+        assert!(
+            p.audio
+                .loads
+                .iter()
+                .all(|(path_, ..)| [path(0), path(5)].contains(path_))
+        );
+    }
+
+    #[test]
+    fn playing_from_library_restores_library_order() {
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![4, 1], 0);
+        p.play(2);
+        assert_eq!(p.source(), &Source::Library);
+        assert_eq!(p.current_item(), Some(2));
+        p.next();
+        assert_eq!(p.current(), Some(3));
+        p.audio.position = secs(1);
+        p.prev();
+        p.prev();
+        assert_eq!(p.current(), Some(1));
+    }
+
+    #[test]
+    fn shuffle_and_repeat_survive_a_source_change() {
+        let mut p = playback(10, &[]);
+        set_repeat(&mut p, Repeat::One);
+        p.toggle_shuffle();
+        p.play_source(running(), vec![7, 8, 9], 1);
+        assert!(p.shuffle());
+        assert_eq!(p.repeat(), Repeat::One);
+        assert_eq!(p.current(), Some(8), "the chosen entry plays first");
+        p.play(3);
+        assert!(p.shuffle());
+        assert_eq!(p.current(), Some(3));
+    }
+
+    #[test]
+    fn invalid_sources_are_refused() {
+        let mut p = playback(3, &[]);
+        p.play(0);
+        assert!(
+            !p.play_source(running(), vec![1, 2], 2),
+            "start out of range"
+        );
+        assert!(!p.play_source(running(), vec![], 0), "empty");
+        assert!(
+            !p.play_source(running(), vec![1, 3], 0),
+            "not a library index"
+        );
+        assert_eq!(p.source(), &Source::Library);
+        assert_eq!(p.current(), Some(0));
+        assert_eq!(p.audio.loads.len(), 1);
+    }
+
+    #[test]
+    fn edits_apply_only_to_the_playing_playlist() {
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1, 2], 0);
+        assert!(!p.edit_playlist("Gym", Edit::Remove(1)));
+        assert!(
+            !p.edit_playlist("running", Edit::Remove(1)),
+            "names are exact"
+        );
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(1));
+
+        let mut p = playback(6, &[]);
+        p.play(0);
+        assert!(
+            !p.edit_playlist("Running", Edit::Remove(0)),
+            "library is playing"
+        );
+        assert_eq!(p.current_item(), Some(0));
+    }
+
+    #[test]
+    fn removing_playing_entry_lets_it_finish() {
+        // A, B, C = 0, 1, 2; B plays and is removed.
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1, 2], 1);
+        let loads = p.audio.loads.len();
+        assert!(p.edit_playlist("Running", Edit::Remove(1)));
+        assert_eq!(p.current(), Some(1), "B keeps playing");
+        assert_eq!(p.current_item(), None, "no entry has the playing marker");
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.audio.loads.len(), loads, "not restarted");
+        p.tick();
+        assert_eq!(p.current(), Some(1));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(2), "C plays when B ends");
+        assert_eq!(p.current_item(), Some(1));
+    }
+
+    #[test]
+    fn removed_playing_entry_with_repeat_one() {
+        let mut p = playback(6, &[]);
+        set_repeat(&mut p, Repeat::One);
+        p.play_source(running(), vec![0, 1, 2], 1);
+        p.edit_playlist("Running", Edit::Remove(1));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(2));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(2), "then C repeats");
+    }
+
+    #[test]
+    fn removed_last_entry_stops_or_wraps() {
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1, 2], 2);
+        p.edit_playlist("Running", Edit::Remove(2));
+        end_track(&mut p);
+        assert_eq!(p.state(), PlayState::Stopped);
+
+        let mut p = playback(6, &[]);
+        set_repeat(&mut p, Repeat::All);
+        p.play_source(running(), vec![0, 1, 2], 2);
+        p.edit_playlist("Running", Edit::Remove(2));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(0));
+        assert_eq!(p.state(), PlayState::Playing);
+    }
+
+    #[test]
+    fn previous_after_removal_goes_to_preceding_entry() {
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1, 2], 1);
+        p.audio.position = secs(2);
+        p.edit_playlist("Running", Edit::Remove(1));
+        p.prev();
+        assert_eq!(p.current(), Some(0));
+        assert_eq!(
+            p.audio.loads.last(),
+            Some(&(path(0), Duration::ZERO, false))
+        );
+
+        // Later than the restart threshold, the removed track restarts.
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1, 2], 1);
+        p.audio.position = secs(30);
+        p.edit_playlist("Running", Edit::Remove(1));
+        p.prev();
+        assert_eq!(p.current(), Some(1));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(2), "and still moves on to C");
+    }
+
+    #[test]
+    fn failing_removed_track_does_not_use_up_an_attempt() {
+        // D (5) is removed while it is being retried; X (1) fails too, Y (2)
+        // plays. Each of the three must be tried before giving up.
+        let n = MAX_ATTEMPTS_PER_CALL + 5;
+        let mut p = playback(n, &[]);
+        set_repeat(&mut p, Repeat::All);
+        p.play_source(running(), vec![5, 1, 2], 0);
+        p.edit_playlist("Running", Edit::Remove(0));
+        assert!(p.queue.is_detached());
+        p.audio.broken.extend([path(5), path(1)]);
+        p.audio.status = Some(Status::Failed("bad data".to_owned()));
+        p.tick();
+        assert_eq!(p.current(), Some(2), "Y is reached");
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.audio.loaded, Some(path(2)));
+
+        // All three failing still stops, and says so.
+        let mut p = playback(n, &[]);
+        set_repeat(&mut p, Repeat::All);
+        p.play_source(running(), vec![5, 1, 2], 0);
+        p.edit_playlist("Running", Edit::Remove(0));
+        p.audio.broken.extend([path(5), path(1), path(2)]);
+        p.audio.status = Some(Status::Failed("bad data".to_owned()));
+        p.tick();
+        assert_eq!(p.state(), PlayState::Stopped);
+        assert!(
+            p.stop_reason()
+                .is_some_and(|n| n.text.contains("no playable tracks"))
+        );
+        let tried: Vec<_> = p
+            .audio
+            .loads
+            .iter()
+            .skip(1)
+            .map(|(l, ..)| l.clone())
+            .collect();
+        assert_eq!(tried, [path(1), path(2)], "each tried once, no extra round");
+    }
+
+    #[test]
+    fn reorder_while_playing() {
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1, 2], 0);
+        assert!(p.edit_playlist("Running", Edit::Move { from: 2, to: 1 }));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(2), "C plays after A");
+        assert!(!p.edit_playlist("Running", Edit::Move { from: 0, to: 3 }));
+    }
+
+    #[test]
+    fn appended_tracks_play_next() {
+        // Running lists A, B; B plays; D is added from the library.
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1], 1);
+        assert!(p.edit_playlist("Running", Edit::Append(vec![3])));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(3), "D plays when B ends");
+        assert!(
+            !p.edit_playlist("Running", Edit::Append(vec![6])),
+            "not a library index"
+        );
+        end_track(&mut p);
+        assert_eq!(
+            p.state(),
+            PlayState::Stopped,
+            "the bad append changed nothing"
+        );
+    }
+
+    #[test]
+    fn reload_keeps_playing_track() {
+        // Running plays B; the file is changed to A, B, X.
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1], 1);
+        let loads = p.audio.loads.len();
+        assert!(p.edit_playlist("Running", Edit::Replace(vec![0, 1, 5])));
+        assert_eq!(p.current(), Some(1));
+        assert_eq!(p.audio.loads.len(), loads, "B is not restarted");
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(5), "X plays when B ends");
+        assert!(!p.edit_playlist("Running", Edit::Replace(vec![9])));
+        assert_eq!(p.current(), Some(5));
+    }
+
+    #[test]
+    fn rename_follows_and_delete_detaches() {
+        let mut p = playback(6, &[]);
+        p.play_source(running(), vec![0, 1, 2], 0);
+        p.playlist_renamed("Gym", "Other");
+        assert_eq!(p.source(), &running());
+        p.playlist_renamed("Running", "Morning run");
+        assert_eq!(p.source(), &Source::Playlist("Morning run".to_owned()));
+        assert!(p.is_playing_playlist("Morning run"));
+        assert!(!p.edit_playlist("Running", Edit::Remove(2)));
+        assert!(p.edit_playlist("Morning run", Edit::Remove(2)));
+        assert_eq!(p.state(), PlayState::Playing);
+
+        p.playlist_deleted("Gym");
+        assert!(p.is_playing_playlist("Morning run"));
+        p.playlist_deleted("Morning run");
+        assert_eq!(p.source(), &Source::Detached);
+        assert!(!p.edit_playlist("Morning run", Edit::Remove(0)));
+        assert_eq!(p.state(), PlayState::Playing, "playback is not interrupted");
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(1), "its play order keeps going");
+        end_track(&mut p);
+        assert_eq!(p.state(), PlayState::Stopped);
+    }
+
+    #[test]
+    fn library_play_after_detached_source_restores_library() {
+        let mut p = playback(4, &[]);
+        p.play_source(running(), vec![3], 0);
+        p.playlist_deleted("Running");
+        p.play(0);
+        assert_eq!(p.source(), &Source::Library);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(1));
     }
 }
