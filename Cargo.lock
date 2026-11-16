@@ -932,6 +932,8 @@ dependencies = [
  "rand 0.10.4",
  "ratatui",
  "rodio",
+ "rustix",
+ "signal-hook",
  "tempfile",
  "walkdir",
 ]

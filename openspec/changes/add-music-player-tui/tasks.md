@@ -20,11 +20,11 @@
 
 ## 4. Terminal UI
 
-- [ ] 4.1 Implement terminal setup/teardown with panic hook restoring the terminal; verify that `q`, Ctrl+C and a forced panic all leave the shell usable
-- [ ] 4.2 Implement the event loop (250 ms poll, tick for auto-advance, resize redraw); verify elapsed time advances each second and auto-advance plays the next track
-- [ ] 4.3 Render layout: track list with selected vs playing markers, now-playing panel, progress gauge with `m:ss / m:ss`, volume/shuffle/repeat indicators, keybinding bar, status message area, empty-library message; verify visually in a terminal and with a ratatui `TestBackend` render test for the empty-library message
-- [ ] 4.4 Implement key handling for navigation (↑↓/jk, PgUp/PgDn, g/G/Home/End) and transport keys (Enter, Space, s, n, p, ←/→, +/-, z, r, q); verify unit tests on `App::handle_key` for selection movement and manually for transport keys
-- [ ] 4.5 Implement `/` search mode with live case-insensitive filtering on title/artist/album, Enter to keep, Esc to clear; verify unit test that filtering "beat" keeps only matching tracks
+- [x] 4.1 Implement terminal setup/teardown with panic hook restoring the terminal; verify that `q`, Ctrl+C and a forced panic all leave the shell usable
+- [x] 4.2 Implement the event loop (250 ms poll, tick for auto-advance, resize redraw); verify elapsed time advances each second and auto-advance plays the next track
+- [x] 4.3 Render layout: track list with selected vs playing markers, now-playing panel, progress gauge with `m:ss / m:ss`, volume/shuffle/repeat indicators, keybinding bar, status message area, empty-library message; verify visually in a terminal and with a ratatui `TestBackend` render test for the empty-library message
+- [x] 4.4 Implement key handling for navigation (↑↓/jk, PgUp/PgDn, g/G/Home/End) and transport keys (Enter, Space, s, n, p, ←/→, +/-, z, r, q); verify unit tests on `App::handle_key` for selection movement and manually for transport keys
+- [x] 4.5 Implement `/` search mode with live case-insensitive filtering on title/artist/album, Enter to keep, Esc to clear; verify unit test that filtering "beat" keeps only matching tracks
 
 ## 5. Docs and integration
 

@@ -108,6 +108,7 @@ impl Queue {
     }
 
     /// The play order as library indices.
+    #[cfg(test)]
     #[must_use]
     pub fn order(&self) -> &[usize] {
         &self.order

@@ -55,14 +55,16 @@ pub struct Notice {
 }
 
 impl Notice {
-    fn info(text: impl Into<String>) -> Self {
+    /// An informational message; `text` must already be safe to display.
+    pub fn info(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             level: Level::Info,
         }
     }
 
-    fn error(text: impl Into<String>) -> Self {
+    /// An error message; `text` must already be safe to display.
+    pub fn error(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             level: Level::Error,
@@ -107,6 +109,12 @@ impl<A: Audio> Playback<A> {
             notice: None,
             stop_reason: None,
         }
+    }
+
+    /// The audio output, for tests that script it.
+    #[cfg(test)]
+    pub const fn audio_mut(&mut self) -> &mut A {
+        &mut self.audio
     }
 
     /// All tracks, in library order.

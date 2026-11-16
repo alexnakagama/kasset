@@ -6,7 +6,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,6 +18,7 @@ use rodio::source::SeekError;
 use rodio::{ChannelCount, CpalError, Decoder, DeviceSinkBuilder, DeviceTrait, MixerDeviceSink};
 use rodio::{Sample, SampleRate, Source};
 
+use crate::panic_guard::quietly;
 use crate::text::sanitize;
 
 /// How far one seek step moves.
@@ -157,7 +158,7 @@ impl<S: Source> Guarded<S> {
         self.flags.panicked.store(true, Ordering::Release);
         // Dropping a decoder in an inconsistent state may panic again.
         let inner = self.inner.take();
-        let _ignored = catch_unwind(AssertUnwindSafe(move || drop(inner)));
+        let _ignored = quietly(AssertUnwindSafe(move || drop(inner)));
     }
 }
 
@@ -168,7 +169,7 @@ impl<S: Source> Iterator for Guarded<S> {
         let inner = self.inner.as_mut()?;
         // The decoder is dropped on panic and never touched again, so no broken
         // invariant can be observed. Requires `panic = "unwind"` (Cargo.toml).
-        match catch_unwind(AssertUnwindSafe(|| inner.next())) {
+        match quietly(AssertUnwindSafe(|| inner.next())) {
             Ok(Some(sample)) => {
                 if !self.produced {
                     self.produced = true;
@@ -216,7 +217,7 @@ impl<S: Source> Source for Guarded<S> {
         let Some(inner) = self.inner.as_mut() else {
             return Err(SeekError::Other(Arc::new(DecoderCrashed)));
         };
-        catch_unwind(AssertUnwindSafe(|| inner.try_seek(pos))).unwrap_or_else(|_| {
+        quietly(AssertUnwindSafe(|| inner.try_seek(pos))).unwrap_or_else(|_| {
             self.poison();
             Err(SeekError::Other(Arc::new(DecoderCrashed)))
         })
@@ -431,7 +432,7 @@ fn open_source(
         builder = builder.with_hint(&ext.to_ascii_lowercase());
     }
 
-    let decoder = catch_unwind(AssertUnwindSafe(move || builder.build()))
+    let decoder = quietly(AssertUnwindSafe(move || builder.build()))
         .map_err(|_| anyhow!(DecoderCrashed))?
         .context("not a playable audio file")?;
     let mut source = Guarded::new(decoder, Arc::clone(flags));
