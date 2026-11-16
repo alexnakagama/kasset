@@ -24,6 +24,30 @@ const KEYS_NORMAL: &str = "Enter play · Space pause · s stop · n/p next/prev 
                            +/- volume · z shuffle · r repeat · / search · q quit";
 const KEYS_SEARCH: &str = "type to filter · Enter keep · Esc clear · ↑/↓ move · Ctrl+C quit";
 
+/// Start of the list title, before the library root.
+const TITLE_PREFIX: &str = " kasset · ";
+
+/// `text` cut from the start to fit `max` columns, with `…` marking the cut.
+fn elide_start(text: &str, max: usize) -> String {
+    if Span::raw(text).width() <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut width = 1; // the ellipsis
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        let w = Span::raw(&text[i..i + c.len_utf8()]).width();
+        if width + w > max {
+            break;
+        }
+        width += w;
+        start = i;
+    }
+    format!("…{}", &text[start..])
+}
+
 /// What rendering remembers between frames.
 #[derive(Debug, Default)]
 pub struct View {
@@ -73,9 +97,19 @@ fn render_list<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area:
     } else {
         format!(" {shown} of {total} match '{}' ", app.query())
     };
+    // The left title gets whatever the count leaves free: two borders, the
+    // count and a one-column gap. Long roots keep their end, the part that
+    // tells folders apart.
+    let free = usize::from(area.width).saturating_sub(2 + Span::raw(&count).width() + 1);
+    let root_room = free.saturating_sub(Span::raw(TITLE_PREFIX).width() + 1);
+    let title = if root_room < 2 {
+        " kasset ".to_owned()
+    } else {
+        format!("{TITLE_PREFIX}{} ", elide_start(app.root(), root_room))
+    };
     let block = Block::bordered()
         .padding(Padding::horizontal(1))
-        .title(format!(" kasset · {} ", app.root()).bold())
+        .title(title.bold())
         .title_top(Line::from(count).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -338,6 +372,52 @@ mod tests {
 
     fn press(app: &mut App<SilentAudio>, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn elide_start_keeps_the_end_within_the_width() {
+        assert_eq!(elide_start("/music", 6), "/music");
+        assert_eq!(elide_start("/home/me/Music", 8), "…e/Music");
+        assert_eq!(elide_start("/a/音楽", 4), "…楽");
+        assert_eq!(elide_start("/a/音楽", 3), "…楽");
+        assert_eq!(
+            elide_start("/a/音楽", 2),
+            "…",
+            "a wide char never overflows"
+        );
+        assert_eq!(elide_start("/music", 1), "…");
+        assert_eq!(elide_start("/music", 0), "");
+    }
+
+    #[test]
+    fn long_root_is_elided_and_keeps_the_track_count() {
+        let root = format!("/very/{}long/Music", "deep/".repeat(30));
+        let app = App::new(
+            vec![track("Song", "Band", "LP")],
+            SilentAudio::default(),
+            root,
+            None,
+        );
+        let screen = draw(&app, &mut View::default(), 60, 12);
+        assert!(screen[0].contains("…"), "{screen:#?}");
+        assert!(screen[0].contains("/long/Music ─ 1 tracks "), "{screen:#?}");
+        // " 1 tracks " leaves exactly 2 columns for the root at width 26:
+        // the ellipsis and the last character.
+        let app = App::new(
+            vec![track("Song", "Band", "LP")],
+            SilentAudio::default(),
+            "/music".to_owned(),
+            None,
+        );
+        let screen = draw(&app, &mut View::default(), 26, 12);
+        assert!(screen[0].contains(" kasset · …c "), "{screen:#?}");
+        let screen = draw(&app, &mut View::default(), 25, 12);
+        assert!(screen[0].contains(" kasset "), "{screen:#?}");
+        assert!(!screen[0].contains('…'), "{screen:#?}");
+        // Too narrow for the root at all: only the name is left.
+        let screen = draw(&app, &mut View::default(), 22, 12);
+        assert!(screen[0].contains(" kasset "), "{screen:#?}");
+        assert!(screen[0].contains(" 1 tracks "), "{screen:#?}");
     }
 
     #[test]

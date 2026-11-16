@@ -28,8 +28,8 @@
 
 ## 5. Docs and integration
 
-- [ ] 5.1 Write `README.md` with build prerequisites (`libasound2-dev`, `pkg-config`), `cargo install --path .`, usage, keybindings and known limitations (.opus unsupported); verify the install command puts `kasset` on PATH and `kasset --version` runs
-- [ ] 5.2 End-to-end check: run `kasset` on a real music folder, exercise every keybinding from the spec, then run `cargo test` and `cargo clippy -- -D warnings` with no failures
+- [x] 5.1 Write `README.md` with build prerequisites (`libasound2-dev`, `pkg-config`), `cargo install --path .`, usage, keybindings and known limitations (.opus unsupported); verify the install command puts `kasset` on PATH and `kasset --version` runs
+- [x] 5.2 End-to-end check: run `kasset` on a real music folder, exercise every keybinding from the spec, then run `cargo test` and `cargo clippy -- -D warnings` with no failures
 
 ## Workflow follow-up
 
