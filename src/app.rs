@@ -6,6 +6,11 @@
 //! playlists. The playlists side shows either the list of playlists or one
 //! open playlist. Each list (library, playlists, open playlist) keeps its own
 //! filter and selection.
+//!
+//! Every playlist change (add, remove, move, rename, delete) goes to disk
+//! before the next key is handled. Edits are made on a copy and only shown
+//! once saved, so a failed or conflicting save leaves the screen as it was.
+//! Changes to the playlist that is playing are forwarded to the play order.
 
 use std::cell::OnceCell;
 use std::time::{Duration, Instant};
@@ -15,7 +20,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::library::Track;
 use crate::playback::{Edit, Notice, Playback, Source};
 use crate::player::Audio;
-use crate::playlist::{AddOutcome, Playlist, PlaylistInfo, PlaylistStore, Resolver, StoreError};
+use crate::playlist::{
+    AddOutcome, Playlist, PlaylistInfo, PlaylistStore, Resolver, SaveOutcome, StoreError,
+    validate_name,
+};
 use crate::text::{is_invisible_format, sanitize};
 
 /// How long a transient status message stays on screen.
@@ -35,6 +43,9 @@ pub enum Mode {
     Picker(Picker),
     /// Typing a playlist name.
     NameInput(NameInput),
+    /// Asking whether to delete the named playlist: `y` deletes, any other
+    /// key cancels.
+    ConfirmDelete(String),
 }
 
 /// The "add to playlist" popup.
@@ -73,6 +84,8 @@ impl Picker {
 pub enum NamePurpose {
     /// A new playlist holding these library tracks.
     Create(Vec<usize>),
+    /// A new name for the playlist with this name.
+    Rename(String),
 }
 
 /// The playlist name prompt.
@@ -418,6 +431,7 @@ impl<A: Audio> App<A> {
             Mode::Search => self.search_key(key),
             Mode::Picker(_) => self.picker_key(key),
             Mode::NameInput(_) => self.name_key(key),
+            Mode::ConfirmDelete(_) => self.confirm_delete_key(key),
         }
     }
 
@@ -449,6 +463,11 @@ impl<A: Audio> App<A> {
                 let tracks = self.library.rows.clone();
                 self.open_picker(tracks);
             }
+            KeyCode::Char('d') if self.view() == View::Playlist => self.remove_selected(),
+            KeyCode::Char('J') if self.view() == View::Playlist => self.move_selected(true),
+            KeyCode::Char('K') if self.view() == View::Playlist => self.move_selected(false),
+            KeyCode::Char('R') if self.view() == View::Playlists => self.start_rename(),
+            KeyCode::Char('D') if self.view() == View::Playlists => self.start_delete(),
             KeyCode::Char(' ') => self.playback.toggle_pause(),
             KeyCode::Char('s') => self.playback.stop(),
             KeyCode::Char('n') => self.playback.next(),
@@ -540,6 +559,22 @@ impl<A: Audio> App<A> {
                 input.error = None;
             }
             _ => {}
+        }
+    }
+
+    /// A key in the delete confirmation: `y` deletes, anything else cancels.
+    fn confirm_delete_key(&mut self, key: KeyEvent) {
+        let Mode::ConfirmDelete(name) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+            return;
+        };
+        let yes = key.code == KeyCode::Char('y')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if yes {
+            self.delete_playlist(&name);
+        } else {
+            self.pending = Some(Notice::info(format!("{} was not deleted", quoted(&name))));
         }
     }
 
@@ -934,7 +969,7 @@ impl<A: Audio> App<A> {
             return;
         }
         match self.store.save(&mut playlist) {
-            Ok(crate::playlist::SaveOutcome::Saved) => {
+            Ok(SaveOutcome::Saved) => {
                 let after = playlist.tracks();
                 let appended = after.get(before.len()..).unwrap_or_default().to_vec();
                 self.follow_edit(name, &before, &after, Edit::Append(appended));
@@ -943,7 +978,7 @@ impl<A: Audio> App<A> {
                 }
                 self.pending = Some(add_notice(name, outcome));
             }
-            Ok(crate::playlist::SaveOutcome::ChangedOnDisk) => {
+            Ok(SaveOutcome::ChangedOnDisk) => {
                 if self.reload(name) {
                     self.pending = Some(Notice::error(format!(
                         "{} was changed by another program and has been reloaded; nothing was added",
@@ -961,11 +996,18 @@ impl<A: Audio> App<A> {
         let Mode::NameInput(mut input) = std::mem::replace(&mut self.mode, Mode::Normal) else {
             return;
         };
-        let result = match &input.purpose {
-            NamePurpose::Create(tracks) => self.create_playlist(&input.text, tracks),
+        let (result, failed) = match &input.purpose {
+            NamePurpose::Create(tracks) => (
+                self.create_playlist(&input.text, tracks),
+                "Playlist not created",
+            ),
+            NamePurpose::Rename(old) => (
+                self.rename_playlist(old, &input.text),
+                "Playlist not renamed",
+            ),
         };
         if let Err(reason) = result {
-            self.pending = Some(Notice::error(format!("Playlist not created: {reason}")));
+            self.pending = Some(Notice::error(format!("{failed}: {reason}")));
             input.error = Some(reason);
             self.mode = Mode::NameInput(input);
         }
@@ -1015,6 +1057,236 @@ impl<A: Audio> App<A> {
                 Ok(())
             }
         }
+    }
+}
+
+/// Editing the open playlist: `d`, `J` and `K`.
+impl<A: Audio> App<A> {
+    /// `d`: removes the selected entry (only that occurrence).
+    fn remove_selected(&mut self) {
+        let Some(item) = self.open.as_ref().and_then(|o| o.list.selected_value()) else {
+            return;
+        };
+        self.edit_open(EntryEdit::Remove(item));
+    }
+
+    /// `J` / `K`: moves the selected entry one position down / up. Refused
+    /// with a filter active, since neighbours on screen need not be
+    /// neighbours in the playlist.
+    fn move_selected(&mut self, down: bool) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        if !open.list.query.is_empty() {
+            self.pending = Some(Notice::info("Clear the filter (Esc) to reorder"));
+            return;
+        }
+        let Some(from) = open.list.selected_value() else {
+            return;
+        };
+        self.edit_open(EntryEdit::Move { from, down });
+    }
+
+    /// Applies `edit` to the open playlist and saves it at once. The edit is
+    /// made on a copy: if it is refused or the save fails, the playlist on
+    /// screen (and on disk) stays as it was. A playlist changed on disk by
+    /// another program is reloaded instead and the edit discarded.
+    fn edit_open(&mut self, edit: EntryEdit) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let name = open.name().to_owned();
+        let before = open.items.clone();
+        let mut playlist = open.playlist.clone();
+        let applied = match edit {
+            EntryEdit::Remove(item) => playlist.remove(item),
+            EntryEdit::Move { from, down } => playlist.move_entry(from, down),
+        };
+        match applied {
+            Ok(true) => {}
+            // Past either end, or nothing selected: nothing to do.
+            Ok(false) => return,
+            Err(err) => {
+                self.pending = Some(Notice::error(format!(
+                    "Cannot edit {}: {err}",
+                    quoted(&name)
+                )));
+                return;
+            }
+        }
+        match self.store.save(&mut playlist) {
+            Ok(SaveOutcome::Saved) => {
+                let after = playlist.tracks();
+                let play_edit = match edit {
+                    EntryEdit::Remove(item) => Edit::Remove(item),
+                    EntryEdit::Move { from, down } => Edit::Move {
+                        from,
+                        to: moved_to(from, down),
+                    },
+                };
+                self.follow_edit(&name, &before, &after, play_edit);
+                self.install(playlist);
+                self.select_after(edit);
+                if let EntryEdit::Remove(item) = edit
+                    && let Some(&track) = before.get(item)
+                {
+                    let title = self
+                        .playback
+                        .tracks()
+                        .get(track)
+                        .map_or("", |t| t.title.as_str());
+                    self.pending = Some(Notice::info(format!(
+                        "Removed {} from {}",
+                        quoted(title),
+                        quoted(&name)
+                    )));
+                }
+            }
+            Ok(SaveOutcome::ChangedOnDisk) => {
+                if self.reload(&name) {
+                    self.pending = Some(Notice::error(format!(
+                        "{} was changed by another program and has been reloaded; the edit was not applied",
+                        quoted(&name)
+                    )));
+                }
+            }
+            Err(StoreError::NotFound) => self.playlist_gone(&name),
+            Err(err) => self.pending = Some(store_error(&name, &err)),
+        }
+    }
+
+    /// The selection after a saved `edit` of the open playlist: the entry
+    /// that followed a removed one (or the new last entry), or the moved
+    /// entry at its new place.
+    fn select_after(&mut self, edit: EntryEdit) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        let list = &mut open.list;
+        match edit {
+            EntryEdit::Remove(item) => {
+                // Items after the removed one moved up by one position, so
+                // its successor is the first listed position `>= item`.
+                let row = list
+                    .rows
+                    .iter()
+                    .position(|&r| r >= item)
+                    .unwrap_or(usize::MAX);
+                list.select_row(row);
+            }
+            EntryEdit::Move { from, down } => list.select_value(Some(moved_to(from, down))),
+        }
+    }
+}
+
+/// Renaming and deleting playlists: `R` and `D` in the playlists list.
+impl<A: Audio> App<A> {
+    /// Name of the playlist selected in the playlists list.
+    fn selected_playlist(&self) -> Option<String> {
+        self.playlist_list
+            .selected_value()
+            .and_then(|i| self.playlists.get(i))
+            .map(|info| info.name.clone())
+    }
+
+    /// `R`: asks for a new name, prefilled with the current one.
+    fn start_rename(&mut self) {
+        let Some(name) = self.selected_playlist() else {
+            return;
+        };
+        // Names made outside kasset may be longer than the input allows;
+        // they are still shown whole and can be shortened.
+        self.mode = Mode::NameInput(NameInput {
+            text: name.clone(),
+            purpose: NamePurpose::Rename(name),
+            error: None,
+        });
+    }
+
+    /// Renames playlist `old` to `text` (trimmed). A refused name is
+    /// returned as `Err` with the reason, so the prompt can stay open; other
+    /// failures are reported and close the prompt. Playback of the playlist
+    /// goes on under its new name.
+    fn rename_playlist(&mut self, old: &str, text: &str) -> Result<(), String> {
+        let new = validate_name(text)
+            .map_err(|err| err.to_string())?
+            .to_owned();
+        if new == old {
+            return Ok(());
+        }
+        match self.store.rename(old, &new) {
+            Ok(()) => {
+                self.playback.playlist_renamed(old, &new);
+                if self.open.as_ref().is_some_and(|o| o.name() == old) {
+                    // Not reachable from the keys (`R` works in the list),
+                    // but an open copy must never keep the old path.
+                    self.open = None;
+                }
+                self.refresh_playlists(Some(&new));
+                self.pending = Some(Notice::info(format!(
+                    "Renamed {} to {}",
+                    quoted(old),
+                    quoted(&new)
+                )));
+                Ok(())
+            }
+            Err(StoreError::Name(err)) => Err(err.to_string()),
+            Err(StoreError::NotFound) => {
+                self.playlist_gone(old);
+                Ok(())
+            }
+            Err(err) => {
+                self.pending = Some(store_error(old, &err));
+                Ok(())
+            }
+        }
+    }
+
+    /// `D`: asks whether to delete the selected playlist.
+    fn start_delete(&mut self) {
+        if let Some(name) = self.selected_playlist() {
+            self.mode = Mode::ConfirmDelete(name);
+        }
+    }
+
+    /// Deletes the file of playlist `name` (a symlink itself, never its
+    /// target; never an audio file). If it was playing, playback goes on.
+    fn delete_playlist(&mut self, name: &str) {
+        match self.store.delete(name) {
+            Ok(()) => {
+                self.playback.playlist_deleted(name);
+                if self.open.as_ref().is_some_and(|o| o.name() == name) {
+                    self.open = None;
+                }
+                self.refresh_playlists(None);
+                self.pending = Some(Notice::info(format!(
+                    "Deleted playlist {}; its songs stay in the library",
+                    quoted(name)
+                )));
+            }
+            Err(StoreError::NotFound) => self.playlist_gone(name),
+            Err(err) => self.pending = Some(store_error(name, &err)),
+        }
+    }
+}
+
+/// An edit of the open playlist's entries, by item position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryEdit {
+    Remove(usize),
+    /// Swap with the next (`down`) or previous entry.
+    Move {
+        from: usize,
+        down: bool,
+    },
+}
+
+/// Where an entry at `from` lands after moving one step down or up.
+const fn moved_to(from: usize, down: bool) -> usize {
+    if down {
+        from.saturating_add(1)
+    } else {
+        from.saturating_sub(1)
     }
 }
 
@@ -2136,6 +2408,712 @@ mod playlist_tests {
         assert_eq!(
             m.name_input().map(|n| n.text().chars().count()),
             Some(MAX_QUERY_CHARS)
+        );
+        Ok(())
+    }
+
+    // --- Editing the open playlist (task 4.1) ---
+
+    impl Music {
+        /// Selects row `row` of the list on screen.
+        fn select_row(&mut self, row: usize) {
+            self.keys(&[KeyCode::Home]);
+            for _ in 0..row {
+                self.keys(&[KeyCode::Down]);
+            }
+        }
+
+        /// Ends the playing track and lets playback react.
+        fn end_track(&mut self) {
+            self.app.playback_mut().audio_mut().ended = true;
+            self.app.tick(Instant::now());
+        }
+
+        fn shift(&mut self, c: char) {
+            self.app
+                .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT));
+        }
+
+        /// Title of the selected row in the open playlist.
+        fn selected_title(&self) -> Option<String> {
+            self.app.selected_track().map(|t| self.title(t))
+        }
+
+        fn playing_title(&self) -> Option<String> {
+            self.app.playback().current().map(|t| self.title(t))
+        }
+    }
+
+    #[test]
+    fn remove_selects_the_following_entry_and_saves() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.open("Running")?;
+        m.select_row(1);
+        m.chars("d");
+        assert_eq!(m.shown_titles(), ["A", "C"]);
+        assert_eq!(m.selected_title().as_deref(), Some("C"));
+        assert_eq!(m.file_titles("Running")?, ["A", "C"]);
+        let status = m.status();
+        assert!(
+            status.contains("Removed \"B\" from \"Running\""),
+            "{status}"
+        );
+
+        // Removing the last entry selects the new last one.
+        m.select_row(1);
+        m.chars("d");
+        assert_eq!(m.shown_titles(), ["A"]);
+        assert_eq!(m.selected_title().as_deref(), Some("A"));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_takes_only_that_occurrence_and_keeps_other_lines() -> Result<()> {
+        let mut m = abcd()?;
+        m.write_raw(
+            "Running",
+            b"#EXTM3U\r\n#EXTINF:1,x - A\r\n../Band/LP/A.mp3\r\n# note\r\n../gone.mp3\r\n\
+              #EXTINF:2,x - B\r\n../Band/LP/B.mp3\r\n../Band/LP/A.mp3",
+        )?;
+        m.open("Running")?;
+        assert_eq!(m.shown_titles(), ["A", "B", "A"]);
+        m.select_row(1);
+        m.chars("d");
+        assert_eq!(m.shown_titles(), ["A", "A"]);
+        assert_eq!(
+            fs::read(m.file("Running"))?,
+            b"#EXTM3U\r\n#EXTINF:1,x - A\r\n../Band/LP/A.mp3\r\n# note\r\n../gone.mp3\r\n\
+              ../Band/LP/A.mp3",
+            "the #EXTINF went with B; comments, unmatched entries, CRLF and the \
+             missing final newline stayed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remove_while_filtered_selects_the_next_listed_entry() -> Result<()> {
+        let mut m = music(&[("A", "Band"), ("B", "Other"), ("C", "Band"), ("D", "Band")])?;
+        m.write_raw(
+            "Running",
+            b"../Band/LP/A.mp3\n../Other/LP/B.mp3\n../Band/LP/C.mp3\n../Band/LP/D.mp3\n",
+        )?;
+        m.open("Running")?;
+        m.chars("/band");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.shown_titles(), ["A", "C", "D"]);
+        m.chars("d");
+        assert_eq!(m.shown_titles(), ["C", "D"], "the filter stays");
+        assert_eq!(m.selected_title().as_deref(), Some("C"));
+        assert_eq!(m.file_titles("Running")?, ["B", "C", "D"]);
+        Ok(())
+    }
+
+    #[test]
+    fn move_down_and_up_keep_the_entry_selected() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.open("Running")?;
+        m.shift('J');
+        assert_eq!(m.shown_titles(), ["B", "A", "C"]);
+        assert_eq!(m.selected_title().as_deref(), Some("A"));
+        assert_eq!(m.file_titles("Running")?, ["B", "A", "C"]);
+
+        m.shift('K');
+        m.shift('K');
+        assert_eq!(m.shown_titles(), ["A", "B", "C"], "past the top: nothing");
+        assert_eq!(m.selected_title().as_deref(), Some("A"));
+        m.select_row(2);
+        let before = fs::read(m.file("Running"))?;
+        m.shift('J');
+        assert_eq!(
+            fs::read(m.file("Running"))?,
+            before,
+            "past the end: nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn move_skips_over_unmatched_entries_which_stay_in_place() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "gone", "B"])?;
+        m.open("Running")?;
+        m.shift('J');
+        assert_eq!(m.shown_titles(), ["B", "A"]);
+        assert_eq!(m.file_titles("Running")?, ["B", "gone", "A"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reorder_is_refused_with_a_filter_active() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        let before = fs::read(m.file("Running"))?;
+        m.open("Running")?;
+        m.chars("/b");
+        m.keys(&[KeyCode::Enter]);
+        m.shift('K');
+        m.shift('J');
+        assert_eq!(fs::read(m.file("Running"))?, before);
+        let status = m.status();
+        assert!(status.contains("Clear the filter"), "{status}");
+        assert!(status.contains("to reorder"), "{status}");
+        Ok(())
+    }
+
+    #[test]
+    fn latin1_playlist_refuses_edits_and_is_unchanged() -> Result<()> {
+        let mut m = abcd()?;
+        let bytes = b"../Band/LP/A.mp3\n# caf\xe9\n../Band/LP/B.mp3\n";
+        m.write_raw("Old", bytes)?;
+        m.open("Old")?;
+        m.status();
+        m.chars("d");
+        assert_eq!(m.shown_titles(), ["A", "B"]);
+        let status = m.status();
+        assert!(status.contains("not UTF-8"), "{status}");
+        assert!(status.contains("cannot be edited"), "{status}");
+        m.shift('J');
+        assert_eq!(m.shown_titles(), ["A", "B"]);
+        assert_eq!(fs::read(m.file("Old"))?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn consecutive_edits_are_all_saved_without_a_conflict() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C", "D"])?;
+        m.open("Running")?;
+        m.chars("d");
+        m.status();
+        m.chars("d");
+        let status = m.status();
+        assert!(!status.contains("another program"), "{status}");
+        m.shift('J');
+        assert_eq!(m.file_titles("Running")?, ["D", "C"]);
+        assert_eq!(m.shown_titles(), ["D", "C"]);
+        Ok(())
+    }
+
+    #[test]
+    fn edit_of_a_playlist_changed_elsewhere_is_discarded() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B"])?;
+        m.open("Running")?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.chars("d");
+        assert_eq!(
+            m.file_titles("Running")?,
+            ["A", "B", "C"],
+            "not overwritten"
+        );
+        assert_eq!(
+            m.shown_titles(),
+            ["A", "B", "C"],
+            "the other program's change"
+        );
+        let status = m.status();
+        assert!(status.contains("reloaded"), "{status}");
+        Ok(())
+    }
+
+    /// D9: the temporary file's path is taken by a directory.
+    #[test]
+    fn failed_save_leaves_the_list_unchanged() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.open("Running")?;
+        let before = fs::read(m.file("Running"))?;
+        let blocker = m
+            .dir()
+            .join(format!(".Running.m3u8.tmp-{}", std::process::id()));
+        fs::create_dir(&blocker)?;
+        m.select_row(1);
+        m.chars("d");
+        m.shift('J');
+        assert_eq!(m.shown_titles(), ["A", "B", "C"]);
+        assert_eq!(m.selected_title().as_deref(), Some("B"));
+        assert_eq!(fs::read(m.file("Running"))?, before);
+        let status = m.status();
+        assert!(status.contains("\"Running\""), "{status}");
+        assert!(status.contains("cannot save"), "{status}");
+
+        fs::remove_dir(&blocker)?;
+        m.chars("d");
+        assert_eq!(
+            m.shown_titles(),
+            ["A", "C"],
+            "works once the folder is writable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn edit_of_a_playlist_deleted_elsewhere_goes_back_to_the_list() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B"])?;
+        m.open("Running")?;
+        fs::remove_file(m.file("Running"))?;
+        m.chars("d");
+        assert_eq!(m.app.view(), View::Playlists);
+        assert!(!m.file("Running").exists(), "not recreated");
+        let status = m.status();
+        assert!(status.contains("no longer exists"), "{status}");
+        Ok(())
+    }
+
+    /// Plays B from "Running" (A, B, C) and removes it.
+    fn remove_playing_b(m: &mut Music) -> Result<()> {
+        m.write("Running", &["A", "B", "C"])?;
+        m.open("Running")?;
+        m.select_row(1);
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.playing_title().as_deref(), Some("B"));
+        m.chars("d");
+        assert_eq!(m.shown_titles(), ["A", "C"]);
+        assert_eq!(m.playing_title().as_deref(), Some("B"), "B keeps playing");
+        Ok(())
+    }
+
+    #[test]
+    fn removed_playing_track_finishes_then_the_next_plays() -> Result<()> {
+        let mut m = abcd()?;
+        remove_playing_b(&mut m)?;
+        m.end_track();
+        assert_eq!(m.playing_title().as_deref(), Some("C"));
+        Ok(())
+    }
+
+    #[test]
+    fn removed_playing_track_is_not_repeated_with_repeat_one() -> Result<()> {
+        let mut m = abcd()?;
+        m.chars("rr");
+        assert_eq!(m.app.playback().repeat(), crate::queue::Repeat::One);
+        remove_playing_b(&mut m)?;
+        m.end_track();
+        assert_eq!(m.playing_title().as_deref(), Some("C"));
+        m.end_track();
+        assert_eq!(m.playing_title().as_deref(), Some("C"), "then C repeats");
+        Ok(())
+    }
+
+    #[test]
+    fn removed_last_entry_stops_or_wraps() -> Result<()> {
+        for repeat_all in [false, true] {
+            let mut m = abcd()?;
+            if repeat_all {
+                m.chars("r");
+            }
+            m.write("Running", &["A", "B", "C"])?;
+            m.open("Running")?;
+            m.select_row(2);
+            m.keys(&[KeyCode::Enter]);
+            m.chars("d");
+            assert_eq!(m.playing_title().as_deref(), Some("C"));
+            m.end_track();
+            if repeat_all {
+                assert_eq!(m.playing_title().as_deref(), Some("A"));
+            } else {
+                assert_eq!(
+                    m.app.playback().state(),
+                    crate::playback::PlayState::Stopped
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn previous_after_removing_the_playing_track() -> Result<()> {
+        let mut m = abcd()?;
+        remove_playing_b(&mut m)?;
+        m.app.playback_mut().audio_mut().position = Duration::from_secs(2);
+        m.chars("p");
+        assert_eq!(m.playing_title().as_deref(), Some("A"));
+        Ok(())
+    }
+
+    #[test]
+    fn reorder_while_playing_changes_what_plays_next() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.open("Running")?;
+        m.keys(&[KeyCode::Enter]);
+        m.select_row(2);
+        m.shift('K');
+        assert_eq!(m.shown_titles(), ["A", "C", "B"]);
+        m.end_track();
+        assert_eq!(m.playing_title().as_deref(), Some("C"));
+        m.end_track();
+        assert_eq!(m.playing_title().as_deref(), Some("B"));
+        Ok(())
+    }
+
+    #[test]
+    fn edits_of_a_playlist_that_is_not_playing_leave_the_play_order() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.keys(&[KeyCode::Enter]);
+        m.open("Running")?;
+        m.chars("d");
+        m.chars("n");
+        assert_eq!(m.playing_title().as_deref(), Some("B"), "library order");
+        Ok(())
+    }
+
+    // --- Renaming and deleting (task 4.2) ---
+
+    impl Music {
+        /// In the playlists list, selects playlist `name`.
+        fn select_playlist(&mut self, name: &str) -> Result<()> {
+            let Some(index) = self.app.playlists().iter().position(|i| i.name == name) else {
+                bail!("{name} not listed");
+            };
+            let Some(row) = self.app.visible().iter().position(|&r| r == index) else {
+                bail!("{name} filtered out");
+            };
+            self.select_row(row);
+            Ok(())
+        }
+
+        fn listed(&self) -> Vec<String> {
+            self.app
+                .playlists()
+                .iter()
+                .map(|i| i.name.clone())
+                .collect()
+        }
+
+        fn selected_playlist_name(&self) -> Option<String> {
+            self.app
+                .selected()
+                .and_then(|row| self.app.visible().get(row))
+                .and_then(|&i| self.app.playlists().get(i))
+                .map(|i| i.name.clone())
+        }
+
+        /// Clears the name prompt and types `name`.
+        fn retype(&mut self, name: &str) {
+            let len = self.name_input().map_or(0, |n| n.text().chars().count());
+            for _ in 0..len {
+                self.keys(&[KeyCode::Backspace]);
+            }
+            self.chars(name);
+        }
+    }
+
+    #[test]
+    fn rename_prefills_and_renames_the_file() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Running", &["B"])?;
+        let before = fs::read(m.file("Running"))?;
+        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Running")?;
+        m.shift('R');
+        assert_eq!(m.name_input().map(NameInput::text), Some("Running"));
+        m.retype("Morning run");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.listed(), ["Gym", "Morning run"]);
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Morning run"));
+        assert!(!m.file("Running").exists());
+        assert_eq!(
+            fs::read(m.file("Morning run"))?,
+            before,
+            "content untouched"
+        );
+        let status = m.status();
+        assert!(
+            status.contains("Renamed \"Running\" to \"Morning run\""),
+            "{status}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_rename_keeps_the_name() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["B"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.shift('R');
+        m.retype("Other");
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.listed(), ["Running"]);
+        assert!(m.file("Running").exists());
+        assert!(!m.file("Other").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn rename_unchanged_does_nothing() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["B"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.shift('R');
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.listed(), ["Running"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rename_may_change_only_the_case() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["B"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.shift('R');
+        m.retype("RUNNING");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.listed(), ["RUNNING"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rename_refuses_taken_and_invalid_names_and_keeps_the_prompt() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Running", &["B"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Running")?;
+        m.shift('R');
+        m.retype("gym");
+        m.keys(&[KeyCode::Enter]);
+        let error = m.name_input().and_then(NameInput::error).map(str::to_owned);
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains("already used")),
+            "{error:?}"
+        );
+        let status = m.status();
+        assert!(status.contains("Playlist not renamed"), "{status}");
+
+        m.retype("a:b");
+        m.keys(&[KeyCode::Enter]);
+        let error = m.name_input().and_then(NameInput::error).map(str::to_owned);
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains("':'")),
+            "{error:?}"
+        );
+        assert_eq!(m.listed(), ["Gym", "Running"]);
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_the_playing_playlist_keeps_playing_it() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B"])?;
+        m.open("Running")?;
+        m.keys(&[KeyCode::Enter, KeyCode::Esc]);
+        m.shift('R');
+        m.retype("Morning");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.playing_title().as_deref(), Some("A"));
+        assert!(m.app.playback().is_playing_playlist("Morning"));
+        // Still the same play order, and edits under the new name follow it.
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(
+            m.app.open_playlist().map(OpenPlaylist::name),
+            Some("Morning")
+        );
+        m.select_row(1);
+        m.chars("d");
+        m.end_track();
+        assert_eq!(
+            m.app.playback().state(),
+            crate::playback::PlayState::Stopped,
+            "B was removed, so the order ends after A"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rename_of_a_playlist_deleted_meanwhile_reports_it() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["B"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.shift('R');
+        fs::remove_file(m.file("Running"))?;
+        m.retype("Other");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert!(!m.file("Other").exists());
+        let status = m.status();
+        assert!(status.contains("no longer exists"), "{status}");
+        Ok(())
+    }
+
+    #[test]
+    fn confirm_delete_removes_only_the_playlist_file() -> Result<()> {
+        let mut m = abcd()?;
+        let songs: Vec<PathBuf> = m
+            .app
+            .playback()
+            .tracks()
+            .iter()
+            .map(|t| t.path.clone())
+            .collect();
+        for song in &songs {
+            if let Some(dir) = song.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            fs::write(song, b"audio")?;
+        }
+        m.write("Gym", &["A", "B"])?;
+        m.write("Running", &["C"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Gym")?;
+        m.shift('D');
+        assert_eq!(*m.app.mode(), Mode::ConfirmDelete("Gym".to_owned()));
+        m.chars("y");
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.listed(), ["Running"]);
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Running"));
+        assert!(!m.file("Gym").exists());
+        for song in &songs {
+            assert_eq!(fs::read(song)?, b"audio", "{}", song.display());
+        }
+        assert_eq!(
+            m.app.playback().tracks().len(),
+            5,
+            "songs stay in the library"
+        );
+        let status = m.status();
+        assert!(status.contains("Deleted playlist \"Gym\""), "{status}");
+        Ok(())
+    }
+
+    #[test]
+    fn any_other_key_cancels_delete() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.keys(&[KeyCode::Tab]);
+        for cancel in [
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ] {
+            m.shift('D');
+            m.app.handle_key(cancel);
+            assert_eq!(*m.app.mode(), Mode::Normal);
+            assert_eq!(m.listed(), ["Gym"]);
+            assert!(m.file("Gym").exists());
+        }
+        let status = m.status();
+        assert!(status.contains("\"Gym\" was not deleted"), "{status}");
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_the_playing_playlist_keeps_playing() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B"])?;
+        m.open("Running")?;
+        m.keys(&[KeyCode::Enter, KeyCode::Esc]);
+        m.shift('D');
+        m.chars("y");
+        assert!(!m.file("Running").exists());
+        assert_eq!(m.playing_title().as_deref(), Some("A"));
+        assert!(!m.app.playback().is_playing_playlist("Running"));
+        m.end_track();
+        assert_eq!(m.playing_title().as_deref(), Some("B"), "its order goes on");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_delete_is_reported_and_keeps_the_playlist() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.keys(&[KeyCode::Tab]);
+        // A directory with the playlist's name cannot be deleted as a file;
+        // it is not listed either, so the store is asked directly.
+        fs::remove_file(m.file("Gym"))?;
+        fs::create_dir(m.file("Gym"))?;
+        m.app.mode = Mode::ConfirmDelete("Gym".to_owned());
+        m.chars("y");
+        assert!(m.file("Gym").is_dir());
+        let status = m.status();
+        assert!(status.contains("\"Gym\""), "{status}");
+        assert!(status.contains("cannot delete"), "{status}");
+        Ok(())
+    }
+
+    #[test]
+    fn rename_and_delete_keys_only_act_in_the_playlists_list() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A"])?;
+        m.shift('R');
+        m.shift('D');
+        assert_eq!(*m.app.mode(), Mode::Normal, "not in the library");
+        m.open("Running")?;
+        m.shift('R');
+        m.shift('D');
+        assert_eq!(*m.app.mode(), Mode::Normal, "not in an open playlist");
+        m.chars("d");
+        assert_eq!(m.app.view(), View::Playlist);
+        m.keys(&[KeyCode::Esc, KeyCode::Tab]);
+        m.chars("dJK");
+        assert_eq!(
+            m.app.view(),
+            View::Library,
+            "d/J/K do nothing in the library"
+        );
+        Ok(())
+    }
+
+    /// Rename and delete do not rewrite a playlist's contents, so they are
+    /// allowed on read-only playlists; only entry edits are refused.
+    #[test]
+    fn read_only_playlist_can_be_renamed_and_deleted() -> Result<()> {
+        let mut m = abcd()?;
+        let bytes = b"../Band/LP/A.mp3\n# caf\xe9\n";
+        m.write_raw("Old", bytes)?;
+        m.keys(&[KeyCode::Tab]);
+        m.shift('R');
+        m.retype("Older");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.listed(), ["Older"]);
+        assert_eq!(fs::read(m.file("Older"))?, bytes, "byte for byte");
+        m.shift('D');
+        m.chars("y");
+        assert_eq!(m.listed(), [] as [String; 0]);
+        assert!(!m.file("Older").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_playlist_rename_and_delete_keep_the_target() -> Result<()> {
+        let mut m = abcd()?;
+        let target = m.root.join("elsewhere.m3u8");
+        fs::write(&target, "../Band/LP/A.mp3\n")?;
+        fs::create_dir_all(m.dir())?;
+        std::os::unix::fs::symlink(&target, m.file("Linked"))?;
+        m.keys(&[KeyCode::Tab]);
+        m.shift('R');
+        m.retype("Moved");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.listed(), ["Moved"]);
+        assert!(
+            fs::symlink_metadata(m.file("Moved"))?
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::symlink_metadata(m.file("Linked")).is_err());
+        m.shift('D');
+        m.chars("y");
+        assert!(
+            fs::symlink_metadata(m.file("Moved")).is_err(),
+            "link removed"
+        );
+        assert_eq!(
+            fs::read(&target)?,
+            b"../Band/LP/A.mp3\n",
+            "target untouched"
         );
         Ok(())
     }

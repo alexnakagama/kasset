@@ -70,10 +70,6 @@ pub enum Action {
     Save,
     Create,
     Rename,
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     Delete,
 }
 
@@ -195,10 +191,6 @@ pub trait PlaylistStore: fmt::Debug {
     ///
     /// Fails when `to` breaks a naming rule or is taken, `from` is gone, or
     /// the rename fails.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     fn rename(&self, from: &str, to: &str) -> Result<(), StoreError>;
 
     /// Deletes a playlist file (a symlink itself, never its target).
@@ -206,10 +198,6 @@ pub trait PlaylistStore: fmt::Debug {
     /// # Errors
     ///
     /// Fails when the file is gone or cannot be removed.
-    #[allow(
-        dead_code,
-        reason = "wired into the playlist views in task group 4 of add-playlists"
-    )]
     fn delete(&self, name: &str) -> Result<(), StoreError>;
 }
 

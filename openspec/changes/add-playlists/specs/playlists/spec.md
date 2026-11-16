@@ -56,7 +56,7 @@ When saving, the system SHALL keep a leading UTF-8 byte order mark, each existin
 - **THEN** the file's bytes are identical to before
 
 ### Requirement: Playlists that cannot be edited safely
-A playlist file that is not valid UTF-8, or that exceeds the size or entry limits (16 MiB, 100 000 entries), SHALL still be listed, opened (as far as read) and played, but SHALL NOT be modified: edit keys and adding to it SHALL be refused with a message saying why.
+A playlist file that is not valid UTF-8, or that exceeds the size or entry limits (16 MiB, 100 000 entries), SHALL still be listed, opened (as far as read) and played, but its contents SHALL NOT be modified: removing (`d`), reordering (`J` / `K`) and adding to it SHALL be refused with a message saying why. Renaming (`R`) and deleting (`D`) it SHALL still be allowed, since neither rewrites the file's contents.
 
 #### Scenario: Latin-1 file
 - **WHEN** `Old.m3u8` contains bytes that are not valid UTF-8 and the user presses `d` inside it
@@ -65,6 +65,10 @@ A playlist file that is not valid UTF-8, or that exceeds the size or entry limit
 #### Scenario: Not offered as a target
 - **WHEN** the user presses `a` and the only playlist cannot be edited
 - **THEN** the picker shows it as read-only and choosing it is refused with the reason
+
+#### Scenario: Rename and delete allowed
+- **WHEN** `Old.m3u8` is not valid UTF-8 and the user renames it to "Older" with `R`, then deletes it with `D` and `y`
+- **THEN** after the rename `Older.m3u8` has exactly the bytes `Old.m3u8` had, and after the delete it is gone
 
 ### Requirement: Unmatched entries preserved
 Entries that do not match a track in the scanned library SHALL NOT be shown as tracks. They SHALL be counted in the status area when the playlist is opened, and SHALL be written back unchanged, in their original position, whenever the playlist is saved. Comment and tag lines SHALL also be kept.

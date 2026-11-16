@@ -28,7 +28,11 @@ Playlists (stored as .m3u8 files in <DIR>/Playlists):
   Tab            switch between library and playlists
   a / A          add selected / all listed tracks to a playlist
   Enter          open playlist; in a playlist, play from it
-  Esc            in a playlist: clear filter, then back to the list";
+  Esc            in a playlist: clear filter, then back to the list
+  d              in a playlist: remove the selected entry
+  J / K          in a playlist: move the selected entry down / up
+  R              in the playlists list: rename the selected playlist
+  D              in the playlists list: delete it (asks y/n; songs stay)";
 
 /// A keyboard-driven terminal music player for your local music folder.
 #[derive(Debug, Parser)]

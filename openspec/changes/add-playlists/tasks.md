@@ -22,9 +22,9 @@
 
 ## 4. Editing playlists (`src/app.rs`, `src/ui.rs`)
 
-- [ ] 4.1 Implement `d` remove and `J`/`K` reorder (refused with a filter active) inside an open playlist, saving immediately and updating the play order when it is the playing source; verify key-sequence tests for *Remove*, *Move down*, *Filter active*, *Latin-1 file*, *Consecutive edits*, *Remove playing track*, *Repeat one*, *Last entry removed*, *Previous after removal*, *Reorder while playing*, and a failed save (forced per D9) leaving the list unchanged
-- [ ] 4.2 Implement `R` rename (prefilled prompt, case-only rename allowed) and `D` delete with `y`/other-key confirmation popup, keeping playback running when the playing playlist is renamed or deleted; verify key-sequence tests for *Rename*, *Cancel rename*, *Confirm delete*, *Cancel delete* and that audio files are untouched
-- [ ] 4.3 Add key help for the playlist views and prompts, and document `d`, `J`/`K`, `R`, `D` in README and `--help`; verify a render test of the open-playlist help bar and `cargo run -- --help`
+- [x] 4.1 Implement `d` remove and `J`/`K` reorder (refused with a filter active) inside an open playlist, saving immediately and updating the play order when it is the playing source; verify key-sequence tests for *Remove*, *Move down*, *Filter active*, *Latin-1 file*, *Consecutive edits*, *Remove playing track*, *Repeat one*, *Last entry removed*, *Previous after removal*, *Reorder while playing*, and a failed save (forced per D9) leaving the list unchanged
+- [x] 4.2 Implement `R` rename (prefilled prompt, case-only rename allowed) and `D` delete with `y`/other-key confirmation popup, keeping playback running when the playing playlist is renamed or deleted; verify key-sequence tests for *Rename*, *Cancel rename*, *Confirm delete*, *Cancel delete* and that audio files are untouched
+- [x] 4.3 Add key help for the playlist views and prompts, and document `d`, `J`/`K`, `R`, `D` in README and `--help`; verify a render test of the open-playlist help bar and `cargo run -- --help`
 
 ## 5. Integration
 
