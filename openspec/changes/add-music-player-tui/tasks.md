@@ -7,10 +7,10 @@
 
 ## 2. CLI and library scanning
 
-- [ ] 2.1 Implement `kasset [DIR]` argument parsing with `--help`/`--version` and library root resolution (arg → music dir → cwd, error on missing dir); verify `cargo run -- --help` prints usage plus the keybinding summary (`after_help`) and `cargo run -- /no/such/dir` exits non-zero with the folder named
-- [ ] 2.2 Implement recursive scan with case-insensitive extension filter and skipping unreadable dirs; verify with unit tests using a temp dir (nested files found, `.jpg`/`.txt` ignored)
-- [ ] 2.3 Implement metadata reading with lofty and filename/"Unknown" fallbacks; verify unit test that an untagged file gets its filename as title
-- [ ] 2.4 Implement library sort (artist, album, track number, title, case-insensitive); verify unit test that tracks 1, 2, 10 sort numerically
+- [x] 2.1 Implement `kasset [DIR]` argument parsing with `--help`/`--version` and library root resolution (arg → music dir → cwd, error on missing dir); verify `cargo run -- --help` prints usage plus the keybinding summary (`after_help`) and `cargo run -- /no/such/dir` exits non-zero with the folder named
+- [x] 2.2 Implement recursive scan with case-insensitive extension filter and skipping unreadable dirs; verify with unit tests using a temp dir (nested files found, `.jpg`/`.txt` ignored)
+- [x] 2.3 Implement metadata reading with lofty and filename/"Unknown" fallbacks; verify unit test that an untagged file gets its filename as title
+- [x] 2.4 Implement library sort (artist, album, track number, title, case-insensitive); verify unit test that tracks 1, 2, 10 sort numerically
 
 ## 3. Playback engine
 
