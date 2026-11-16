@@ -6,6 +6,12 @@ mod library;
 mod panic_guard;
 mod playback;
 mod player;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "wired into the interface in task group 3 of add-playlists"
+)]
+mod playlist;
 mod queue;
 mod terminal;
 #[cfg(test)]
