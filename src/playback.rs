@@ -42,10 +42,6 @@ impl PlayState {
 
 /// Where the play order comes from; compared by the interface to decide
 /// whether an open playlist is the one playing.
-#[allow(
-    dead_code,
-    reason = "used by the playlist views in task group 3 of add-playlists"
-)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Source {
     /// The whole library, in library order.
@@ -61,15 +57,19 @@ pub enum Source {
 /// A change to the list of the playlist that is playing, forwarded with
 /// [`Playback::edit_playlist`]. Positions are item positions (the
 /// playlist's matched entries, in file order); tracks are library indices.
-#[allow(
-    dead_code,
-    reason = "used by the playlist views in task group 3 of add-playlists"
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {
     /// The entry at this position was removed.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     Remove(usize),
     /// The entry at `from` was moved to `to`.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     Move { from: usize, to: usize },
     /// These tracks were added at the end.
     Append(Vec<usize>),
@@ -493,12 +493,9 @@ impl<A: Audio> Playback<A> {
 }
 
 /// Playlists as the play order.
-#[allow(
-    dead_code,
-    reason = "used by the playlist views in task group 3 of add-playlists"
-)]
 impl<A: Audio> Playback<A> {
     /// Where the play order comes from.
+    #[cfg(test)]
     #[must_use]
     pub const fn source(&self) -> &Source {
         &self.source
@@ -510,6 +507,13 @@ impl<A: Audio> Playback<A> {
     #[must_use]
     pub fn current_item(&self) -> Option<usize> {
         self.queue.current_item()
+    }
+
+    /// The source's list as the play order knows it: library indices, in
+    /// list order (duplicates kept).
+    #[must_use]
+    pub fn items(&self) -> &[usize] {
+        self.queue.items()
     }
 
     /// Makes `items` (library indices, duplicates allowed) the play order,
@@ -559,6 +563,10 @@ impl<A: Audio> Playback<A> {
     }
 
     /// Follows a rename of playlist `old` to `new` if it is the one playing.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     pub fn playlist_renamed(&mut self, old: &str, new: &str) {
         if self.is_playing_playlist(old) {
             self.source = Source::Playlist(new.to_owned());

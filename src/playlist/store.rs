@@ -70,6 +70,10 @@ pub enum Action {
     Save,
     Create,
     Rename,
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     Delete,
 }
 
@@ -140,7 +144,7 @@ impl From<NameError> for StoreError {
 }
 
 /// Where playlists live. `App` talks to this, never to the filesystem.
-pub trait PlaylistStore {
+pub trait PlaylistStore: fmt::Debug {
     /// Every playlist, sorted by name ignoring case. A missing folder is an
     /// empty list.
     ///
@@ -191,6 +195,10 @@ pub trait PlaylistStore {
     ///
     /// Fails when `to` breaks a naming rule or is taken, `from` is gone, or
     /// the rename fails.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     fn rename(&self, from: &str, to: &str) -> Result<(), StoreError>;
 
     /// Deletes a playlist file (a symlink itself, never its target).
@@ -198,6 +206,10 @@ pub trait PlaylistStore {
     /// # Errors
     ///
     /// Fails when the file is gone or cannot be removed.
+    #[allow(
+        dead_code,
+        reason = "wired into the playlist views in task group 4 of add-playlists"
+    )]
     fn delete(&self, name: &str) -> Result<(), StoreError>;
 }
 
@@ -216,6 +228,7 @@ impl FsStore {
     }
 
     /// The playlists folder (it may not exist yet).
+    #[cfg(test)]
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir

@@ -2,8 +2,9 @@
 //! the only state kept here is the list's scroll position ([`View`]).
 //!
 //! All text drawn comes from sanitised sources (tags and file names through
-//! `text::sanitize`/`display_path`, the query through input filtering), so no
-//! terminal control sequence can reach the screen.
+//! `text::sanitize`/`display_path`, playlist names through `text::sanitize`
+//! here, typed text through input filtering), so no terminal control
+//! sequence can reach the screen.
 
 use std::time::{Duration, Instant};
 
@@ -11,21 +12,42 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Gauge, Padding, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Cell, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Row, Table,
+    TableState, Wrap,
+};
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, NameInput, NamePurpose, Picker, View as Screen};
 use crate::playback::{Level, PlayState, clock};
 use crate::player::Audio;
+use crate::text::sanitize;
 
 /// Height of the now-playing panel, borders included.
 const NOW_PLAYING_HEIGHT: u16 = 6;
 
-const KEYS_NORMAL: &str = "Enter play · Space pause · s stop · n/p next/prev · ←/→ seek · \
-                           +/- volume · z shuffle · r repeat · / search · q quit";
+const KEYS_LIBRARY: &str = "Enter play · Space pause · s stop · n/p next/prev · ←/→ seek · \
+                            +/- volume · z shuffle · r repeat · / search · \
+                            a/A add to playlist · Tab playlists · q quit";
+const KEYS_PLAYLISTS: &str = "Enter open · / search · Tab library · Space pause · s stop · \
+                              n/p next/prev · ←/→ seek · +/- volume · z shuffle · r repeat · q quit";
+const KEYS_PLAYLIST: &str = "Enter play · Esc back · / search · Tab library · Space pause · \
+                             s stop · n/p next/prev · ←/→ seek · +/- volume · z shuffle · \
+                             r repeat · q quit";
 const KEYS_SEARCH: &str = "type to filter · Enter keep · Esc clear · ↑/↓ move · Ctrl+C quit";
+const KEYS_PICKER: &str = "↑/↓ choose · Enter add · Esc cancel";
+const KEYS_NAME: &str = "type a name · Enter create · Esc cancel";
 
-/// Start of the list title, before the library root.
+/// Start of the library title, before the library root.
 const TITLE_PREFIX: &str = " kasset · ";
+
+/// Start of an open playlist's title, before its name.
+const PLAYLIST_PREFIX: &str = " Playlist · ";
+
+/// Label of the picker's first row.
+pub const NEW_PLAYLIST: &str = "New playlist…";
+
+/// Widest popup, in columns.
+const POPUP_MAX_WIDTH: u16 = 60;
 
 /// `text` cut from the start to fit `max` columns, with `…` marking the cut.
 fn elide_start(text: &str, max: usize) -> String {
@@ -46,6 +68,32 @@ fn elide_start(text: &str, max: usize) -> String {
         start = i;
     }
     format!("…{}", &text[start..])
+}
+
+/// `text` cut at the end to fit `max` columns, with `…` marking the cut.
+fn elide_end(text: &str, max: usize) -> String {
+    if Span::raw(text).width() <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut width = 1; // the ellipsis
+    let mut end = 0;
+    for (i, c) in text.char_indices() {
+        let w = Span::raw(&text[i..i + c.len_utf8()]).width();
+        if width + w > max {
+            break;
+        }
+        width += w;
+        end = i + c.len_utf8();
+    }
+    format!("{}…", &text[..end])
+}
+
+/// A playlist name ready to draw.
+fn shown_name(name: &str) -> String {
+    sanitize(name).unwrap_or_default()
 }
 
 /// What rendering remembers between frames.
@@ -69,6 +117,20 @@ impl View {
     }
 }
 
+/// The key help for what is on screen.
+fn key_help<A: Audio>(app: &App<A>) -> &'static str {
+    match app.mode() {
+        Mode::Search => KEYS_SEARCH,
+        Mode::Picker(_) => KEYS_PICKER,
+        Mode::NameInput(_) => KEYS_NAME,
+        Mode::Normal => match app.view() {
+            Screen::Library => KEYS_LIBRARY,
+            Screen::Playlists => KEYS_PLAYLISTS,
+            Screen::Playlist => KEYS_PLAYLIST,
+        },
+    }
+}
+
 /// Draws the whole screen.
 pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: Instant) {
     let [list, playing, status, keys] = Layout::vertical([
@@ -79,56 +141,151 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
     ])
     .areas(frame.area());
 
-    render_list(frame, app, view, list);
+    match app.view() {
+        Screen::Library => render_library(frame, app, view, list),
+        Screen::Playlists => render_playlists(frame, app, view, list),
+        Screen::Playlist => render_open_playlist(frame, app, view, list),
+    }
     render_now_playing(frame, app, playing);
     render_status(frame, app, status, now);
-    let help = match app.mode() {
-        Mode::Normal => KEYS_NORMAL,
-        Mode::Search => KEYS_SEARCH,
-    };
-    frame.render_widget(Paragraph::new(help).dark_gray(), keys);
+    frame.render_widget(Paragraph::new(key_help(app)).dark_gray(), keys);
+
+    match app.mode() {
+        Mode::Picker(picker) => render_picker(frame, picker, list),
+        Mode::NameInput(input) => render_name_input(frame, input, list),
+        Mode::Normal | Mode::Search => {}
+    }
 }
 
-fn render_list<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area: Rect) {
-    let total = app.playback().tracks().len();
-    let shown = app.visible().len();
-    let count = if app.query().is_empty() {
-        format!(" {total} tracks ")
+/// `" N <noun> "`, or how many rows match the filter.
+fn count_title<A: Audio>(app: &App<A>, total: usize, noun: &str) -> String {
+    if app.query().is_empty() {
+        format!(" {total} {noun} ")
     } else {
-        format!(" {shown} of {total} match '{}' ", app.query())
-    };
+        format!(
+            " {} of {total} match '{}' ",
+            app.visible().len(),
+            app.query()
+        )
+    }
+}
+
+/// A bordered list block titled `prefix` + `text` on the left (elided by
+/// `elide` to leave room for `count` on the right, or just `fallback` when
+/// there is no room for `text`), and `count` on the right.
+fn list_block<'a>(
+    area: Rect,
+    (prefix, text, fallback): (&str, &str, &str),
+    elide: fn(&str, usize) -> String,
+    count: String,
+) -> Block<'a> {
     // The left title gets whatever the count leaves free: two borders, the
-    // count and a one-column gap. Long roots keep their end, the part that
-    // tells folders apart.
+    // count and a one-column gap.
     let free = usize::from(area.width).saturating_sub(2 + Span::raw(&count).width() + 1);
-    let root_room = free.saturating_sub(Span::raw(TITLE_PREFIX).width() + 1);
-    let title = if root_room < 2 {
-        " kasset ".to_owned()
+    let room = free.saturating_sub(Span::raw(prefix).width() + 1);
+    let title = if text.is_empty() {
+        prefix.to_owned()
+    } else if room < 2 {
+        fallback.to_owned()
     } else {
-        format!("{TITLE_PREFIX}{} ", elide_start(app.root(), root_room))
+        format!("{prefix}{} ", elide(text, room))
     };
-    let block = Block::bordered()
+    Block::bordered()
         .padding(Padding::horizontal(1))
         .title(title.bold())
-        .title_top(Line::from(count).right_aligned());
+        .title_top(Line::from(count).right_aligned())
+}
+
+/// Draws `message` in place of an empty list.
+fn render_empty(frame: &mut Frame, view: &mut View, inner: Rect, message: String) {
+    view.offset = 0;
+    view.page_size = usize::from(inner.height);
+    frame.render_widget(
+        Paragraph::new(message).italic().wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn render_library<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area: Rect) {
+    let total = app.playback().tracks().len();
+    let count = count_title(app, total, "tracks");
+    // Long roots keep their end, the part that tells folders apart.
+    let block = list_block(
+        area,
+        (TITLE_PREFIX, app.root(), " kasset "),
+        elide_start,
+        count,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if shown == 0 {
-        view.offset = 0;
-        view.page_size = usize::from(inner.height);
+    if app.visible().is_empty() {
         let message = if total == 0 {
             format!("No music found in {}", app.root())
         } else {
             format!("No tracks match '{}'", app.query())
         };
-        frame.render_widget(
-            Paragraph::new(message).italic().wrap(Wrap { trim: false }),
-            inner,
-        );
+        render_empty(frame, view, inner, message);
         return;
     }
+    let current = app.playback().current();
+    render_tracks(frame, app, view, inner, |index| {
+        (index, current == Some(index))
+    });
+}
 
+fn render_open_playlist<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area: Rect) {
+    let Some(open) = app.open_playlist() else {
+        return;
+    };
+    let items = open.items();
+    let mut name = shown_name(open.name());
+    if open.playlist().editable().is_err() {
+        name.push_str(" · read-only");
+    }
+    let count = count_title(app, items.len(), "tracks");
+    let block = list_block(
+        area,
+        (PLAYLIST_PREFIX, &name, " Playlist "),
+        elide_end,
+        count,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.visible().is_empty() {
+        let message = if !items.is_empty() {
+            format!("No tracks match '{}'", app.query())
+        } else if open.playlist().unmatched() > 0 {
+            "None of this playlist's entries are in the library".to_owned()
+        } else {
+            "This playlist is empty. Add tracks from the library with a or A.".to_owned()
+        };
+        render_empty(frame, view, inner, message);
+        return;
+    }
+    // Only the playlist that is the play order shows what is playing: the
+    // same song may be listed here while it plays from elsewhere.
+    let playback = app.playback();
+    let playing_item = playback
+        .is_playing_playlist(open.name())
+        .then(|| playback.current_item())
+        .flatten();
+    render_tracks(frame, app, view, inner, |item| {
+        (items[item], playing_item == Some(item))
+    });
+}
+
+/// Draws the rows of a track list; `row(value)` gives the library index of
+/// the track a row shows and whether it is the one playing.
+fn render_tracks<A: Audio>(
+    frame: &mut Frame,
+    app: &App<A>,
+    view: &mut View,
+    inner: Rect,
+    row: impl Fn(usize) -> (usize, bool),
+) {
+    let shown = app.visible().len();
     // One line is the header.
     let rows = usize::from(inner.height.saturating_sub(1));
     let selected = app.selected().unwrap_or(0);
@@ -136,28 +293,24 @@ fn render_list<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area:
     view.page_size = rows;
 
     let tracks = app.playback().tracks();
-    let current = app.playback().current();
     let state = app.playback().state();
     let end = view.offset.saturating_add(rows).min(shown);
-    let body = app.visible()[view.offset..end].iter().map(|&index| {
-        let track = &tracks[index];
+    let body = app.visible()[view.offset..end].iter().filter_map(|&value| {
+        let (index, playing) = row(value);
+        let track = tracks.get(index)?;
         let length = track.duration.map(clock).unwrap_or_default();
         let row = Row::new([
-            Cell::from(if current == Some(index) {
-                state_marker(state)
-            } else {
-                " "
-            }),
+            Cell::from(if playing { state_marker(state) } else { " " }),
             Cell::from(track.title.as_str()),
             Cell::from(track.artist.as_str()),
             Cell::from(track.album.as_str()),
             Cell::from(Line::from(length).right_aligned()),
         ]);
-        if current == Some(index) {
+        Some(if playing {
             row.style(Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
         } else {
             row
-        }
+        })
     });
     let header = Row::new([
         Cell::from(""),
@@ -181,6 +334,167 @@ fn render_list<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area:
     .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = TableState::new().with_selected(Some(selected - view.offset));
     frame.render_stateful_widget(table, inner, &mut state);
+}
+
+fn render_playlists<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area: Rect) {
+    let infos = app.playlists();
+    let count = count_title(app, infos.len(), "playlists");
+    let block = list_block(area, (" Playlists ", "", ""), elide_end, count);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let shown = app.visible().len();
+    if shown == 0 {
+        let message = if infos.is_empty() {
+            "No playlists yet. In the library, press a (selected track) or A (all listed \
+             tracks) and choose \"New playlist…\"."
+                .to_owned()
+        } else {
+            format!("No playlists match '{}'", app.query())
+        };
+        render_empty(frame, view, inner, message);
+        return;
+    }
+
+    let rows = usize::from(inner.height.saturating_sub(1));
+    let selected = app.selected().unwrap_or(0);
+    view.offset = scroll(view.offset, selected, rows, shown);
+    view.page_size = rows;
+
+    let playback = app.playback();
+    let state = playback.state();
+    let end = view.offset.saturating_add(rows).min(shown);
+    let body = app.visible()[view.offset..end].iter().filter_map(|&i| {
+        let info = infos.get(i)?;
+        let playing = playback.is_playing_playlist(&info.name);
+        let tracks = info
+            .tracks
+            .map_or_else(|| "?".to_owned(), |n| n.to_string());
+        let row = Row::new([
+            Cell::from(if playing { state_marker(state) } else { " " }),
+            Cell::from(shown_name(&info.name)),
+            Cell::from(Line::from(tracks).right_aligned()),
+            Cell::from(if info.read_only.is_some() {
+                "read-only"
+            } else {
+                ""
+            }),
+        ]);
+        Some(if playing {
+            row.style(Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else {
+            row
+        })
+    });
+    let header = Row::new([
+        Cell::from(""),
+        Cell::from("Name"),
+        Cell::from(Line::from("Tracks").right_aligned()),
+        Cell::from(""),
+    ])
+    .style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
+    let table = Table::new(
+        body,
+        [
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(7),
+            Constraint::Length(9),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut table_state = TableState::new().with_selected(Some(selected - view.offset));
+    frame.render_stateful_widget(table, inner, &mut table_state);
+}
+
+/// A `width`×`height` rectangle centred in `area` (shrunk to fit it).
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
+    let tracks = picker.track_count();
+    let title = format!(
+        " Add {tracks} {} to ",
+        if tracks == 1 { "track" } else { "tracks" }
+    );
+    let names: Vec<(String, bool)> = picker
+        .choices()
+        .iter()
+        .map(|info| (shown_name(&info.name), info.read_only.is_some()))
+        .collect();
+    let widest = names
+        .iter()
+        .map(|(name, read_only)| Span::raw(name).width() + if *read_only { 12 } else { 0 })
+        .chain([Span::raw(NEW_PLAYLIST).width(), Span::raw(&title).width()])
+        .max()
+        .unwrap_or(0);
+    // Borders, padding and the highlight symbol.
+    let width = u16::try_from(widest + 6)
+        .unwrap_or(u16::MAX)
+        .clamp(30, POPUP_MAX_WIDTH);
+    let height = u16::try_from(names.len() + 3).unwrap_or(u16::MAX);
+    let popup = centered(area, width, height);
+
+    let items = std::iter::once(ListItem::new(Line::from(NEW_PLAYLIST.italic()))).chain(
+        names.into_iter().map(|(name, read_only)| {
+            if read_only {
+                ListItem::new(Line::from(vec![
+                    Span::raw(name).dark_gray(),
+                    Span::raw(" (read-only)").dark_gray(),
+                ]))
+            } else {
+                ListItem::new(Line::from(name))
+            }
+        }),
+    );
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .padding(Padding::horizontal(1))
+                .title(title.bold()),
+        )
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(Some(picker.selected()));
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+fn render_name_input(frame: &mut Frame, input: &NameInput, area: Rect) {
+    let title = match input.purpose() {
+        NamePurpose::Create(_) => " New playlist ",
+    };
+    let popup = centered(area, POPUP_MAX_WIDTH, 4);
+    let block = Block::bordered()
+        .padding(Padding::horizontal(1))
+        .title(title.bold());
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let [text_line, message_line] = Layout::vertical([Constraint::Length(1); 2]).areas(inner);
+
+    // Show the end of a name too long for the line, so the cursor stays visible.
+    let room = usize::from(text_line.width.saturating_sub(1));
+    let text = tail_fitting(input.text(), room);
+    frame.render_widget(Line::from(text), text_line);
+    if text_line.width > 0 && text_line.height > 0 {
+        let width = u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX);
+        let x = text_line.x.saturating_add(width);
+        frame.set_cursor_position(Position::new(x.min(text_line.right() - 1), text_line.y));
+    }
+    let message = input.error().map_or_else(
+        || Line::from("Enter to create, Esc to cancel").dark_gray(),
+        |error| Line::styled(error, Style::new().fg(Color::Red)),
+    );
+    frame.render_widget(message, message_line);
 }
 
 /// The first row to show so that `selected` is on screen, moving the previous
@@ -296,7 +610,7 @@ fn render_status<A: Audio>(frame: &mut Frame, app: &App<A>, area: Rect, now: Ins
         };
         Line::styled(notice.text.as_str(), style)
     });
-    if app.mode() != Mode::Search {
+    if !matches!(app.mode(), Mode::Search) {
         if let Some(line) = notice {
             frame.render_widget(line, area);
         }
@@ -336,7 +650,7 @@ fn tail_fitting(text: &str, width: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{SilentAudio, track};
+    use crate::test_support::{SilentAudio, no_store, track};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -367,7 +681,13 @@ mod tests {
         let tracks = (0..n)
             .map(|i| track(&format!("Song {i:02}"), "Band", "LP"))
             .collect();
-        App::new(tracks, SilentAudio::default(), "/music".to_owned(), None)
+        App::new(
+            tracks,
+            SilentAudio::default(),
+            no_store(),
+            "/music".to_owned(),
+            None,
+        )
     }
 
     fn press(app: &mut App<SilentAudio>, code: KeyCode) {
@@ -395,6 +715,7 @@ mod tests {
         let app = App::new(
             vec![track("Song", "Band", "LP")],
             SilentAudio::default(),
+            no_store(),
             root,
             None,
         );
@@ -406,6 +727,7 @@ mod tests {
         let app = App::new(
             vec![track("Song", "Band", "LP")],
             SilentAudio::default(),
+            no_store(),
             "/music".to_owned(),
             None,
         );
@@ -425,6 +747,7 @@ mod tests {
         let app = App::new(
             Vec::new(),
             SilentAudio::default(),
+            no_store(),
             "/home/me/Music".to_owned(),
             None,
         );
@@ -439,7 +762,13 @@ mod tests {
     fn now_playing_shows_track_progress_and_modes() {
         let mut tracks = vec![track("Song", "Band", "LP")];
         tracks[0].duration = Some(Duration::from_secs(210));
-        let mut app = App::new(tracks, SilentAudio::default(), "/m".to_owned(), None);
+        let mut app = App::new(
+            tracks,
+            SilentAudio::default(),
+            no_store(),
+            "/m".to_owned(),
+            None,
+        );
         press(&mut app, KeyCode::Enter);
         app.playback_mut().audio_mut().position = Duration::from_secs(65);
         let screen = draw(&app, &mut View::default(), 80, 20);
@@ -582,6 +911,208 @@ mod tests {
         assert_eq!(scroll(6, 3, 10, 100), 3);
         assert_eq!(scroll(90, 2, 10, 5), 0, "list shrank under the view");
         assert_eq!(scroll(3, 7, 0, 100), 7);
+    }
+
+    /// A library of A, B, C by "Band" under a temporary root, with playlists
+    /// "Running" (B, C) and "Gym" (A, B) in it.
+    fn with_playlists() -> anyhow::Result<(tempfile::TempDir, App<SilentAudio>)> {
+        let tmp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(tmp.path())?;
+        let tracks = ["A", "B", "C"]
+            .into_iter()
+            .map(|t| {
+                let mut track = track(t, "Band", "LP");
+                track.path = root.join(format!("Band/LP/{t}.mp3"));
+                track
+            })
+            .collect();
+        let dir = root.join("Playlists");
+        std::fs::create_dir(&dir)?;
+        std::fs::write(
+            dir.join("Running.m3u8"),
+            "../Band/LP/B.mp3\n../Band/LP/C.mp3\n",
+        )?;
+        std::fs::write(dir.join("Gym.m3u8"), "../Band/LP/A.mp3\n../Band/LP/B.mp3\n")?;
+        let store = Box::new(crate::playlist::FsStore::new(&root));
+        let app = App::new(tracks, SilentAudio::default(), store, "/m".to_owned(), None);
+        Ok((tmp, app))
+    }
+
+    fn keys(app: &mut App<SilentAudio>, codes: &[KeyCode]) {
+        for &code in codes {
+            press(app, code);
+        }
+    }
+
+    fn row_with<'a>(screen: &'a [String], needle: &str) -> Option<&'a String> {
+        screen.iter().find(|l| l.contains(needle))
+    }
+
+    #[test]
+    fn empty_playlists_view_says_how_to_make_one() {
+        let mut app = library(3);
+        press(&mut app, KeyCode::Tab);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        assert!(screen[0].contains(" Playlists "), "{screen:#?}");
+        assert!(screen[0].contains(" 0 playlists "), "{screen:#?}");
+        assert!(screen_contains(&screen, "No playlists yet"), "{screen:#?}");
+        assert!(screen_contains(&screen, "New playlist…"), "{screen:#?}");
+        assert!(screen[19].starts_with("Enter open"), "{screen:#?}");
+        assert!(screen[19].contains("Tab library"), "{screen:#?}");
+    }
+
+    #[test]
+    fn playlists_view_lists_names_and_counts() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        press(&mut app, KeyCode::Tab);
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(screen[0].contains(" 2 playlists "), "{screen:#?}");
+        let gym = screen.iter().position(|l| l.contains("Gym"));
+        let running = screen.iter().position(|l| l.contains("Running"));
+        assert!(gym < running, "sorted ignoring case: {screen:#?}");
+        assert!(
+            row_with(&screen, "Running").is_some_and(|l| l.contains("  2 ")),
+            "{screen:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn picker_lists_new_playlist_then_the_playlists() -> anyhow::Result<()> {
+        let (tmp, mut app) = with_playlists()?;
+        std::fs::write(
+            tmp.path().join("Playlists/Old.m3u8"),
+            b"../Band/LP/A.mp3\n# caf\xe9\n",
+        )?;
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        press(&mut app, KeyCode::Down);
+        let screen = draw(&app, &mut View::default(), 80, 24);
+        assert!(screen_contains(&screen, " Add 3 tracks to "), "{screen:#?}");
+        let new = screen.iter().position(|l| l.contains("New playlist…"));
+        let gym = screen.iter().position(|l| l.contains("Gym"));
+        assert!(new.is_some() && new < gym, "{screen:#?}");
+        assert!(screen_contains(&screen, "Old (read-only)"), "{screen:#?}");
+        assert!(
+            screen.last().is_some_and(|l| l.starts_with("↑/↓ choose")),
+            "{screen:#?}"
+        );
+
+        // The selected row (Gym) is highlighted.
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).unwrap_or_else(|never| match never {});
+        let now = Instant::now();
+        terminal
+            .draw(|f| render(f, &app, &mut View::default(), now))
+            .unwrap_or_else(|never| match never {});
+        let buffer = terminal.backend().buffer();
+        let y = u16::try_from(gym.unwrap_or(0))?;
+        let x = (0..buffer.area.width)
+            .find(|&x| buffer[(x, y)].symbol() == "G")
+            .unwrap_or(0);
+        assert!(buffer[(x, y)].modifier.contains(Modifier::REVERSED));
+        Ok(())
+    }
+
+    #[test]
+    fn name_prompt_shows_the_reason_a_name_was_refused() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        press(&mut app, KeyCode::Enter);
+        for c in "a/b".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let screen = draw(&app, &mut View::default(), 80, 24);
+        assert!(screen_contains(&screen, " New playlist "), "{screen:#?}");
+        assert!(screen_contains(&screen, "a/b"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&app, &mut View::default(), 80, 24);
+        assert!(
+            screen_contains(&screen, "the name cannot contain '/'"),
+            "{screen:#?}"
+        );
+        assert!(
+            screen.last().is_some_and(|l| l.starts_with("type a name")),
+            "{screen:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_playlist_marks_the_playing_entry_only_when_it_is_the_source() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        // Play B from "Running" (its first entry), then open "Running".
+        keys(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
+        keys(&mut app, &[KeyCode::Enter]);
+        assert!(app.playback().is_playing_playlist("Running"));
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(screen[0].contains(" Playlist · Running "), "{screen:#?}");
+        assert!(screen_contains(&screen, "▶ B"), "{screen:#?}");
+        assert!(!screen_contains(&screen, "▶ C"), "{screen:#?}");
+        assert!(
+            screen[19].starts_with("Enter play · Esc back"),
+            "{screen:#?}"
+        );
+
+        // "Gym" also lists B, but it is not the play order.
+        keys(&mut app, &[KeyCode::Esc, KeyCode::Up, KeyCode::Enter]);
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(screen[0].contains(" Playlist · Gym "), "{screen:#?}");
+        // The list is the top 12 rows; the now-playing panel shows ▶ too.
+        assert!(!screen_contains(&screen[..12], "▶"), "{screen:#?}");
+
+        // The library marks the playing track whatever the source.
+        press(&mut app, KeyCode::Tab);
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(screen_contains(&screen, "▶ B"), "{screen:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn playlist_played_from_the_library_has_no_marker() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        keys(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(app.playback().current(), Some(1), "B from the library");
+        keys(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(screen[0].contains("Running"), "{screen:#?}");
+        assert!(screen_contains(&screen, "  B"), "{screen:#?}");
+        // The list is the top 12 rows; the now-playing panel shows ▶ too.
+        assert!(!screen_contains(&screen[..12], "▶"), "{screen:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn library_help_mentions_playlist_keys() {
+        let app = library(3);
+        let screen = draw(&app, &mut View::default(), 200, 20);
+        assert!(screen[19].contains("a/A add to playlist"), "{screen:#?}");
+        assert!(screen[19].contains("Tab playlists"), "{screen:#?}");
+    }
+
+    #[test]
+    fn popups_at_tiny_sizes_do_not_panic() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        for (w, h) in [(0, 0), (1, 1), (2, 3), (10, 5), (80, 4), (5, 80), (300, 2)] {
+            draw(&app, &mut View::default(), w, h);
+        }
+        press(&mut app, KeyCode::Enter);
+        for c in "日本語のプレイリスト".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        for (w, h) in [(0, 0), (1, 1), (2, 3), (10, 5), (80, 4), (5, 80), (300, 2)] {
+            draw(&app, &mut View::default(), w, h);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn elide_end_keeps_the_start_within_the_width() {
+        assert_eq!(elide_end("Running", 7), "Running");
+        assert_eq!(elide_end("Running", 4), "Run…");
+        assert_eq!(elide_end("音楽です", 4), "音…");
+        assert_eq!(elide_end("音楽", 2), "…", "a wide char never overflows");
+        assert_eq!(elide_end("abc", 0), "");
     }
 
     #[test]

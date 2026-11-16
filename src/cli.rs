@@ -22,7 +22,13 @@ Keys:
   Up/Down, k/j   move selection
   PgUp / PgDn    move selection by a page
   g/Home, G/End  first / last track
-  q, Ctrl+C      quit";
+  q, Ctrl+C      quit
+
+Playlists (stored as .m3u8 files in <DIR>/Playlists):
+  Tab            switch between library and playlists
+  a / A          add selected / all listed tracks to a playlist
+  Enter          open playlist; in a playlist, play from it
+  Esc            in a playlist: clear filter, then back to the list";
 
 /// A keyboard-driven terminal music player for your local music folder.
 #[derive(Debug, Parser)]
@@ -92,6 +98,8 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("Usage: kasset [DIR]"));
         assert!(help.contains("pause / resume"));
+        assert!(help.contains("switch between library and playlists"));
+        assert!(help.contains("add selected / all listed tracks"));
     }
 
     #[test]

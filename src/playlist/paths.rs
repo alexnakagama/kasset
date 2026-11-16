@@ -56,6 +56,7 @@ impl Resolver {
 
     /// The library index `raw` (an entry line) refers to, read relative to
     /// `folder` unless absolute.
+    #[cfg(test)]
     #[must_use]
     pub fn resolve(&self, folder: &Path, raw: &[u8]) -> Option<usize> {
         self.resolve_with(folder, raw, Matching::Full)

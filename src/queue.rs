@@ -160,7 +160,6 @@ impl Queue {
     }
 
     /// The list as library indices, in list (not play) order.
-    #[cfg(test)]
     #[must_use]
     pub fn items(&self) -> &[usize] {
         &self.items
@@ -314,10 +313,6 @@ impl Queue {
 }
 
 /// Editing the list while it plays.
-#[allow(
-    dead_code,
-    reason = "used by the playlist views in task group 3 of add-playlists"
-)]
 impl Queue {
     /// Removes the item at position `item`. If it is the current one, the
     /// queue becomes detached: its track stays current and the queue moves
@@ -472,10 +467,6 @@ impl Queue {
 
 /// Where the item at position `p` ends up when the item at `from` is moved to
 /// `to`.
-#[allow(
-    dead_code,
-    reason = "used by the playlist views in task group 3 of add-playlists"
-)]
 const fn moved(p: usize, from: usize, to: usize) -> usize {
     if p == from {
         to
@@ -493,10 +484,6 @@ const fn moved(p: usize, from: usize, to: usize) -> usize {
 /// side when it moves past another item on the other side: one that lands
 /// right at the gap stays on the side it came from, so a played item is not
 /// replayed and an unplayed one is not skipped.
-#[allow(
-    dead_code,
-    reason = "used by the playlist views in task group 3 of add-playlists"
-)]
 const fn moved_gap(gap: usize, from: usize, to: usize) -> usize {
     // Take the item out, then put it back in front of the item that is at
     // position `to` once it was taken out.
