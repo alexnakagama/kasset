@@ -1,0 +1,40 @@
+[package]
+name = "kasset"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A keyboard-driven terminal music player for your local music folder"
+keywords = ["music", "player", "tui", "terminal", "audio"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[[bin]]
+name = "kasset"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
+dirs = "7.0.0"
+lofty = "0.25.5"
+rand = "0.10.4"
+ratatui = "0.30.2"
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "mp3", "flac", "vorbis", "wav", "mp4"] }
+walkdir = "2.5.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

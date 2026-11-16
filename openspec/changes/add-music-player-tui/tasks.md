@@ -2,8 +2,8 @@
 
 ## 1. Project setup
 
-- [ ] 1.1 Create the `kasset` binary crate (`Cargo.toml`, `src/main.rs`, `.gitignore` with `target/`) and verify `cargo build` succeeds
-- [ ] 1.2 Add dependencies (ratatui, crossterm, rodio with symphonia features, lofty, walkdir, clap derive, dirs, rand, anyhow) and verify `cargo build` succeeds on Linux with ALSA headers installed
+- [x] 1.1 Create the `kasset` binary crate (`Cargo.toml`, `src/main.rs`, `.gitignore` with `target/`) and verify `cargo build` succeeds
+- [x] 1.2 Add dependencies (ratatui, crossterm, rodio with symphonia features, lofty, walkdir, clap derive, dirs, rand, anyhow) and verify `cargo build` succeeds on Linux with ALSA headers installed
 
 ## 2. CLI and library scanning
 
