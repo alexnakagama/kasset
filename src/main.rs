@@ -2,6 +2,7 @@
 
 mod app;
 mod cli;
+mod keys;
 mod library;
 mod panic_guard;
 mod playback;

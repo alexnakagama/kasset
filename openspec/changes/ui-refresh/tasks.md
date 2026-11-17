@@ -4,13 +4,13 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 1. One key table (`src/keys.rs`, `src/cli.rs`)
 
-- [ ] 1.1 Add `src/keys.rs` with a `//!` doc, `GROUPS` (D7) covering every key in the new spec, including `?`, `Tab`/Shift+Tab as "move focus", and `Enter`/`Esc`/`R`/`D` in the sidebar sense. Add `BarContext`, `keys::bar(context)` and `keys::help_line_count()`. Verify with unit tests:
+- [x] 1.1 Add `src/keys.rs` with a `//!` doc, `GROUPS` (D7) covering every key in the new spec, including `?`, `Tab`/Shift+Tab as "move focus", and `Enter`/`Esc`/`R`/`D` in the sidebar sense. Add `BarContext`, `keys::bar(context)` and `keys::help_line_count()`. Verify with unit tests:
   - every `BarContext` has a non-empty bar;
   - no bar label is wider than 24 columns;
   - the Sidebar bar contains `Enter`, `R` and `D` labels;
   - the Playlist bar contains `d` and `J/K` labels;
   - `help_line_count()` equals the number of lines the overlay draws for `GROUPS`.
-- [ ] 1.2 Build the `--help` text with `keys::help_text()` and pass it as `after_help` in `src/cli.rs`, removing `KEYBINDINGS`. Update the existing `help_includes_keybindings` test: it asserts the old `Tab` wording. Add a test that the output lists `Tab`, `a / A`, `d`, `J / K`, `R`, `D` and `?` (spec *Help lists playlist keys*). Verify with `cargo test`, clippy, and by checking `cargo run -- --help` by eye.
+- [x] 1.2 Build the `--help` text with `keys::help_text()` and pass it as `after_help` in `src/cli.rs`, removing `KEYBINDINGS`. Update the existing `help_includes_keybindings` test: it asserts the old `Tab` wording. Add a test that the output lists `Tab`, `a / A`, `d`, `J / K`, `R`, `D` and `?` (spec *Help lists playlist keys*). Verify with `cargo test`, clippy, and by checking `cargo run -- --help` by eye.
 
 ## 2. Focus model and sidebar state (`src/app.rs`, minimal `src/ui.rs`)
 
@@ -88,7 +88,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - unknown duration: an empty bar;
   - an 80-column frame with a 200-character title keeps the indicators intact.
 - [ ] 5.2 Draw the key bar from `keys::bar(context)`, cutting at whole labels and right-aligning `? help` only in the Normal-mode contexts (D7). Verify with `TestBackend` tests: *Help hint always visible* at 40 columns, *Playlist view help*, *Sidebar help*, *No help hint in prompts*, and no `? help` while searching.
-- [ ] 5.3 Render the help overlay from `keys::GROUPS` with scrolling, truncating lines and never wrapping them, and record `help_rows` in `ui::View`. Verify with `TestBackend` tests: *Help does not fit* (at 80×15 the first rows show, and after `j` the view moves one line), the full overlay at 100×50 shows every group title, and a 40-column overlay truncates lines with `…`.
+- [ ] 5.3 Render the help overlay from `keys::GROUPS` with scrolling, truncating lines and never wrapping them, and record `help_rows` in `ui::View`. Verify with `TestBackend` tests: *Help does not fit* (at 80×15 the first rows show, and after `j` the view moves one line), the full overlay at 100×50 shows every group title, the overlay's scrollable height equals `keys::help_line_count()`, and a 40-column overlay truncates lines with `…`.
 - [ ] 5.4 Update the README's now-playing and progress bar wording and the remaining doc comments that mention `NOW_PLAYING_HEIGHT` or the `Gauge`. Verify that `grep -rn "Gauge\|NOW_PLAYING_HEIGHT" src README.md` returns only code that is actually used, and that the whole suite and clippy pass.
 
 ## 6. Integration
@@ -106,5 +106,6 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## Workflow follow-up
 
+- Groups 1–3 change `--help` and the keys together, so they land in one PR or branch. Group 1 alone makes `--help` describe keys that groups 2–3 implement.
 - After each task group, hand the group off for review, as with the previous changes, and fix the findings before starting the next group.
 - Sync the delta specs and archive the change once all groups are reviewed, then bump the minor version and note the `Tab`/`Esc` key changes in the release notes.
