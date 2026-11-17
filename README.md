@@ -288,8 +288,8 @@ KASSET_SAMPLE=/path/to/song.mp3 cargo test -- --ignored   # also plays a sample
 
 The `Release` workflow (`.github/workflows/release.yml`) then checks that the
 tag matches `Cargo.toml`, tests and builds every platform again, and publishes
-a GitHub Release with the archives and `SHA256SUMS`. A tag with a suffix
-(`v0.2.0-rc.1`) is published as a pre-release. Pull requests that change
+a GitHub Release with the archives and `SHA256SUMS`, as an official release
+marked latest. Pull requests that change
 `Cargo.toml`, `Cargo.lock`, `.cargo/` or the workflow get the dry run
 automatically. If a tagged build fails nothing is published: fix it, then
 move the tag with `git tag -d v0.2.0 && git push origin :refs/tags/v0.2.0`

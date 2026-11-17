@@ -2,8 +2,8 @@
 # packages one archive per platform.
 #
 # - Pushing a tag like `v0.2.0` publishes a GitHub Release with the archives
-#   plus a SHA256SUMS file. The tag must match `version` in Cargo.toml; a tag
-#   with a suffix (`v0.2.0-rc.1`) is published as a pre-release.
+#   plus a SHA256SUMS file, as an official release marked latest (never a
+#   pre-release). The tag must match `version` in Cargo.toml.
 # - A dry run (the "Run workflow" button / `gh workflow run Release`, or a pull
 #   request touching the build setup) does everything except publishing; the
 #   archives are kept as run artifacts so they can be downloaded and tried.
@@ -166,7 +166,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: |
-          prerelease=()
-          if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
-          gh release create "$TAG" --verify-tag --title "kasset $TAG" --generate-notes "${prerelease[@]}" dist/*
+        run: gh release create "$TAG" --verify-tag --latest --title "kasset $TAG" --generate-notes dist/*
