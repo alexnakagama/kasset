@@ -17,7 +17,9 @@ use ratatui::widgets::{
     TableState, Wrap,
 };
 
-use crate::app::{App, Mode, NameInput, NamePurpose, Picker, View as Screen};
+use crate::app::{
+    App, Focus, ListView, MainView, Mode, NameInput, NamePurpose, Picker, View as Screen,
+};
 use crate::playback::{Level, PlayState, clock};
 use crate::player::Audio;
 use crate::text::sanitize;
@@ -26,15 +28,15 @@ use crate::text::sanitize;
 const NOW_PLAYING_HEIGHT: u16 = 6;
 
 // Each bar puts its view's own keys first: the bar is cut at the terminal's width.
-const KEYS_LIBRARY: &str = "Enter play · a/A add selected/all to playlist · Tab playlists · / search · \
+const KEYS_LIBRARY: &str = "Enter play · a/A add selected/all to playlist · Tab focus · / search · \
                             Space pause · s stop · n/p next/prev · ←/→ seek · \
                             +/- volume · z shuffle · r repeat · q quit";
-const KEYS_PLAYLISTS: &str = "Enter open · R rename · D delete · / search · Tab library · \
+const KEYS_PLAYLISTS: &str = "Enter open · R rename · D delete · / search · Tab focus · \
                               Space pause · s stop · n/p next/prev · ←/→ seek · +/- volume · \
                               z shuffle · r repeat · q quit";
 // The edit keys come first: the bar is cut at the terminal's width.
-const KEYS_PLAYLIST: &str = "Enter play · d remove · J/K move · Esc back · / search · \
-                             Tab library · Space pause · s stop · n/p next/prev · ←/→ seek · \
+const KEYS_PLAYLIST: &str = "Enter play · d remove · J/K move · Esc sidebar · / search · \
+                             Tab focus · Space pause · s stop · n/p next/prev · ←/→ seek · \
                              +/- volume · z shuffle · r repeat · q quit";
 const KEYS_SEARCH: &str = "type to filter · Enter keep · Esc clear · ↑/↓ move · Ctrl+C quit";
 const KEYS_PICKER: &str = "↑/↓ choose · Enter add · Esc cancel";
@@ -150,10 +152,11 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
     ])
     .areas(frame.area());
 
-    match app.view() {
-        Screen::Library => render_library(frame, app, view, list),
-        Screen::Playlists => render_playlists(frame, app, view, list),
-        Screen::Playlist => render_open_playlist(frame, app, view, list),
+    // Only the focused pane is drawn until the two-pane layout.
+    match (app.focus(), app.main_view()) {
+        (Focus::Sidebar, _) => render_playlists(frame, app, view, list),
+        (Focus::Main, MainView::Library) => render_library(frame, app, view, list),
+        (Focus::Main, MainView::Playlist) => render_open_playlist(frame, app, view, list),
     }
     render_now_playing(frame, app, playing);
     render_status(frame, app, status, now);
@@ -167,16 +170,13 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
     }
 }
 
-/// `" N <noun> "`, or how many rows match the filter.
-fn count_title<A: Audio>(app: &App<A>, total: usize, noun: &str) -> String {
-    if app.query().is_empty() {
+/// `" N <noun> "`, or how many of the `total` entries (`shown` of them
+/// listed) match `list`'s filter.
+fn count_title(list: &ListView, shown: usize, total: usize, noun: &str) -> String {
+    if list.query.is_empty() {
         format!(" {total} {noun} ")
     } else {
-        format!(
-            " {} of {total} match '{}' ",
-            app.visible().len(),
-            app.query()
-        )
+        format!(" {shown} of {total} match '{}' ", list.query)
     }
 }
 
@@ -217,8 +217,9 @@ fn render_empty(frame: &mut Frame, view: &mut View, inner: Rect, message: String
 }
 
 fn render_library<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area: Rect) {
+    let list = app.main_list();
     let total = app.playback().tracks().len();
-    let count = count_title(app, total, "tracks");
+    let count = count_title(&list, list.rows.len(), total, "tracks");
     // Long roots keep their end, the part that tells folders apart.
     let block = list_block(
         area,
@@ -229,17 +230,17 @@ fn render_library<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, ar
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.visible().is_empty() {
+    if list.rows.is_empty() {
         let message = if total == 0 {
             format!("No music found in {}", app.root())
         } else {
-            format!("No tracks match '{}'", app.query())
+            format!("No tracks match '{}'", list.query)
         };
         render_empty(frame, view, inner, message);
         return;
     }
     let current = app.playback().current();
-    render_tracks(frame, app, view, inner, |index| {
+    render_tracks(frame, app, &list, view, inner, |index| {
         (index, current == Some(index))
     });
 }
@@ -248,12 +249,13 @@ fn render_open_playlist<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut Vi
     let Some(open) = app.open_playlist() else {
         return;
     };
+    let list = app.main_list();
     let items = open.items();
     let mut name = shown_name(open.name());
     if open.playlist().editable().is_err() {
         name.push_str(" · read-only");
     }
-    let count = count_title(app, items.len(), "tracks");
+    let count = count_title(&list, list.rows.len(), items.len(), "tracks");
     let block = list_block(
         area,
         (PLAYLIST_PREFIX, &name, " Playlist "),
@@ -263,9 +265,9 @@ fn render_open_playlist<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut Vi
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.visible().is_empty() {
+    if list.rows.is_empty() {
         let message = if !items.is_empty() {
-            format!("No tracks match '{}'", app.query())
+            format!("No tracks match '{}'", list.query)
         } else if open.playlist().unmatched() > 0 {
             "None of this playlist's entries are in the library".to_owned()
         } else {
@@ -281,7 +283,7 @@ fn render_open_playlist<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut Vi
         .is_playing_playlist(open.name())
         .then(|| playback.current_item())
         .flatten();
-    render_tracks(frame, app, view, inner, |item| {
+    render_tracks(frame, app, &list, view, inner, |item| {
         (items[item], playing_item == Some(item))
     });
 }
@@ -291,21 +293,22 @@ fn render_open_playlist<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut Vi
 fn render_tracks<A: Audio>(
     frame: &mut Frame,
     app: &App<A>,
+    list: &ListView,
     view: &mut View,
     inner: Rect,
     row: impl Fn(usize) -> (usize, bool),
 ) {
-    let shown = app.visible().len();
+    let shown = list.rows.len();
     // One line is the header.
     let rows = usize::from(inner.height.saturating_sub(1));
-    let selected = app.selected().unwrap_or(0);
+    let selected = list.selected.unwrap_or(0);
     view.offset = scroll(view.offset, selected, rows, shown);
     view.page_size = rows;
 
     let tracks = app.playback().tracks();
     let state = app.playback().state();
     let end = view.offset.saturating_add(rows).min(shown);
-    let body = app.visible()[view.offset..end].iter().filter_map(|&value| {
+    let body = list.rows[view.offset..end].iter().filter_map(|&value| {
         let (index, playing) = row(value);
         let track = tracks.get(index)?;
         let length = track.duration.map(clock).unwrap_or_default();
@@ -346,35 +349,51 @@ fn render_tracks<A: Audio>(
     frame.render_stateful_widget(table, inner, &mut state);
 }
 
+/// The sidebar list drawn full width: the "Library" row (value 0), then
+/// the playlists. With no playlist listed, a hint is drawn below "Library".
 fn render_playlists<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area: Rect) {
+    let list = app.sidebar_list();
     let infos = app.playlists();
-    let count = count_title(app, infos.len(), "playlists");
+    // Rows other than "Library".
+    let matching = list.rows.iter().filter(|&&value| value != 0).count();
+    let count = count_title(&list, matching, infos.len(), "playlists");
     let block = list_block(area, (" Playlists ", "", ""), elide_end, count);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let shown = app.visible().len();
-    if shown == 0 {
+    let shown = list.rows.len();
+    let mut inner = inner;
+    if matching == 0 {
+        // The table keeps the header and "Library"; the hint goes below.
         let message = if infos.is_empty() {
             "No playlists yet. In the library, press a (selected track) or A (all listed \
              tracks) and choose \"New playlist…\"."
                 .to_owned()
         } else {
-            format!("No playlists match '{}'", app.query())
+            format!("No playlists match '{}'", list.query)
         };
-        render_empty(frame, view, inner, message);
-        return;
+        let [table, hint] =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+        frame.render_widget(
+            Paragraph::new(message).italic().wrap(Wrap { trim: false }),
+            hint,
+        );
+        inner = table;
     }
-
+    // One line is the header.
     let rows = usize::from(inner.height.saturating_sub(1));
-    let selected = app.selected().unwrap_or(0);
+
+    let selected = list.selected.unwrap_or(0);
     view.offset = scroll(view.offset, selected, rows, shown);
     view.page_size = rows;
 
     let playback = app.playback();
     let state = playback.state();
     let end = view.offset.saturating_add(rows).min(shown);
-    let body = app.visible()[view.offset..end].iter().filter_map(|&i| {
+    let body = list.rows[view.offset..end].iter().filter_map(|&value| {
+        let Some(i) = value.checked_sub(1) else {
+            return Some(Row::new([Cell::from(" "), Cell::from("Library")]));
+        };
         let info = infos.get(i)?;
         let playing = playback.is_playing_playlist(&info.name);
         let tracks = info
@@ -989,7 +1008,7 @@ mod tests {
         assert!(screen_contains(&screen, "No playlists yet"), "{screen:#?}");
         assert!(screen_contains(&screen, "New playlist…"), "{screen:#?}");
         assert!(screen[19].starts_with("Enter open"), "{screen:#?}");
-        assert!(screen[19].contains("Tab library"), "{screen:#?}");
+        assert!(screen[19].contains("Tab focus"), "{screen:#?}");
     }
 
     #[test]
@@ -1003,6 +1022,29 @@ mod tests {
         assert!(gym < running, "sorted ignoring case: {screen:#?}");
         assert!(
             row_with(&screen, "Running").is_some_and(|l| l.contains("  2 ")),
+            "{screen:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_count_counts_playlists_not_the_library_row() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        press(&mut app, KeyCode::Tab);
+        for c in "/gy".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(screen[0].contains(" 1 of 2 match 'gy' "), "{screen:#?}");
+        assert!(screen_contains(&screen, "Library"), "{screen:#?}");
+        for c in "zz".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(screen[0].contains(" 0 of 2 match 'gyzz' "), "{screen:#?}");
+        assert!(screen_contains(&screen, "Library"), "{screen:#?}");
+        assert!(
+            screen_contains(&screen, "No playlists match 'gyzz'"),
             "{screen:#?}"
         );
         Ok(())
@@ -1071,8 +1113,9 @@ mod tests {
     #[test]
     fn open_playlist_marks_the_playing_entry_only_when_it_is_the_source() -> anyhow::Result<()> {
         let (_tmp, mut app) = with_playlists()?;
-        // Play B from "Running" (its first entry), then open "Running".
-        keys(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
+        // Play B from "Running" (its first entry), then open "Running"
+        // (sidebar rows: "Library", "Gym", "Running").
+        keys(&mut app, &[KeyCode::Tab, KeyCode::End, KeyCode::Enter]);
         keys(&mut app, &[KeyCode::Enter]);
         assert!(app.playback().is_playing_playlist("Running"));
         let screen = draw(&app, &mut View::default(), 80, 20);
@@ -1080,11 +1123,12 @@ mod tests {
         assert!(screen_contains(&screen, "▶ B"), "{screen:#?}");
         assert!(!screen_contains(&screen, "▶ C"), "{screen:#?}");
         assert!(
-            screen[19].starts_with("Enter play · d remove · J/K move · Esc back"),
+            screen[19].starts_with("Enter play · d remove · J/K move · Esc sidebar"),
             "{screen:#?}"
         );
 
-        // "Gym" also lists B, but it is not the play order.
+        // "Gym" also lists B, but it is not the play order. `Esc` focuses
+        // the sidebar with "Running" selected.
         keys(&mut app, &[KeyCode::Esc, KeyCode::Up, KeyCode::Enter]);
         let screen = draw(&app, &mut View::default(), 80, 20);
         assert!(screen[0].contains(" Playlist · Gym "), "{screen:#?}");
@@ -1092,7 +1136,7 @@ mod tests {
         assert!(!screen_contains(&screen[..12], "▶"), "{screen:#?}");
 
         // The library marks the playing track whatever the source.
-        press(&mut app, KeyCode::Tab);
+        keys(&mut app, &[KeyCode::Tab, KeyCode::Home, KeyCode::Enter]);
         let screen = draw(&app, &mut View::default(), 80, 20);
         assert!(screen_contains(&screen, "▶ B"), "{screen:#?}");
         Ok(())
@@ -1103,7 +1147,7 @@ mod tests {
         let (_tmp, mut app) = with_playlists()?;
         keys(&mut app, &[KeyCode::Down, KeyCode::Enter]);
         assert_eq!(app.playback().current(), Some(1), "B from the library");
-        keys(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
+        keys(&mut app, &[KeyCode::Tab, KeyCode::End, KeyCode::Enter]);
         let screen = draw(&app, &mut View::default(), 80, 20);
         assert!(screen[0].contains("Running"), "{screen:#?}");
         assert!(screen_contains(&screen, "  B"), "{screen:#?}");
@@ -1122,19 +1166,19 @@ mod tests {
             screen[19].contains("a/A add selected/all to playlist"),
             "{screen:#?}"
         );
-        assert!(screen[19].contains("Tab playlists"), "{screen:#?}");
+        assert!(screen[19].contains("Tab focus"), "{screen:#?}");
     }
 
     #[test]
     fn open_playlist_help_bar_shows_the_edit_keys() -> anyhow::Result<()> {
         let (_tmp, mut app) = with_playlists()?;
-        keys(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+        keys(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
         // Narrow enough that the bar is cut: the edit keys come first.
         let screen = draw(&app, &mut View::default(), 50, 20);
         let bar = &screen[19];
         assert!(bar.contains("d remove"), "{screen:#?}");
         assert!(bar.contains("J/K move"), "{screen:#?}");
-        assert!(bar.contains("Esc back"), "{screen:#?}");
+        assert!(bar.contains("Esc sidebar"), "{screen:#?}");
 
         press(&mut app, KeyCode::Esc);
         let screen = draw(&app, &mut View::default(), 200, 20);
@@ -1146,7 +1190,7 @@ mod tests {
     #[test]
     fn rename_prompt_is_prefilled_and_titled() -> anyhow::Result<()> {
         let (_tmp, mut app) = with_playlists()?;
-        keys(&mut app, &[KeyCode::Tab, KeyCode::Down]);
+        keys(&mut app, &[KeyCode::Tab, KeyCode::End]);
         app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
         let screen = draw(&app, &mut View::default(), 80, 24);
         assert!(screen_contains(&screen, " Rename playlist "), "{screen:#?}");
@@ -1170,7 +1214,7 @@ mod tests {
     #[test]
     fn delete_confirmation_names_the_playlist() -> anyhow::Result<()> {
         let (_tmp, mut app) = with_playlists()?;
-        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &[KeyCode::Tab, KeyCode::Down]);
         app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
         let screen = draw(&app, &mut View::default(), 80, 24);
         assert!(screen_contains(&screen, " Delete playlist "), "{screen:#?}");

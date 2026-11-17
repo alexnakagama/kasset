@@ -2,10 +2,28 @@
 //! here, and files are only reached through a [`PlaylistStore`], so
 //! everything is testable with a fake audio output and a temporary folder.
 //!
-//! The screen has two sides, switched with `Tab`: the library and the
-//! playlists. The playlists side shows either the list of playlists or one
-//! open playlist. Each list (library, playlists, open playlist) keeps its own
-//! filter and selection.
+//! The screen has two panes: a sidebar and a main pane. Exactly one has
+//! keyboard focus ([`Focus`]); `Tab` / Shift+Tab move it. Keys act on the
+//! focused pane only ([`App::view`]).
+//!
+//! - The sidebar lists a fixed "Library" row (value 0), then the saved
+//!   playlists (value `i + 1` for `playlists[i]`). The "Library" row is
+//!   never filtered out, so the sidebar is never empty. `Enter` shows the
+//!   selected entry in the main pane and focuses it.
+//! - The main pane shows the open playlist if there is one, else the
+//!   library ([`MainView`]). Only `Enter` on a sidebar playlist opens one; it
+//!   is closed by `Enter` on "Library", by deleting it, and when its file
+//!   disappears.
+//!
+//! Each list (library, sidebar, open playlist) keeps its own filter and
+//! selection. The playlists are listed in [`App::new`], so the sidebar is
+//! filled on the first frame, again whenever the sidebar gains focus, and
+//! after rename and delete. The app's own edits (add, create, `d`/`J`/`K`,
+//! reloads) update the edited playlist's sidebar entry in place.
+//!
+//! Status messages raised during one key press go through [`App::notify`]:
+//! an error is never hidden by an info message raised after it, and two
+//! messages of the same level are joined.
 //!
 //! Every playlist change (add, remove, move, rename, delete) goes to disk
 //! before the next key is handled. Edits are made on a copy and only shown
@@ -18,7 +36,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::library::Track;
-use crate::playback::{Edit, Notice, Playback, Source};
+use crate::playback::{Edit, Level, Notice, Playback, Source};
 use crate::player::Audio;
 use crate::playlist::{
     AddOutcome, Playlist, PlaylistInfo, PlaylistStore, Resolver, SaveOutcome, StoreError,
@@ -115,25 +133,56 @@ impl NameInput {
     }
 }
 
-/// Which list is on screen.
+/// Which list keys act on: the focused pane, and what it shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    /// The main pane, showing the library.
     Library,
-    /// The list of playlists.
+    /// The sidebar ("Library" and the playlists).
     Playlists,
-    /// One open playlist.
+    /// The main pane, showing the open playlist.
     Playlist,
 }
 
-/// Which side `Tab` toggles between.
+/// The pane with keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Library,
-    Playlists,
+pub enum Focus {
+    Sidebar,
+    Main,
 }
 
-/// Rows, selection and filter of one list. Rows are positions in the list's
-/// full contents (library indices, playlist infos or playlist items).
+/// What the main pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainView {
+    Library,
+    /// The open playlist ([`App::open_playlist`]).
+    Playlist,
+}
+
+/// One list as drawn: its rows, the selected row and its filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListView<'a> {
+    /// Values of the rows listed, in order: library indices, sidebar values
+    /// (0 is "Library", `i + 1` is [`App::playlists`]`[i]`), or positions in
+    /// [`OpenPlaylist::items`].
+    pub rows: &'a [usize],
+    /// Index into `rows` of the selection, if anything is listed.
+    pub selected: Option<usize>,
+    /// The search query (empty when no filter is active).
+    pub query: &'a str,
+}
+
+/// The sidebar entry selected, kept across a change of its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidebarPick {
+    Library,
+    Playlist(String),
+}
+
+/// Rows, selection and filter of one list. Rows are values naming entries of
+/// the list's full contents: library indices, sidebar values (0 is
+/// "Library", `i + 1` is `playlists[i]`: never index `playlists` with a raw
+/// row value) or positions in the open playlist's items.
 #[derive(Debug, Clone, Default)]
 struct ListState {
     /// Positions of the rows shown, in list order.
@@ -201,9 +250,17 @@ impl ListState {
         // Without a filter, row and position coincide.
         self.select_row(keep.unwrap_or(0));
     }
+
+    fn view(&self) -> ListView<'_> {
+        ListView {
+            rows: &self.rows,
+            selected: self.selected_row(),
+            query: &self.query,
+        }
+    }
 }
 
-/// The playlist shown on the playlists side.
+/// The playlist shown in the main pane.
 #[derive(Debug)]
 pub struct OpenPlaylist {
     playlist: Playlist,
@@ -236,26 +293,30 @@ impl OpenPlaylist {
 pub struct App<A: Audio> {
     playback: Playback<A>,
     store: Box<dyn PlaylistStore>,
-    /// Built on first use: users who never touch playlists do not pay for it.
+    /// Built lazily, in practice by the playlist listing in [`App::new`].
     resolver: OnceCell<Resolver>,
     /// Library root, ready for display.
     root: String,
     /// Per track, lower-cased "title artist album" for case-insensitive search.
     search_keys: Vec<String>,
-    side: Side,
+    focus: Focus,
     /// Rows are library indices.
     library: ListState,
-    /// The playlists as last listed.
+    /// The playlists as last listed (and updated by the app's own edits),
+    /// sorted by name ignoring case.
     playlists: Vec<PlaylistInfo>,
-    /// Rows are indices into `playlists`.
+    /// The sidebar: value 0 is "Library", `i + 1` is `playlists[i]`.
     playlist_list: ListState,
-    /// The open playlist, if any; shown instead of the list on the playlists side.
+    /// The playlist shown in the main pane, if any (else the library is).
     open: Option<OpenPlaylist>,
     mode: Mode,
     /// Transient message and when it expires.
     status: Option<(Notice, Instant)>,
     /// Message raised by a key press, stamped and shown on the next tick.
     pending: Option<Notice>,
+    /// Whether `pending` was raised by the key press being handled (or by
+    /// startup), so a new notice is combined with it rather than replacing it.
+    pending_fresh: bool,
     /// Rows the list showed in the last frame (`PageUp`/`PageDown` step).
     page_size: usize,
     quit: bool,
@@ -265,7 +326,8 @@ impl<A: Audio> App<A> {
     /// The app over `tracks` (already sorted), playing through `audio`, with
     /// playlists kept in `store`. `root` is the library folder as shown to
     /// the user; `notice`, if any, is shown in the status area on the first
-    /// frame.
+    /// frame, joined with a playlist listing error if there is one. The
+    /// playlists are listed here, so the sidebar is filled on the first frame.
     pub fn new(
         tracks: Vec<Track>,
         audio: A,
@@ -278,13 +340,13 @@ impl<A: Audio> App<A> {
             .map(|t| format!("{}\n{}\n{}", t.title, t.artist, t.album).to_lowercase())
             .collect();
         let library = ListState::all(tracks.len());
-        Self {
+        let mut app = Self {
             playback: Playback::new(tracks, audio),
             store,
             resolver: OnceCell::new(),
             root,
             search_keys,
-            side: Side::Library,
+            focus: Focus::Main,
             library,
             playlists: Vec::new(),
             playlist_list: ListState::default(),
@@ -292,9 +354,12 @@ impl<A: Audio> App<A> {
             mode: Mode::Normal,
             status: None,
             pending: notice,
+            pending_fresh: true,
             page_size: 1,
             quit: false,
-        }
+        };
+        app.refresh_playlists(None);
+        app
     }
 
     #[must_use]
@@ -313,26 +378,58 @@ impl<A: Audio> App<A> {
         &self.root
     }
 
-    /// Which list is on screen.
+    /// Which list keys act on: the focused pane, and what it shows.
     #[must_use]
     pub const fn view(&self) -> View {
-        match (self.side, &self.open) {
-            (Side::Library, _) => View::Library,
-            (Side::Playlists, None) => View::Playlists,
-            (Side::Playlists, Some(_)) => View::Playlist,
+        match (self.focus, &self.open) {
+            (Focus::Sidebar, _) => View::Playlists,
+            (Focus::Main, None) => View::Library,
+            (Focus::Main, Some(_)) => View::Playlist,
         }
     }
 
-    /// The listed rows of the list on screen: library indices in the library
-    /// view, indices into [`App::playlists`] in the playlists view, and
+    /// The pane with keyboard focus.
+    #[must_use]
+    pub const fn focus(&self) -> Focus {
+        self.focus
+    }
+
+    /// What the main pane shows, whichever pane has focus.
+    #[must_use]
+    pub const fn main_view(&self) -> MainView {
+        if self.open.is_some() {
+            MainView::Playlist
+        } else {
+            MainView::Library
+        }
+    }
+
+    /// The sidebar list: value 0 is "Library", `i + 1` is
+    /// [`App::playlists`]`[i]`.
+    #[must_use]
+    pub fn sidebar_list(&self) -> ListView<'_> {
+        self.playlist_list.view()
+    }
+
+    /// The main pane's list: library indices, or positions in
+    /// [`OpenPlaylist::items`] when a playlist is shown.
+    #[must_use]
+    pub fn main_list(&self) -> ListView<'_> {
+        self.open.as_ref().map_or(&self.library, |o| &o.list).view()
+    }
+
+    /// The listed rows of the focused list: library indices in the library,
+    /// sidebar values in the sidebar (see [`App::sidebar_list`]), and
     /// positions in [`OpenPlaylist::items`] in an open playlist.
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by key-handling tests"))]
     pub fn visible(&self) -> &[usize] {
         &self.list().rows
     }
 
     /// Row of the selection in [`App::visible`], if anything is listed.
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by key-handling tests"))]
     pub fn selected(&self) -> Option<usize> {
         self.list().selected_row()
     }
@@ -350,19 +447,34 @@ impl<A: Audio> App<A> {
         }
     }
 
-    /// The search query of the list on screen (empty when no filter is active).
+    /// The search query of the focused list (empty when no filter is active).
     #[must_use]
     pub fn query(&self) -> &str {
         &self.list().query
     }
 
-    /// The playlists as last listed.
+    /// The playlists as last listed, sorted by name ignoring case.
     #[must_use]
     pub fn playlists(&self) -> &[PlaylistInfo] {
         &self.playlists
     }
 
-    /// The playlist open on the playlists side, if any.
+    /// The playlist selected in the sidebar; `None` on the "Library" row.
+    #[must_use]
+    pub fn selected_playlist(&self) -> Option<&PlaylistInfo> {
+        let value = self.playlist_list.selected_value()?;
+        self.playlists.get(value.checked_sub(1)?)
+    }
+
+    /// The sidebar value of playlist `name`, if it is listed.
+    fn sidebar_value_of(&self, name: &str) -> Option<usize> {
+        self.playlists
+            .iter()
+            .position(|info| info.name == name)
+            .map(|i| i + 1)
+    }
+
+    /// The playlist shown in the main pane, if any.
     #[must_use]
     pub const fn open_playlist(&self) -> Option<&OpenPlaylist> {
         self.open.as_ref()
@@ -392,6 +504,29 @@ impl<A: Audio> App<A> {
     /// Records how many list rows the last frame showed.
     pub fn set_page_size(&mut self, rows: usize) {
         self.page_size = rows.max(1);
+    }
+
+    /// Raises `notice` for the status area. Within one key press, an error
+    /// is never hidden: a later info notice is dropped, and an error raised
+    /// after an info notice is shown first with the info after it. Notices
+    /// of the same level are joined with `; `. A notice from an earlier key
+    /// press that was not shown yet is replaced.
+    pub fn notify(&mut self, notice: Notice) {
+        let merged = match self.pending.take() {
+            Some(old) if self.pending_fresh => match (old.level, notice.level) {
+                (Level::Error, Level::Info) => old,
+                (Level::Info, Level::Error) => {
+                    Notice::error(format!("{}; {}", notice.text, old.text))
+                }
+                (level, _) => Notice {
+                    text: format!("{}; {}", old.text, notice.text),
+                    level,
+                },
+            },
+            _ => notice,
+        };
+        self.pending = Some(merged);
+        self.pending_fresh = true;
     }
 
     /// Periodic housekeeping: drives playback (auto-advance, skipping broken
@@ -426,6 +561,8 @@ impl<A: Audio> App<A> {
             self.quit = true;
             return;
         }
+        // Notices of this key press are combined only with each other.
+        self.pending_fresh = false;
         match &self.mode {
             Mode::Normal => self.normal_key(key),
             Mode::Search => self.search_key(key),
@@ -454,7 +591,10 @@ impl<A: Audio> App<A> {
             KeyCode::Char('g') => self.list_mut().select_row(0),
             KeyCode::Char('G') => self.list_mut().select_row(usize::MAX),
             KeyCode::Enter => self.activate(),
-            KeyCode::Tab => self.switch_side(),
+            KeyCode::Tab | KeyCode::BackTab => match self.focus {
+                Focus::Main => self.focus_sidebar(None),
+                Focus::Sidebar => self.focus_main(),
+            },
             KeyCode::Char('a') if self.view() == View::Library => {
                 let tracks = self.selected_track().into_iter().collect();
                 self.open_picker(tracks);
@@ -478,18 +618,19 @@ impl<A: Audio> App<A> {
             KeyCode::Char('-') => self.playback.volume_down(),
             KeyCode::Char('z') => {
                 let on = self.playback.toggle_shuffle();
-                self.pending = Some(Notice::info(if on { "Shuffle on" } else { "Shuffle off" }));
+                self.notify(Notice::info(if on { "Shuffle on" } else { "Shuffle off" }));
             }
             KeyCode::Char('r') => {
                 let repeat = self.playback.cycle_repeat();
-                self.pending = Some(Notice::info(format!("Repeat {}", repeat.label())));
+                self.notify(Notice::info(format!("Repeat {}", repeat.label())));
             }
             KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Esc => {
                 if !self.query().is_empty() {
                     self.clear_filter();
-                } else if self.view() == View::Playlist {
-                    self.close_playlist();
+                } else if let (Focus::Main, Some(open)) = (self.focus, &self.open) {
+                    let name = open.name().to_owned();
+                    self.focus_sidebar(Some(&name));
                 }
             }
             _ => {}
@@ -574,7 +715,7 @@ impl<A: Audio> App<A> {
         if yes {
             self.delete_playlist(&name);
         } else {
-            self.pending = Some(Notice::info(format!("{} was not deleted", quoted(&name))));
+            self.notify(Notice::info(format!("{} was not deleted", quoted(&name))));
         }
     }
 
@@ -599,56 +740,67 @@ impl<A: Audio> App<A> {
         list.select_row(list.selected.saturating_add_signed(delta));
     }
 
-    /// The list state of the list on screen.
+    /// The list state of the focused list.
     const fn list(&self) -> &ListState {
-        match (self.side, &self.open) {
-            (Side::Library, _) => &self.library,
-            (Side::Playlists, None) => &self.playlist_list,
-            (Side::Playlists, Some(open)) => &open.list,
+        match (self.focus, &self.open) {
+            (Focus::Sidebar, _) => &self.playlist_list,
+            (Focus::Main, None) => &self.library,
+            (Focus::Main, Some(open)) => &open.list,
         }
     }
 
     const fn list_mut(&mut self) -> &mut ListState {
-        match (self.side, &mut self.open) {
-            (Side::Library, _) => &mut self.library,
-            (Side::Playlists, None) => &mut self.playlist_list,
-            (Side::Playlists, Some(open)) => &mut open.list,
+        match (self.focus, &mut self.open) {
+            (Focus::Sidebar, _) => &mut self.playlist_list,
+            (Focus::Main, None) => &mut self.library,
+            (Focus::Main, Some(open)) => &mut open.list,
         }
     }
 
-    /// Recomputes the list on screen for its query and selects the first match.
+    /// Recomputes the focused list for its query and selects the first
+    /// match: in the sidebar, the first matching playlist rather than the
+    /// "Library" row, which always matches.
     fn apply_filter(&mut self) {
         self.refilter_current();
-        self.list_mut().selected = 0;
+        let first = usize::from(self.focus == Focus::Sidebar && self.playlist_list.rows.len() > 1);
+        self.list_mut().select_row(first);
     }
 
-    /// Recomputes the rows of the list on screen; the selection is not moved.
+    /// Recomputes the rows of the focused list; the selection is not moved.
     fn refilter_current(&mut self) {
         let keys = &self.search_keys;
-        match (self.side, &mut self.open) {
-            (Side::Library, _) => self
+        match (self.focus, &mut self.open) {
+            (Focus::Sidebar, _) => self.refilter_sidebar(),
+            (Focus::Main, None) => self
                 .library
                 .refilter(keys.len(), |i, q| keys[i].contains(q)),
-            (Side::Playlists, Some(open)) => {
+            (Focus::Main, Some(open)) => {
                 let items = &open.items;
                 open.list.refilter(items.len(), |i, q| {
                     keys.get(items[i]).is_some_and(|k| k.contains(q))
                 });
             }
-            (Side::Playlists, None) => {
-                let infos = &self.playlists;
-                self.playlist_list
-                    .refilter(infos.len(), |i, q| infos[i].name.to_lowercase().contains(q));
-            }
         }
     }
 
-    /// Lists the whole list on screen again, keeping the selected entry selected.
+    /// Recomputes the sidebar rows for its query; "Library" (value 0)
+    /// always stays. The selection is not moved.
+    fn refilter_sidebar(&mut self) {
+        let infos = &self.playlists;
+        self.playlist_list.refilter(infos.len() + 1, |value, q| {
+            value
+                .checked_sub(1)
+                .and_then(|i| infos.get(i))
+                .is_none_or(|info| info.name.to_lowercase().contains(q))
+        });
+    }
+
+    /// Lists the whole focused list again, keeping the selected entry selected.
     fn clear_filter(&mut self) {
-        let len = match (self.side, &self.open) {
-            (Side::Library, _) => self.search_keys.len(),
-            (Side::Playlists, None) => self.playlists.len(),
-            (Side::Playlists, Some(open)) => open.items.len(),
+        let len = match (self.focus, &self.open) {
+            (Focus::Sidebar, _) => self.playlists.len() + 1,
+            (Focus::Main, None) => self.search_keys.len(),
+            (Focus::Main, Some(open)) => open.items.len(),
         };
         self.list_mut().clear_filter(len);
     }
@@ -658,7 +810,7 @@ impl<A: Audio> App<A> {
             .get_or_init(|| Resolver::new(self.playback.tracks()))
     }
 
-    /// `Enter` in normal mode: play a track or open a playlist.
+    /// `Enter` in normal mode: play a track, or show the sidebar entry.
     fn activate(&mut self) {
         match self.view() {
             View::Library => {
@@ -666,16 +818,7 @@ impl<A: Audio> App<A> {
                     self.playback.play(track);
                 }
             }
-            View::Playlists => {
-                let name = self
-                    .playlist_list
-                    .selected_value()
-                    .and_then(|i| self.playlists.get(i))
-                    .map(|info| info.name.clone());
-                if let Some(name) = name {
-                    self.open_named(&name);
-                }
-            }
+            View::Playlists => self.show_selected(),
             View::Playlist => {
                 let Some(open) = &self.open else {
                     return;
@@ -683,7 +826,7 @@ impl<A: Audio> App<A> {
                 if let Some(item) = open.list.selected_value() {
                     let source = Source::Playlist(open.name().to_owned());
                     if !self.playback.play_source(source, open.items.clone(), item) {
-                        self.pending = Some(Notice::error(format!(
+                        self.notify(Notice::error(format!(
                             "Cannot play {}: its tracks no longer match the library",
                             quoted(open.name())
                         )));
@@ -693,44 +836,124 @@ impl<A: Audio> App<A> {
         }
     }
 
-    /// `Tab`: shows the other side. Entering the playlists side refreshes
-    /// the listing and reloads the open playlist if its file changed.
-    fn switch_side(&mut self) {
-        match self.side {
-            Side::Playlists => self.side = Side::Library,
-            Side::Library => {
-                self.side = Side::Playlists;
-                self.refresh_playlists(None);
-                self.check_open();
-            }
+    /// `Enter` in the sidebar: "Library" shows the library; a playlist is
+    /// opened (or, if already shown, reloaded only if its file changed, so
+    /// it keeps its filter and selection). The main pane gets the focus,
+    /// unless the playlist could not be read: then focus and the main pane
+    /// stay as they were.
+    fn show_selected(&mut self) {
+        let Some(value) = self.playlist_list.selected_value() else {
+            return;
+        };
+        let Some(index) = value.checked_sub(1) else {
+            // "Library".
+            self.open = None;
+            self.focus = Focus::Main;
+            return;
+        };
+        let Some(info) = self.playlists.get(index) else {
+            return;
+        };
+        let name = info.name.clone();
+        let shown = |app: &Self| app.open.as_ref().is_some_and(|o| o.name() == name);
+        if shown(self) {
+            self.check_open();
+        } else {
+            self.open_named(&name);
+        }
+        if shown(self) {
+            self.focus = Focus::Main;
         }
     }
 
-    /// Lists the playlists again, keeping the filter and the selected
-    /// playlist (or selecting `select`, if given and listed).
+    /// Moves focus to the sidebar and lists the playlists again, keeping
+    /// the sidebar selection unless `select` names a listed playlist (see
+    /// [`Self::refresh_playlists`]).
+    fn focus_sidebar(&mut self, select: Option<&str>) {
+        self.focus = Focus::Sidebar;
+        self.refresh_playlists(select);
+    }
+
+    /// Moves focus to the main pane. A shown playlist is reloaded if
+    /// another program changed its file; if the file is gone, the main pane
+    /// shows the library instead.
+    fn focus_main(&mut self) {
+        self.focus = Focus::Main;
+        self.check_open();
+    }
+
+    /// The sidebar entry selected now.
+    fn sidebar_pick(&self) -> Option<SidebarPick> {
+        match self.playlist_list.selected_value()? {
+            0 => Some(SidebarPick::Library),
+            _ => self
+                .selected_playlist()
+                .map(|info| SidebarPick::Playlist(info.name.clone())),
+        }
+    }
+
+    /// Selects `pick` in the sidebar if it is listed, else keeps the
+    /// selected row (clamped).
+    fn restore_sidebar(&mut self, pick: Option<SidebarPick>) {
+        let value = match pick {
+            Some(SidebarPick::Library) => Some(0),
+            Some(SidebarPick::Playlist(name)) => self.sidebar_value_of(&name),
+            None => None,
+        };
+        self.playlist_list.select_value(value);
+    }
+
+    /// Lists the playlists again, keeping the sidebar filter and the
+    /// selected entry, or selecting playlist `select` if given and listed.
+    /// When the sidebar filter hides `select`, the filter is cleared, so
+    /// the selection never lands on another playlist instead.
     fn refresh_playlists(&mut self, select: Option<&str>) {
-        let keep = select.map(str::to_owned).or_else(|| {
-            self.playlist_list
-                .selected_value()
-                .and_then(|i| self.playlists.get(i))
-                .map(|info| info.name.clone())
-        });
+        let keep = self.sidebar_pick();
         match self.store.list(self.resolver()) {
             Ok(infos) => self.playlists = infos,
             Err(err) => {
                 self.playlists.clear();
-                self.pending = Some(list_error(&err));
+                self.notify(list_error(&err));
             }
         }
-        let infos = &self.playlists;
-        self.playlist_list
-            .refilter(infos.len(), |i, q| infos[i].name.to_lowercase().contains(q));
-        let value = keep.and_then(|name| infos.iter().position(|info| info.name == name));
-        self.playlist_list.select_value(value);
+        self.refilter_sidebar();
+        let listed = select.filter(|name| self.sidebar_value_of(name).is_some());
+        if let Some(value) = listed.and_then(|name| self.sidebar_value_of(name))
+            && !self.playlist_list.rows.contains(&value)
+        {
+            self.playlist_list.query.clear();
+            self.refilter_sidebar();
+        }
+        self.restore_sidebar(
+            listed.map_or(keep, |name| Some(SidebarPick::Playlist(name.to_owned()))),
+        );
+    }
+
+    /// Writes the sidebar entry of `playlist`, just saved or read by the
+    /// app, in place (inserting it in sorted order if it is new), without
+    /// listing the folder again. The sidebar keeps its selected entry.
+    fn update_info(&mut self, playlist: &Playlist) {
+        let info = PlaylistInfo {
+            name: playlist.name().to_owned(),
+            tracks: Some(playlist.tracks().len()),
+            read_only: playlist.editable().err(),
+        };
+        let keep = self.sidebar_pick();
+        if let Some(slot) = self.playlists.iter_mut().find(|i| i.name == info.name) {
+            *slot = info;
+        } else {
+            // The same order as the store's listing.
+            let key = |name: &str| (name.to_lowercase(), name.to_owned());
+            let new = key(&info.name);
+            let at = self.playlists.partition_point(|i| key(&i.name) < new);
+            self.playlists.insert(at, info);
+        }
+        self.refilter_sidebar();
+        self.restore_sidebar(keep);
     }
 
     /// Reloads the open playlist if another program changed its file, or
-    /// goes back to the list if the file is gone.
+    /// closes it (the main pane shows the library) if the file is gone.
     fn check_open(&mut self) {
         let Some(open) = &self.open else {
             return;
@@ -740,7 +963,7 @@ impl<A: Audio> App<A> {
             Ok(true) => {
                 let name = open.name().to_owned();
                 if self.reload(&name) {
-                    self.pending = Some(Notice::info(format!(
+                    self.notify(Notice::info(format!(
                         "{} was changed by another program and has been reloaded",
                         quoted(&name)
                     )));
@@ -752,12 +975,13 @@ impl<A: Audio> App<A> {
             }
             Err(err) => {
                 let name = open.name().to_owned();
-                self.pending = Some(store_error(&name, &err));
+                self.notify(store_error(&name, &err));
             }
         }
     }
 
-    /// Opens playlist `name` from the playlists list.
+    /// Opens playlist `name` in the main pane. On failure the error is
+    /// reported and the open playlist, if any, stays.
     fn open_named(&mut self, name: &str) {
         let playlist = match self.store.load(name, self.resolver()) {
             Ok(playlist) => playlist,
@@ -766,10 +990,11 @@ impl<A: Audio> App<A> {
                 return;
             }
             Err(err) => {
-                self.pending = Some(store_error(name, &err));
+                self.notify(store_error(name, &err));
                 return;
             }
         };
+        self.update_info(&playlist);
         let unmatched = playlist.unmatched();
         let read_only = playlist.editable().err();
         let items = playlist.tracks();
@@ -790,18 +1015,11 @@ impl<A: Audio> App<A> {
             parts.push(format!("read-only: {reason}"));
         }
         if !parts.is_empty() {
-            self.pending = Some(Notice::info(format!(
+            self.notify(Notice::info(format!(
                 "{}: {}",
                 quoted(name),
                 parts.join("; ")
             )));
-        }
-    }
-
-    /// `Esc` in an open playlist: back to the list, with that playlist selected.
-    fn close_playlist(&mut self) {
-        if let Some(open) = self.open.take() {
-            self.refresh_playlists(Some(open.name()));
         }
     }
 
@@ -818,44 +1036,60 @@ impl<A: Audio> App<A> {
                 false
             }
             Err(err) => {
-                self.pending = Some(store_error(name, &err));
+                self.notify(store_error(name, &err));
                 false
             }
         }
     }
 
-    /// The file of playlist `name` disappeared: if it was open, go back to
-    /// the list; if it was playing, playback goes on detached from it.
+    /// The file of playlist `name` disappeared: if it was shown, the main
+    /// pane shows the library; if it was playing, playback goes on detached
+    /// from it.
     fn playlist_gone(&mut self, name: &str) {
         if self.open.as_ref().is_some_and(|o| o.name() == name) {
             self.open = None;
         }
         self.playback.playlist_deleted(name);
         self.refresh_playlists(None);
-        self.pending = Some(Notice::error(format!("{} no longer exists", quoted(name))));
+        self.notify(Notice::error(format!("{} no longer exists", quoted(name))));
     }
 
-    /// Takes `playlist` as the latest version of its file: it replaces the
-    /// open playlist if that one has the same name (keeping its filter and
-    /// selection), and the play order if it is the playlist playing and the
-    /// play order does not match it.
+    /// Takes `playlist` as the latest version of its file: it updates its
+    /// sidebar entry, replaces the open playlist if that one has the same
+    /// name (keeping its filter and selection), and the play order if it is
+    /// the playlist playing and the play order does not match it.
     fn install(&mut self, playlist: Playlist) {
+        self.update_info(&playlist);
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.name() == playlist.name())
+        {
+            self.replace_open(playlist);
+        } else {
+            let items = playlist.tracks();
+            self.follow_reload(playlist.name(), &items);
+        }
+    }
+
+    /// Shows `playlist` in place of the open playlist, whatever its name was
+    /// (a rename changes it), keeping the filter and the selected entry, and
+    /// makes the play order follow it if it is playing.
+    fn replace_open(&mut self, playlist: Playlist) {
         let items = playlist.tracks();
         self.follow_reload(playlist.name(), &items);
         let keys = &self.search_keys;
-        match &mut self.open {
-            Some(open) if open.name() == playlist.name() => {
-                let keep = open.list.selected_value();
-                open.playlist = playlist;
-                open.items = items;
-                let items = &open.items;
-                open.list.refilter(items.len(), |i, q| {
-                    keys.get(items[i]).is_some_and(|k| k.contains(q))
-                });
-                open.list.select_value(keep);
-            }
-            Some(_) | None => {}
-        }
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        let keep = open.list.selected_value();
+        open.playlist = playlist;
+        open.items = items;
+        let items = &open.items;
+        open.list.refilter(items.len(), |i, q| {
+            keys.get(items[i]).is_some_and(|k| k.contains(q))
+        });
+        open.list.select_value(keep);
     }
 
     /// Makes the play order of playlist `name`, if it is playing, hold `items`.
@@ -884,13 +1118,13 @@ impl<A: Audio> App<A> {
     /// `a` / `A`: asks which playlist to add `tracks` to.
     fn open_picker(&mut self, tracks: Vec<usize>) {
         if tracks.is_empty() {
-            self.pending = Some(Notice::info("No track to add"));
+            self.notify(Notice::info("No track to add"));
             return;
         }
         let choices = match self.store.list(self.resolver()) {
             Ok(infos) => infos,
             Err(err) => {
-                self.pending = Some(list_error(&err));
+                self.notify(list_error(&err));
                 Vec::new()
             }
         };
@@ -919,10 +1153,8 @@ impl<A: Audio> App<A> {
             return;
         };
         if let Some(reason) = info.read_only {
-            self.pending = Some(Notice::error(format!(
-                "Cannot add to {}: {reason}",
-                quoted(&info.name)
-            )));
+            let notice = Notice::error(format!("Cannot add to {}: {reason}", quoted(&info.name)));
+            self.notify(notice);
             self.mode = Mode::Picker(picker);
             return;
         }
@@ -932,6 +1164,8 @@ impl<A: Audio> App<A> {
 
     /// Adds library `tracks` to existing playlist `name` and saves it.
     fn add_to(&mut self, name: &str, tracks: &[usize]) {
+        // Unreachable from the keys since the focus model (`a`/`A` need the
+        // library shown, so nothing is open), kept as a safeguard.
         // The open copy is what the user last saw: a change made on disk
         // since then is detected on save instead of silently merged.
         let open_copy = self
@@ -948,7 +1182,7 @@ impl<A: Audio> App<A> {
                     return;
                 }
                 Err(err) => {
-                    self.pending = Some(store_error(name, &err));
+                    self.notify(store_error(name, &err));
                     return;
                 }
             },
@@ -957,7 +1191,7 @@ impl<A: Audio> App<A> {
         let outcome = match playlist.add(tracks, self.playback.tracks()) {
             Ok(outcome) => outcome,
             Err(err) => {
-                self.pending = Some(Notice::error(format!(
+                self.notify(Notice::error(format!(
                     "Cannot add to {}: {err}",
                     quoted(name)
                 )));
@@ -965,7 +1199,7 @@ impl<A: Audio> App<A> {
             }
         };
         if outcome.added == 0 {
-            self.pending = Some(add_notice(name, outcome));
+            self.notify(add_notice(name, outcome));
             return;
         }
         match self.store.save(&mut playlist) {
@@ -975,12 +1209,14 @@ impl<A: Audio> App<A> {
                 self.follow_edit(name, &before, &after, Edit::Append(appended));
                 if self.open.as_ref().is_some_and(|o| o.name() == name) {
                     self.install(playlist);
+                } else {
+                    self.update_info(&playlist);
                 }
-                self.pending = Some(add_notice(name, outcome));
+                self.notify(add_notice(name, outcome));
             }
             Ok(SaveOutcome::ChangedOnDisk) => {
                 if self.reload(name) {
-                    self.pending = Some(Notice::error(format!(
+                    self.notify(Notice::error(format!(
                         "{} was changed by another program and has been reloaded; nothing was added",
                         quoted(name)
                     )));
@@ -991,10 +1227,10 @@ impl<A: Audio> App<A> {
                 // Typically a link repointed outside `Playlists/` since the
                 // playlist was read: reload so it shows as read-only.
                 if self.reload(name) {
-                    self.pending = Some(store_error(name, &err));
+                    self.notify(store_error(name, &err));
                 }
             }
-            Err(err) => self.pending = Some(store_error(name, &err)),
+            Err(err) => self.notify(store_error(name, &err)),
         }
     }
 
@@ -1014,7 +1250,7 @@ impl<A: Audio> App<A> {
             ),
         };
         if let Err(reason) = result {
-            self.pending = Some(Notice::error(format!("{failed}: {reason}")));
+            self.notify(Notice::error(format!("{failed}: {reason}")));
             input.error = Some(reason);
             self.mode = Mode::NameInput(input);
         }
@@ -1028,7 +1264,7 @@ impl<A: Audio> App<A> {
             Ok(playlist) => playlist,
             Err(StoreError::Name(err)) => return Err(err.to_string()),
             Err(err) => {
-                self.pending = Some(store_error(name.trim(), &err));
+                self.notify(store_error(name.trim(), &err));
                 return Ok(());
             }
         };
@@ -1036,7 +1272,7 @@ impl<A: Audio> App<A> {
         let outcome = match playlist.add(tracks, self.playback.tracks()) {
             Ok(outcome) => outcome,
             Err(err) => {
-                self.pending = Some(Notice::error(format!(
+                self.notify(Notice::error(format!(
                     "Playlist {} not created: {err}",
                     quoted(&name)
                 )));
@@ -1048,19 +1284,20 @@ impl<A: Audio> App<A> {
             // playlist is not what was asked for.
             let mut notice = add_notice(&name, outcome);
             notice.text = format!("Playlist {} not created. {}", quoted(&name), notice.text);
-            self.pending = Some(notice);
+            self.notify(notice);
             return Ok(());
         }
         match self.store.create(&mut playlist) {
             Ok(()) => {
+                self.update_info(&playlist);
                 let mut notice = add_notice(&name, outcome);
                 notice.text = format!("Created {}. {}", quoted(&name), notice.text);
-                self.pending = Some(notice);
+                self.notify(notice);
                 Ok(())
             }
             Err(StoreError::Name(err)) => Err(err.to_string()),
             Err(err) => {
-                self.pending = Some(store_error(&name, &err));
+                self.notify(store_error(&name, &err));
                 Ok(())
             }
         }
@@ -1085,7 +1322,7 @@ impl<A: Audio> App<A> {
             return;
         };
         if !open.list.query.is_empty() {
-            self.pending = Some(Notice::info("Clear the filter (Esc) to reorder"));
+            self.notify(Notice::info("Clear the filter (Esc) to reorder"));
             return;
         }
         let Some(from) = open.list.selected_value() else {
@@ -1114,7 +1351,7 @@ impl<A: Audio> App<A> {
             // Past either end, or nothing selected: nothing to do.
             Ok(false) => return,
             Err(err) => {
-                self.pending = Some(Notice::error(format!(
+                self.notify(Notice::error(format!(
                     "Cannot edit {}: {err}",
                     quoted(&name)
                 )));
@@ -1142,7 +1379,7 @@ impl<A: Audio> App<A> {
                         .tracks()
                         .get(track)
                         .map_or("", |t| t.title.as_str());
-                    self.pending = Some(Notice::info(format!(
+                    self.notify(Notice::info(format!(
                         "Removed {} from {}",
                         quoted(title),
                         quoted(&name)
@@ -1151,7 +1388,7 @@ impl<A: Audio> App<A> {
             }
             Ok(SaveOutcome::ChangedOnDisk) => {
                 if self.reload(&name) {
-                    self.pending = Some(Notice::error(format!(
+                    self.notify(Notice::error(format!(
                         "{} was changed by another program and has been reloaded; the edit was not applied",
                         quoted(&name)
                     )));
@@ -1162,10 +1399,10 @@ impl<A: Audio> App<A> {
                 // Typically a link repointed outside `Playlists/` since the
                 // playlist was read: reload so it shows as read-only.
                 if self.reload(&name) {
-                    self.pending = Some(store_error(&name, &err));
+                    self.notify(store_error(&name, &err));
                 }
             }
-            Err(err) => self.pending = Some(store_error(&name, &err)),
+            Err(err) => self.notify(store_error(&name, &err)),
         }
     }
 
@@ -1193,19 +1430,12 @@ impl<A: Audio> App<A> {
     }
 }
 
-/// Renaming and deleting playlists: `R` and `D` in the playlists list.
+/// Renaming and deleting playlists: `R` and `D` in the sidebar.
 impl<A: Audio> App<A> {
-    /// Name of the playlist selected in the playlists list.
-    fn selected_playlist(&self) -> Option<String> {
-        self.playlist_list
-            .selected_value()
-            .and_then(|i| self.playlists.get(i))
-            .map(|info| info.name.clone())
-    }
-
-    /// `R`: asks for a new name, prefilled with the current one.
+    /// `R`: asks for a new name for the playlist selected in the sidebar,
+    /// prefilled with the current one. Nothing on the "Library" row.
     fn start_rename(&mut self) {
-        let Some(name) = self.selected_playlist() else {
+        let Some(name) = self.selected_playlist().map(|info| info.name.clone()) else {
             return;
         };
         // Names made outside kasset may be longer than the input allows;
@@ -1220,7 +1450,10 @@ impl<A: Audio> App<A> {
     /// Renames playlist `old` to `text` (trimmed). A refused name is
     /// returned as `Err` with the reason, so the prompt can stay open; other
     /// failures are reported and close the prompt. Playback of the playlist
-    /// goes on under its new name.
+    /// goes on under its new name. If the renamed playlist is shown, it is
+    /// read again from its new file (so its path and stamp come from disk)
+    /// and stays shown under the new name; if that read fails, the main pane
+    /// shows the library and the error is reported.
     fn rename_playlist(&mut self, old: &str, text: &str) -> Result<(), String> {
         let new = validate_name(text)
             .map_err(|err| err.to_string())?
@@ -1231,17 +1464,25 @@ impl<A: Audio> App<A> {
         match self.store.rename(old, &new) {
             Ok(()) => {
                 self.playback.playlist_renamed(old, &new);
-                if self.open.as_ref().is_some_and(|o| o.name() == old) {
-                    // Not reachable from the keys (`R` works in the list),
-                    // but an open copy must never keep the old path.
-                    self.open = None;
-                }
-                self.refresh_playlists(Some(&new));
-                self.pending = Some(Notice::info(format!(
+                // Raised first: an error reading the file back is joined
+                // with it rather than hiding that the rename happened.
+                self.notify(Notice::info(format!(
                     "Renamed {} to {}",
                     quoted(old),
                     quoted(&new)
                 )));
+                if self.open.as_ref().is_some_and(|o| o.name() == old) {
+                    // The open copy must never keep the old path: a later
+                    // save would recreate the old file.
+                    match self.store.load(&new, self.resolver()) {
+                        Ok(playlist) => self.replace_open(playlist),
+                        Err(err) => {
+                            self.open = None;
+                            self.notify(store_error(&new, &err));
+                        }
+                    }
+                }
+                self.refresh_playlists(Some(&new));
                 Ok(())
             }
             Err(StoreError::Name(err)) => Err(err.to_string()),
@@ -1250,21 +1491,23 @@ impl<A: Audio> App<A> {
                 Ok(())
             }
             Err(err) => {
-                self.pending = Some(store_error(old, &err));
+                self.notify(store_error(old, &err));
                 Ok(())
             }
         }
     }
 
-    /// `D`: asks whether to delete the selected playlist.
+    /// `D`: asks whether to delete the playlist selected in the sidebar.
+    /// Nothing on the "Library" row.
     fn start_delete(&mut self) {
-        if let Some(name) = self.selected_playlist() {
+        if let Some(name) = self.selected_playlist().map(|info| info.name.clone()) {
             self.mode = Mode::ConfirmDelete(name);
         }
     }
 
     /// Deletes the file of playlist `name` (a symlink itself, never its
-    /// target; never an audio file). If it was playing, playback goes on.
+    /// target; never an audio file). If it was playing, playback goes on;
+    /// if it was shown, the main pane shows the library.
     fn delete_playlist(&mut self, name: &str) {
         match self.store.delete(name) {
             Ok(()) => {
@@ -1273,13 +1516,13 @@ impl<A: Audio> App<A> {
                     self.open = None;
                 }
                 self.refresh_playlists(None);
-                self.pending = Some(Notice::info(format!(
+                self.notify(Notice::info(format!(
                     "Deleted playlist {}; its songs stay in the library",
                     quoted(name)
                 )));
             }
             Err(StoreError::NotFound) => self.playlist_gone(name),
-            Err(err) => self.pending = Some(store_error(name, &err)),
+            Err(err) => self.notify(store_error(name, &err)),
         }
     }
 }
@@ -1811,8 +2054,22 @@ mod playlist_tests {
                 .unwrap_or_default()
         }
 
-        /// Selects the library track titled `title` (no filter active).
+        /// Shows the library in the main pane and focuses it: from the
+        /// sidebar, `Enter` on "Library" (which closes an open playlist).
+        fn show_library(&mut self) {
+            if self.app.view() == View::Library {
+                return;
+            }
+            if self.app.focus() == Focus::Main {
+                self.keys(&[KeyCode::Tab]);
+            }
+            self.keys(&[KeyCode::Home, KeyCode::Enter]);
+        }
+
+        /// Shows the library and selects its track titled `title` (no
+        /// filter active).
         fn select_in_library(&mut self, title: &str) -> Result<()> {
+            self.show_library();
             let Some(index) = self
                 .app
                 .playback()
@@ -1829,19 +2086,28 @@ mod playlist_tests {
             Ok(())
         }
 
-        /// From the library: `Tab`, then opens playlist `name`.
-        fn open(&mut self, name: &str) -> Result<()> {
-            self.keys(&[KeyCode::Tab]);
-            let Some(index) = self.app.playlists().iter().position(|i| i.name == name) else {
+        /// Focuses the sidebar (with `Tab` if needed) and selects
+        /// playlist `name` in it.
+        fn select_playlist(&mut self, name: &str) -> Result<()> {
+            if self.app.focus() == Focus::Main {
+                self.keys(&[KeyCode::Tab]);
+            }
+            let Some(value) = self.app.sidebar_value_of(name) else {
                 bail!("{name} not listed");
             };
-            let Some(row) = self.app.visible().iter().position(|&r| r == index) else {
+            let Some(row) = self.app.visible().iter().position(|&r| r == value) else {
                 bail!("{name} filtered out");
             };
             self.keys(&[KeyCode::Home]);
             for _ in 0..row {
                 self.keys(&[KeyCode::Down]);
             }
+            Ok(())
+        }
+
+        /// Selects playlist `name` in the sidebar and opens it with `Enter`.
+        fn open(&mut self, name: &str) -> Result<()> {
+            self.select_playlist(name)?;
             self.keys(&[KeyCode::Enter]);
             if self.app.view() != View::Playlist {
                 bail!("{name} did not open");
@@ -1887,17 +2153,20 @@ mod playlist_tests {
         }
     }
 
-    // --- Switching sides, opening and leaving playlists (task 3.1) ---
+    // --- Focus, opening and leaving playlists ---
 
+    /// Spec *No folder*: only "Library" is listed and nothing is written.
     #[test]
     fn open_playlists_view_without_folder_writes_nothing() -> Result<()> {
         let mut m = abcd()?;
+        assert_eq!(m.app.sidebar_list().rows, [0], "only \"Library\"");
         m.keys(&[KeyCode::Tab]);
         assert_eq!(m.app.view(), View::Playlists);
         assert_eq!(m.app.playlists(), []);
         assert!(!m.dir().exists(), "nothing written to disk");
         m.keys(&[KeyCode::Enter, KeyCode::Esc]);
-        assert_eq!(m.app.view(), View::Playlists);
+        assert_eq!(m.app.view(), View::Library, "Enter on \"Library\" shows it");
+        assert!(!m.dir().exists(), "nothing written to disk");
         Ok(())
     }
 
@@ -1934,11 +2203,15 @@ mod playlist_tests {
         assert_eq!(m.app.visible(), [0, 1, 2, 3]);
         assert_eq!(m.app.selected_track(), Some(2));
 
-        // From an open playlist too.
+        // Spec *Back to library*: from an open playlist, `Enter` on
+        // "Library" in the sidebar.
         m.write("Running", &["A"])?;
         m.open("Running")?;
-        m.keys(&[KeyCode::Tab]);
+        m.keys(&[KeyCode::Tab, KeyCode::Home, KeyCode::Enter]);
         assert_eq!(m.app.view(), View::Library);
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert!(m.app.open_playlist().is_none());
+        assert_eq!(m.app.query(), "band");
         assert_eq!(m.app.selected_track(), Some(2));
         Ok(())
     }
@@ -1965,8 +2238,404 @@ mod playlist_tests {
         Ok(())
     }
 
+    impl Music {
+        /// Starts kasset again over the same library and folder, with
+        /// startup notice `notice`.
+        fn restart(&mut self, notice: Option<Notice>) {
+            let tracks = self.app.playback().tracks().to_vec();
+            self.app = App::new(
+                tracks,
+                SilentAudio::default(),
+                Box::new(FsStore::new(&self.root)),
+                self.root.display().to_string(),
+                notice,
+            );
+        }
+
+        /// Names in the sidebar rows, "Library" included.
+        fn sidebar_rows(&self) -> Vec<String> {
+            self.app
+                .sidebar_list()
+                .rows
+                .iter()
+                .map(|&v| match v.checked_sub(1) {
+                    None => "Library".to_owned(),
+                    Some(i) => self
+                        .app
+                        .playlists()
+                        .get(i)
+                        .map_or_else(|| "<missing>".to_owned(), |p| p.name.clone()),
+                })
+                .collect()
+        }
+
+        fn info(&self, name: &str) -> Option<PlaylistInfo> {
+            self.app
+                .playlists()
+                .iter()
+                .find(|i| i.name == name)
+                .cloned()
+        }
+    }
+
+    // --- Sidebar list (task 2.1) ---
+
     #[test]
-    fn open_playlist_removed_meanwhile_falls_back_to_the_list() -> Result<()> {
+    fn sidebar_filter_keeps_library_and_selects_the_first_match() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Long run", &["B"])?;
+        m.write("Running", &["C"])?;
+        m.keys(&[KeyCode::Tab]);
+        assert_eq!(m.sidebar_rows(), ["Library", "Gym", "Long run", "Running"]);
+        m.chars("/run");
+        assert_eq!(m.sidebar_rows(), ["Library", "Long run", "Running"]);
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Long run"));
+        m.chars("ning");
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Running"));
+        m.chars("zzz");
+        assert_eq!(m.sidebar_rows(), ["Library"], "never filtered out");
+        assert_eq!(m.app.selected(), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_navigation_reaches_library_and_the_last_playlist() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Running", &["C"])?;
+        m.keys(&[KeyCode::Tab]);
+        assert_eq!(m.app.selected(), Some(0), "\"Library\" selected at first");
+        m.shift('G');
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Running"));
+        m.chars("g");
+        assert_eq!(m.app.selected(), Some(0));
+        assert_eq!(m.app.selected_playlist(), None);
+        m.chars("jk");
+        assert_eq!(m.app.selected(), Some(0), "k reaches \"Library\"");
+        Ok(())
+    }
+
+    // --- Startup listing and notices (task 2.2) ---
+
+    /// Spec *Playlists listed on start*.
+    #[test]
+    fn playlists_listed_on_start() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A"])?;
+        m.write("Gym", &["B", "C"])?;
+        m.restart(None);
+        assert_eq!(m.sidebar_rows(), ["Library", "Gym", "Running"]);
+        assert_eq!(m.info("Gym").and_then(|i| i.tracks), Some(2));
+        Ok(())
+    }
+
+    /// Spec *No folder*, at start.
+    #[test]
+    fn no_folder_lists_only_library_and_writes_nothing() -> Result<()> {
+        let mut m = abcd()?;
+        m.restart(None);
+        assert_eq!(m.sidebar_rows(), ["Library"]);
+        assert_eq!(m.status(), "");
+        assert!(!m.dir().exists());
+        Ok(())
+    }
+
+    /// Spec *Nothing played yet*, at the state level.
+    #[test]
+    fn nothing_is_playing_on_start() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A"])?;
+        m.restart(None);
+        assert!(m.app.playback().current_track().is_none());
+        assert!(!m.app.playback().is_playing_playlist("Running"));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_notice_and_listing_error_are_joined() -> Result<()> {
+        let mut m = abcd()?;
+        fs::write(m.dir(), "not a folder")?;
+        m.restart(Some(Notice::info("3 entries skipped")));
+        let now = Instant::now();
+        m.app.tick(now);
+        let notice = m.app.status(now).cloned();
+        let text = notice.as_ref().map_or("", |n| n.text.as_str());
+        assert!(text.starts_with("Cannot list playlists"), "{text}");
+        assert!(text.ends_with("; 3 entries skipped"), "{text}");
+        assert_eq!(notice.map(|n| n.level), Some(Level::Error));
+        assert_eq!(m.sidebar_rows(), ["Library"]);
+        Ok(())
+    }
+
+    #[test]
+    fn info_after_an_error_does_not_hide_it() -> Result<()> {
+        let mut m = abcd()?;
+        m.app.notify(Notice::error("broken"));
+        m.app.notify(Notice::info("fine"));
+        m.app.notify(Notice::error("worse"));
+        let now = Instant::now();
+        m.app.tick(now);
+        let notice = m.app.status(now).cloned();
+        assert_eq!(
+            notice.as_ref().map(|n| n.text.as_str()),
+            Some("broken; worse")
+        );
+        assert_eq!(notice.map(|n| n.level), Some(Level::Error));
+        Ok(())
+    }
+
+    #[test]
+    fn a_later_key_press_replaces_an_unshown_notice() -> Result<()> {
+        let mut m = abcd()?;
+        m.chars("zz");
+        assert_eq!(m.status(), "Shuffle off", "not joined across key presses");
+        Ok(())
+    }
+
+    /// Measures the cost the startup listing adds to `App::new` (task 2.2):
+    /// `cargo test --release startup_listing_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing measurement, run by hand"]
+    fn startup_listing_cost() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = fs::canonicalize(tmp.path())?;
+        let tracks: Vec<Track> = (0..100_000)
+            .map(|i| Track {
+                path: root.join(format!("Artist {}/Album {}/{i:06}.mp3", i % 500, i % 37)),
+                title: format!("Title {i}"),
+                artist: format!("Artist {}", i % 500),
+                album: format!("Album {}", i % 37),
+                number: None,
+                duration: None,
+            })
+            .collect();
+        let resolver_start = Instant::now();
+        let resolver = Resolver::new(&tracks);
+        let listed = FsStore::new(&root).list(&resolver)?;
+        let listing = resolver_start.elapsed();
+        let start = Instant::now();
+        let app = App::new(
+            tracks,
+            SilentAudio::default(),
+            Box::new(FsStore::new(&root)),
+            String::new(),
+            None,
+        );
+        let total = start.elapsed();
+        println!(
+            "App::new on 100 000 tracks: {total:?}; listing (resolver + list): {listing:?}; {} playlists",
+            listed.len() + app.playlists().len()
+        );
+        Ok(())
+    }
+
+    // --- Focus and keys (task 2.3) ---
+
+    /// Spec *Focus on start*.
+    #[test]
+    fn focus_on_start_is_the_library() -> Result<()> {
+        let m = abcd()?;
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.app.main_view(), MainView::Library);
+        assert_eq!(m.app.view(), View::Library);
+        Ok(())
+    }
+
+    /// Spec *Tab moves focus*, with `Tab` and Shift+Tab.
+    #[test]
+    fn tab_and_back_tab_move_focus_and_keep_the_main_list() -> Result<()> {
+        let mut m = abcd()?;
+        m.chars("/band");
+        m.keys(&[KeyCode::Enter, KeyCode::Down]);
+        let before = format!("{:?}", m.app.main_list());
+        for back in [KeyCode::Tab, KeyCode::BackTab] {
+            m.keys(&[KeyCode::Tab]);
+            assert_eq!(m.app.focus(), Focus::Sidebar);
+            assert_eq!(format!("{:?}", m.app.main_list()), before);
+            m.app.handle_key(KeyEvent::new(back, KeyModifiers::SHIFT));
+            assert_eq!(m.app.focus(), Focus::Main);
+            assert_eq!(format!("{:?}", m.app.main_list()), before);
+        }
+        Ok(())
+    }
+
+    /// Spec *Keys go to the focused pane* and *Open playlists view*.
+    #[test]
+    fn keys_go_to_the_focused_pane() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Running", &["B"])?;
+        m.keys(&[KeyCode::Tab]);
+        assert_eq!(m.sidebar_rows(), ["Library", "Gym", "Running"]);
+        assert_eq!(m.app.main_view(), MainView::Library);
+        m.chars("j");
+        assert_eq!(m.app.sidebar_list().selected, Some(1));
+        assert_eq!(m.app.main_list().selected, Some(0), "main pane unchanged");
+        Ok(())
+    }
+
+    /// Spec *Listing refreshed*.
+    #[test]
+    fn sidebar_focus_lists_the_playlists_again() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.restart(None);
+        m.write("New", &["B"])?;
+        assert_eq!(m.listed(), ["Gym"]);
+        m.keys(&[KeyCode::Tab]);
+        assert_eq!(m.listed(), ["Gym", "New"]);
+        Ok(())
+    }
+
+    /// Spec *Filter the sidebar*: then `Enter` opens the matching playlist.
+    #[test]
+    fn enter_after_filtering_the_sidebar_opens_the_match() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Running", &["C", "D"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.chars("/run");
+        m.keys(&[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(m.app.view(), View::Playlist);
+        assert_eq!(
+            m.app.open_playlist().map(OpenPlaylist::name),
+            Some("Running")
+        );
+        Ok(())
+    }
+
+    /// Spec *Open*.
+    #[test]
+    fn enter_on_a_playlist_lists_it_in_file_order_with_focus() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["C", "A", "B"])?;
+        m.select_playlist("Running")?;
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.app.main_view(), MainView::Playlist);
+        assert_eq!(m.shown_titles(), ["C", "A", "B"]);
+        Ok(())
+    }
+
+    /// Spec *Esc from a playlist*: the playlists are listed again.
+    #[test]
+    fn esc_from_a_playlist_lists_the_playlists_again() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A"])?;
+        m.open("Running")?;
+        m.write("Gym", &["B"])?;
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.app.focus(), Focus::Sidebar);
+        assert_eq!(m.listed(), ["Gym", "Running"]);
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Running"));
+        assert_eq!(m.app.main_view(), MainView::Playlist);
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.app.focus(), Focus::Sidebar, "Esc in the sidebar stays");
+        Ok(())
+    }
+
+    /// Spec *Esc from a playlist*, with a sidebar filter that hides it.
+    #[test]
+    fn esc_selects_the_shown_playlist_even_when_the_filter_hides_it() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Running", &["B"])?;
+        m.open("Running")?;
+        m.keys(&[KeyCode::Tab]);
+        m.chars("/gym");
+        m.keys(&[KeyCode::Enter, KeyCode::Tab, KeyCode::Esc]);
+        assert_eq!(m.app.focus(), Focus::Sidebar);
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Running"));
+        assert_eq!(m.app.query(), "", "the filter that hid it is cleared");
+        Ok(())
+    }
+
+    #[test]
+    fn rename_selects_the_new_name_even_when_the_filter_hides_it() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Gym 2", &["A"])?;
+        m.write("Running", &["B"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.chars("/gym");
+        m.keys(&[KeyCode::Enter]);
+        m.select_playlist("Gym")?;
+        m.shift('R');
+        m.retype("Weights");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Weights"));
+        Ok(())
+    }
+
+    /// Spec *Reopen the shown playlist*.
+    #[test]
+    fn reopening_the_shown_playlist_keeps_its_filter_and_selection() -> Result<()> {
+        let mut m = music(&[("A", "Band"), ("B", "Other"), ("C", "Band"), ("D", "Band")])?;
+        m.write_raw(
+            "Running",
+            b"../Band/LP/A.mp3\n../Other/LP/B.mp3\n../Band/LP/C.mp3\n../Band/LP/D.mp3\n",
+        )?;
+        m.open("Running")?;
+        m.chars("/band");
+        m.keys(&[KeyCode::Enter, KeyCode::Down]);
+        m.open("Running")?;
+        assert_eq!(m.app.query(), "band");
+        assert_eq!(m.shown_titles(), ["A", "C", "D"]);
+        assert_eq!(m.selected_title().as_deref(), Some("C"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_open_keeps_focus_and_the_shown_playlist() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.write("Running", &["B"])?;
+        m.open("Running")?;
+        m.select_playlist("Gym")?;
+        fs::remove_file(m.file("Gym"))?;
+        fs::create_dir(m.file("Gym"))?;
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.app.focus(), Focus::Sidebar);
+        assert_eq!(
+            m.app.open_playlist().map(OpenPlaylist::name),
+            Some("Running")
+        );
+        assert!(m.status().contains("\"Gym\""));
+        Ok(())
+    }
+
+    /// Spec *Delete the shown playlist*.
+    #[test]
+    fn deleting_the_shown_playlist_shows_the_library() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.open("Gym")?;
+        m.keys(&[KeyCode::Esc]);
+        m.shift('D');
+        m.chars("y");
+        assert_eq!(m.app.main_view(), MainView::Library);
+        assert_eq!(m.app.focus(), Focus::Sidebar);
+        assert!(!m.file("Gym").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn rename_and_delete_do_nothing_on_library() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.keys(&[KeyCode::Tab, KeyCode::Home]);
+        m.shift('R');
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        m.shift('D');
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert!(m.file("Gym").exists());
+        Ok(())
+    }
+
+    /// Spec *Open playlist removed meanwhile*.
+    #[test]
+    fn open_playlist_removed_meanwhile_falls_back_to_the_library() -> Result<()> {
         let mut m = abcd()?;
         m.write("Running", &["A"])?;
         m.write("Gym", &["B"])?;
@@ -1974,7 +2643,7 @@ mod playlist_tests {
         m.keys(&[KeyCode::Tab]);
         fs::remove_file(m.file("Running"))?;
         m.keys(&[KeyCode::Tab]);
-        assert_eq!(m.app.view(), View::Playlists);
+        assert_eq!(m.app.view(), View::Library);
         let names: Vec<_> = m.app.playlists().iter().map(|i| i.name.clone()).collect();
         assert_eq!(names, ["Gym"]);
         let status = m.status();
@@ -2014,13 +2683,15 @@ mod playlist_tests {
         assert_eq!(m.app.selected_track(), Some(2), "C stays selected");
         m.keys(&[KeyCode::Esc]);
         assert_eq!(m.app.view(), View::Playlists);
-        let selected = m.app.selected().map(|row| m.app.visible()[row]);
         assert_eq!(
-            selected
-                .and_then(|i| m.app.playlists().get(i))
-                .map(|i| i.name.as_str()),
+            m.selected_playlist_name().as_deref(),
             Some("Running"),
             "the playlist just left is selected"
+        );
+        assert_eq!(
+            m.app.open_playlist().map(OpenPlaylist::name),
+            Some("Running"),
+            "and still shown"
         );
         Ok(())
     }
@@ -2265,7 +2936,6 @@ mod playlist_tests {
         let mut m = abcd()?;
         m.write("Running", &["A"])?;
         m.open("Running")?;
-        m.keys(&[KeyCode::Tab]);
         let before = fs::read(m.file("Running"))?;
         let blocker = m
             .dir()
@@ -2278,7 +2948,12 @@ mod playlist_tests {
         assert!(status.contains("\"Running\""), "{status}");
         assert!(status.contains("cannot save"), "{status}");
         assert_eq!(fs::read(m.file("Running"))?, before);
-        m.keys(&[KeyCode::Tab]);
+        assert_eq!(
+            m.app.playlists().first().and_then(|i| i.tracks),
+            Some(1),
+            "the sidebar entry is unchanged"
+        );
+        m.open("Running")?;
         assert_eq!(m.shown_titles(), ["A"], "unchanged on screen too");
         Ok(())
     }
@@ -2301,30 +2976,27 @@ mod playlist_tests {
         let mut m = abcd()?;
         m.write("Running", &["A"])?;
         m.open("Running")?;
-        m.keys(&[KeyCode::Tab]);
         m.write("Running", &["A", "C"])?;
-        m.select_in_library("B")?;
-        m.chars("a");
-        m.pick("Running")?;
+        // `a` only works with the library shown, which closes the playlist,
+        // so the stale open copy is reached through `add_to` directly.
+        m.app.add_to("Running", &[1]);
         assert_eq!(m.file_titles("Running")?, ["A", "C"], "not overwritten");
         let status = m.status();
         assert!(status.contains("reloaded"), "{status}");
         assert!(status.contains("nothing was added"), "{status}");
-        m.keys(&[KeyCode::Tab]);
         assert_eq!(m.shown_titles(), ["A", "C"], "the other program's change");
         Ok(())
     }
 
     #[test]
-    fn adding_to_the_open_playlist_shows_the_new_tracks() -> Result<()> {
+    fn adding_to_a_playlist_shows_the_new_tracks() -> Result<()> {
         let mut m = abcd()?;
         m.write("Running", &["A"])?;
         m.open("Running")?;
-        m.keys(&[KeyCode::Tab]);
         m.select_in_library("D")?;
         m.chars("a");
         m.pick("Running")?;
-        m.keys(&[KeyCode::Tab]);
+        m.open("Running")?;
         assert_eq!(m.shown_titles(), ["A", "D"]);
         m.chars("a");
         assert_eq!(*m.app.mode(), Mode::Normal, "a only adds from the library");
@@ -2354,7 +3026,8 @@ mod playlist_tests {
         let mut m = abcd()?;
         m.write("Running", &["A", "B"])?;
         m.open("Running")?;
-        m.keys(&[KeyCode::Down, KeyCode::Enter, KeyCode::Esc, KeyCode::Tab]);
+        m.keys(&[KeyCode::Down, KeyCode::Enter]);
+        m.show_library();
         assert!(m.app.open_playlist().is_none());
         m.select_in_library("D")?;
         m.chars("a");
@@ -2388,7 +3061,7 @@ mod playlist_tests {
         m.keys(&[KeyCode::Enter, KeyCode::Tab]);
         fs::remove_file(m.file("Running"))?;
         m.keys(&[KeyCode::Tab]);
-        assert_eq!(m.app.view(), View::Playlists);
+        assert_eq!(m.app.view(), View::Library);
         assert!(!m.app.playback().is_playing_playlist("Running"));
         assert_eq!(m.app.playback().current(), Some(0));
         m.chars("n");
@@ -2664,13 +3337,13 @@ mod playlist_tests {
     }
 
     #[test]
-    fn edit_of_a_playlist_deleted_elsewhere_goes_back_to_the_list() -> Result<()> {
+    fn edit_of_a_playlist_deleted_elsewhere_shows_the_library() -> Result<()> {
         let mut m = abcd()?;
         m.write("Running", &["A", "B"])?;
         m.open("Running")?;
         fs::remove_file(m.file("Running"))?;
         m.chars("d");
-        assert_eq!(m.app.view(), View::Playlists);
+        assert_eq!(m.app.view(), View::Library);
         assert!(!m.file("Running").exists(), "not recreated");
         let status = m.status();
         assert!(status.contains("no longer exists"), "{status}");
@@ -2779,18 +3452,6 @@ mod playlist_tests {
     // --- Renaming and deleting (task 4.2) ---
 
     impl Music {
-        /// In the playlists list, selects playlist `name`.
-        fn select_playlist(&mut self, name: &str) -> Result<()> {
-            let Some(index) = self.app.playlists().iter().position(|i| i.name == name) else {
-                bail!("{name} not listed");
-            };
-            let Some(row) = self.app.visible().iter().position(|&r| r == index) else {
-                bail!("{name} filtered out");
-            };
-            self.select_row(row);
-            Ok(())
-        }
-
         fn listed(&self) -> Vec<String> {
             self.app
                 .playlists()
@@ -2800,11 +3461,7 @@ mod playlist_tests {
         }
 
         fn selected_playlist_name(&self) -> Option<String> {
-            self.app
-                .selected()
-                .and_then(|row| self.app.visible().get(row))
-                .and_then(|&i| self.app.playlists().get(i))
-                .map(|i| i.name.clone())
+            self.app.selected_playlist().map(|i| i.name.clone())
         }
 
         /// Clears the name prompt and types `name`.
@@ -2850,7 +3507,7 @@ mod playlist_tests {
     fn cancel_rename_keeps_the_name() -> Result<()> {
         let mut m = abcd()?;
         m.write("Running", &["B"])?;
-        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Running")?;
         m.shift('R');
         m.retype("Other");
         m.keys(&[KeyCode::Esc]);
@@ -2865,7 +3522,7 @@ mod playlist_tests {
     fn rename_unchanged_does_nothing() -> Result<()> {
         let mut m = abcd()?;
         m.write("Running", &["B"])?;
-        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Running")?;
         m.shift('R');
         m.keys(&[KeyCode::Enter]);
         assert_eq!(*m.app.mode(), Mode::Normal);
@@ -2877,7 +3534,7 @@ mod playlist_tests {
     fn rename_may_change_only_the_case() -> Result<()> {
         let mut m = abcd()?;
         m.write("Running", &["B"])?;
-        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Running")?;
         m.shift('R');
         m.retype("RUNNING");
         m.keys(&[KeyCode::Enter]);
@@ -2947,7 +3604,7 @@ mod playlist_tests {
     fn rename_of_a_playlist_deleted_meanwhile_reports_it() -> Result<()> {
         let mut m = abcd()?;
         m.write("Running", &["B"])?;
-        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Running")?;
         m.shift('R');
         fs::remove_file(m.file("Running"))?;
         m.retype("Other");
@@ -3003,7 +3660,7 @@ mod playlist_tests {
     fn any_other_key_cancels_delete() -> Result<()> {
         let mut m = abcd()?;
         m.write("Gym", &["A"])?;
-        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Gym")?;
         for cancel in [
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -3069,13 +3726,175 @@ mod playlist_tests {
         assert_eq!(*m.app.mode(), Mode::Normal, "not in an open playlist");
         m.chars("d");
         assert_eq!(m.app.view(), View::Playlist);
-        m.keys(&[KeyCode::Esc, KeyCode::Tab]);
+        m.show_library();
         m.chars("dJK");
         assert_eq!(
             m.app.view(),
             View::Library,
             "d/J/K do nothing in the library"
         );
+        Ok(())
+    }
+
+    // --- Rename follows the shown playlist (task 2.4) ---
+
+    /// Spec *Rename the shown playlist*: later edits save to the new file.
+    #[test]
+    fn renaming_the_shown_playlist_keeps_it_shown_under_the_new_name() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.open("Running")?;
+        m.keys(&[KeyCode::Esc]);
+        m.shift('R');
+        m.retype("Morning run");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(
+            m.app.open_playlist().map(OpenPlaylist::name),
+            Some("Morning run")
+        );
+        m.keys(&[KeyCode::Tab]);
+        assert_eq!(m.shown_titles(), ["A", "B", "C"]);
+        m.chars("d");
+        assert_eq!(m.file_titles("Morning run")?, ["B", "C"]);
+        assert!(!m.file("Running").exists(), "not recreated");
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_the_shown_playing_playlist_keeps_the_play_order() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["C", "A", "B"])?;
+        m.open("Running")?;
+        m.keys(&[KeyCode::Down, KeyCode::Enter, KeyCode::Esc]);
+        let items = m.app.playback().items().to_vec();
+        m.shift('R');
+        m.retype("Morning");
+        m.keys(&[KeyCode::Enter]);
+        assert!(m.app.playback().is_playing_playlist("Morning"));
+        assert_eq!(m.app.playback().items(), items);
+        assert_eq!(m.playing_title().as_deref(), Some("A"));
+        m.end_track();
+        assert_eq!(m.playing_title().as_deref(), Some("B"));
+        Ok(())
+    }
+
+    /// A store whose renamed file vanishes at once, so reading it back fails.
+    #[derive(Debug)]
+    struct VanishingRename(FsStore, PathBuf);
+
+    impl PlaylistStore for VanishingRename {
+        fn list(&self, r: &Resolver) -> Result<Vec<PlaylistInfo>, StoreError> {
+            self.0.list(r)
+        }
+        fn load(&self, name: &str, r: &Resolver) -> Result<Playlist, StoreError> {
+            self.0.load(name, r)
+        }
+        fn changed(&self, p: &Playlist) -> Result<bool, StoreError> {
+            self.0.changed(p)
+        }
+        fn blank(&self, name: &str) -> Result<Playlist, StoreError> {
+            self.0.blank(name)
+        }
+        fn create(&self, p: &mut Playlist) -> Result<(), StoreError> {
+            self.0.create(p)
+        }
+        fn save(&self, p: &mut Playlist) -> Result<SaveOutcome, StoreError> {
+            self.0.save(p)
+        }
+        fn rename(&self, from: &str, to: &str) -> Result<(), StoreError> {
+            self.0.rename(from, to)?;
+            fs::remove_file(self.1.join(format!("{to}.m3u8"))).map_err(|_| StoreError::NotFound)
+        }
+        fn delete(&self, name: &str) -> Result<(), StoreError> {
+            self.0.delete(name)
+        }
+    }
+
+    #[test]
+    fn failed_read_after_renaming_the_shown_playlist_shows_the_library() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A"])?;
+        let tracks = m.app.playback().tracks().to_vec();
+        m.app = App::new(
+            tracks,
+            SilentAudio::default(),
+            Box::new(VanishingRename(FsStore::new(&m.root), m.dir())),
+            String::new(),
+            None,
+        );
+        m.open("Running")?;
+        m.keys(&[KeyCode::Esc]);
+        m.shift('R');
+        m.retype("Morning");
+        m.keys(&[KeyCode::Enter]);
+        assert!(m.app.open_playlist().is_none());
+        assert_eq!(m.app.main_view(), MainView::Library);
+        let now = Instant::now();
+        m.app.tick(now);
+        let notice = m.app.status(now).cloned();
+        let text = notice.as_ref().map_or("", |n| n.text.as_str());
+        assert!(text.starts_with("Playlist \"Morning\":"), "{text}");
+        assert!(
+            text.ends_with("; Renamed \"Running\" to \"Morning\""),
+            "the rename is still reported: {text}"
+        );
+        assert_eq!(notice.map(|n| n.level), Some(Level::Error));
+        Ok(())
+    }
+
+    // --- The sidebar stays current (task 2.5) ---
+
+    /// Spec *Sidebar kept current*.
+    #[test]
+    fn sidebar_follows_the_apps_own_edits() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.restart(None);
+        m.select_in_library("B")?;
+        m.chars("a");
+        m.create("Road trip");
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.listed(), ["Road trip", "Running"]);
+        assert_eq!(m.info("Road trip").and_then(|i| i.tracks), Some(1));
+
+        m.select_in_library("D")?;
+        m.chars("a");
+        m.pick("Road trip")?;
+        assert_eq!(m.info("Road trip").and_then(|i| i.tracks), Some(2));
+
+        m.open("Running")?;
+        m.chars("d");
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.info("Running").and_then(|i| i.tracks), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_selection_stays_on_its_playlist_after_an_insert() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A"])?;
+        m.select_playlist("Running")?;
+        m.keys(&[KeyCode::Tab]);
+        m.chars("a");
+        m.create("Gym");
+        assert_eq!(m.listed(), ["Gym", "Running"]);
+        assert_eq!(m.selected_playlist_name().as_deref(), Some("Running"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_edit_leaves_the_sidebar_entry() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Running", &["A", "B", "C"])?;
+        m.open("Running")?;
+        let before = m.info("Running");
+        fs::create_dir(
+            m.dir()
+                .join(format!(".Running.m3u8.tmp-{}", std::process::id())),
+        )?;
+        m.chars("d");
+        assert_eq!(m.info("Running"), before);
+        assert_eq!(before.and_then(|i| i.tracks), Some(3));
         Ok(())
     }
 
@@ -3086,7 +3905,7 @@ mod playlist_tests {
         let mut m = abcd()?;
         let bytes = b"../Band/LP/A.mp3\n# caf\xe9\n";
         m.write_raw("Old", bytes)?;
-        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Old")?;
         m.shift('R');
         m.retype("Older");
         m.keys(&[KeyCode::Enter]);
@@ -3107,7 +3926,7 @@ mod playlist_tests {
         fs::write(&target, "../Band/LP/A.mp3\n")?;
         fs::create_dir_all(m.dir())?;
         std::os::unix::fs::symlink(&target, m.file("Linked"))?;
-        m.keys(&[KeyCode::Tab]);
+        m.select_playlist("Linked")?;
         m.shift('R');
         m.retype("Moved");
         m.keys(&[KeyCode::Enter]);

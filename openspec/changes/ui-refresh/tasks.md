@@ -14,10 +14,10 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 2. Focus model and sidebar state (`src/app.rs`, minimal `src/ui.rs`)
 
-- [ ] 2.1 Replace `Side` with `Focus { Sidebar, Main }` and derive `view()` from `(focus, open)` (D1). Add `focus()`, `main_view()`, and the per-pane `sidebar_list()` / `main_list()` returning `ListView`. Make `playlist_list` the sidebar list with a "Library" row at value 0 that is never filtered out. Add `selected_playlist()` / `sidebar_value_of()` and route every indexing site listed in D2 through them. Make the minimal `ui.rs` change so the current single-list rendering skips value 0 and indexes playlists correctly. Verify with:
+- [x] 2.1 Replace `Side` with `Focus { Sidebar, Main }` and derive `view()` from `(focus, open)` (D1). Add `focus()`, `main_view()`, and the per-pane `sidebar_list()` / `main_list()` returning `ListView`. Make `playlist_list` the sidebar list with a "Library" row at value 0 that is never filtered out. Add `selected_playlist()` / `sidebar_value_of()` and route every indexing site listed in D2 through them. Make the minimal `ui.rs` change so the current single-list rendering skips value 0 and indexes playlists correctly. Verify with:
   - unit tests on the sidebar list: the filter keeps "Library"; a non-empty filter selects the first matching playlist; `g` and `k` reach "Library"; `G` reaches the last playlist; the count title counts playlists only;
   - the whole suite green.
-- [ ] 2.2 Add `App::notify` with the precedence of D4 and route every `pending` write through it. List the playlists in `App::new`. Verify with key-free tests:
+- [x] 2.2 Add `App::notify` with the precedence of D4 and route every `pending` write through it. List the playlists in `App::new`. Verify with key-free tests:
   - *Playlists listed on start*;
   - *No folder* (only "Library", nothing written, `Playlists` still absent);
   - *Nothing played yet* at the state level (no source marked while no track is loaded);
@@ -25,26 +25,26 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - an info notice raised after an error in the same key press does not hide the error.
 
   Measure `App::new` on 100 000 generated tracks with no playlists. If it adds more than 100 ms, move the listing to the first `tick` (D4). Record the measurement in the PR description.
-- [ ] 2.3 Implement `focus_sidebar` / `focus_main` and the key semantics of D3:
+- [x] 2.3 Implement `focus_sidebar` / `focus_main` and the key semantics of D3:
   - `Tab` and `BackTab` toggle focus;
   - `Enter` on "Library", on the shown playlist, and on another playlist (a failed load leaves focus and `open` unchanged);
   - `Esc` per focus, with `Esc` from a playlist selecting it in the sidebar;
   - `R`/`D` on the selected playlist only, doing nothing on "Library".
 
   Verify with key-sequence tests on a temp-dir store for: *Tab moves focus* (also with `BackTab`), *Keys go to the focused pane*, *Focus on start*, *Open playlists view*, *Back to library*, *Return to open playlist*, *Listing refreshed*, *Open playlist removed meanwhile*, *Filter the sidebar* (then `Enter` opens the matching playlist, not the library), *Open*, *Esc from a playlist*, *Reopen the shown playlist*, *Delete the shown playlist*, and `R`/`D` on "Library" doing nothing.
-- [ ] 2.4 Make rename follow the shown playlist with `replace_open` and `follow_reload` (D5). Verify with key-sequence tests:
+- [x] 2.4 Make rename follow the shown playlist with `replace_open` and `follow_reload` (D5). Verify with key-sequence tests:
   - *Rename the shown playlist*: a `d` after the rename saves to `Morning run.m3u8`, and `Running.m3u8` is not recreated;
   - renaming the playing playlist keeps playback and the play order;
   - a forced load failure after the rename clears `open` and shows the error.
-- [ ] 2.5 Add `update_info` and call it after add, create, `d`/`J`/`K` saves and reloads (D10). Verify with key-sequence tests:
+- [x] 2.5 Add `update_info` and call it after add, create, `d`/`J`/`K` saves and reloads (D10). Verify with key-sequence tests:
   - *Sidebar kept current*: the new playlist is listed with 1 track, and the count drops after `d`;
   - the sidebar selection stays on the same playlist after an insert before it;
   - a failed save leaves the sidebar entry unchanged.
-- [ ] 2.6 Port the existing app tests that encode the old `Tab` and `Esc` semantics by updating the shared helpers (`select_playlist`, `open`) instead of each test. Keep every assertion about storage, play order and notices unchanged. Verify that:
+- [x] 2.6 Port the existing app tests that encode the old `Tab` and `Esc` semantics by updating the shared helpers (`select_playlist`, `open`) instead of each test. Keep every assertion about storage, play order and notices unchanged. Verify that:
   - `cargo test` passes;
   - `git diff --stat` shows no change in `src/queue.rs`, `src/playback.rs`, `src/playlist.rs` or `src/playlist/`;
   - `cargo test -- queue:: playback:: playlist::` passes.
-- [ ] 2.7 Update the documentation:
+- [x] 2.7 Update the documentation:
   - the `app.rs` `//!` doc: focus model, sidebar rows, startup listing, notices;
   - the README keys tables: `Tab`/Shift+Tab, `Enter`, `Esc`, `R`, `D`, with the breaking `Tab`/`Esc` change noted;
   - in CLAUDE.md, the `app.rs` paragraph, and the "When adding keys…" rule, which now points to `src/keys.rs` + README.

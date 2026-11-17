@@ -127,10 +127,10 @@ the status bar says how many entries were left out.
 | `z`                    | toggle shuffle                           |
 | `r`                    | cycle repeat: off → all → one            |
 | `/`                    | search; `Enter` keeps the filter, `Esc` clears it |
-| `Esc`                  | clear an active filter                   |
+| `Esc`                  | clear an active filter (see also Playlists below) |
 | `↑` / `↓`, `k` / `j`   | move the selection                       |
 | `PgUp` / `PgDn`        | move the selection by a page             |
-| `g` / `Home`, `G` / `End` | first / last track                    |
+| `g` / `Home`, `G` / `End` | first / last row                      |
 | `q`, `Ctrl+C`          | quit                                     |
 
 While searching, typed characters go to the query, so letter keys do not act
@@ -140,15 +140,24 @@ as commands until you press `Enter` or `Esc`.
 
 | Key                    | Action                                   |
 | ---------------------- | ---------------------------------------- |
-| `Tab`                  | switch between the library and the playlists; each side keeps its own selection and filter |
+| `Tab`, `Shift+Tab`     | move focus between the sidebar and the main pane; each list keeps its own selection and filter |
 | `a`                    | in the library: add the selected track to a playlist |
 | `A`                    | in the library: add every listed track (after any search) to a playlist |
-| `Enter`                | in the playlists list: open the playlist; in a playlist: play from the selected track |
-| `Esc`                  | in a playlist: clear the filter, then go back to the playlists list |
+| `Enter`                | in the sidebar: show the selected entry ("Library" or a playlist) in the main pane and focus it; in a playlist: play from the selected track |
+| `Esc`                  | in a playlist: clear the filter, then focus the sidebar (the playlist stays shown); in the sidebar: clear the filter |
 | `d`                    | in a playlist: remove the selected entry (only that occurrence) |
 | `J` / `K`              | in a playlist: move the selected entry down / up (not while filtered) |
-| `R`                    | in the playlists list: rename the selected playlist (changing only the letter case is allowed) |
-| `D`                    | in the playlists list: delete the selected playlist after a `y` confirmation; any other key cancels |
+| `R`                    | in the sidebar: rename the selected playlist (changing only the letter case is allowed) |
+| `D`                    | in the sidebar: delete the selected playlist after a `y` confirmation; any other key cancels |
+
+The sidebar lists "Library" first, then your playlists with their track
+counts; they are listed when kasset starts and again whenever the sidebar
+gets the focus. `R` and `D` do nothing on "Library".
+
+**Changed in this version:** `Tab` used to swap the whole list between the
+library and the playlists; it now moves the focus between the two panes.
+`Esc` in a playlist used to go back to the list of playlists; it now focuses
+the sidebar and leaves the playlist shown.
 
 `a` and `A` open a picker: choose a playlist, or "New playlist…" to type a
 name. Tracks already in the playlist are skipped and the status bar says how

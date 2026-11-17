@@ -88,11 +88,13 @@ Helpers `selected_playlist() -> Option<&PlaylistInfo>` and `sidebar_value_of(nam
 ### D4. Startup listing, the resolver cost, and notices
 `App::new` calls `refresh_playlists(None)` so the sidebar is filled on the first frame. This builds the `Resolver` at startup: a `HashMap` of all track paths. That cost used to be paid only by users who opened the playlists side or the picker. It is linear in the library size and small next to the library scan, which already reads every file's tags. Task 2.2 measures `App::new` on a generated 100 000-track list. If it adds more than 100 ms, the listing moves to the first `tick` after the first frame. That needs no spec change: the first frame shows an empty sidebar for one frame.
 
-**Notices.** Every write to `pending` goes through one new helper, `App::notify(notice)`:
+**Notices.** Every write to `pending` goes through one new helper, `App::notify(notice)`. These rules apply to notices raised by the same key press (or by `App::new`):
 - With nothing pending, the notice is stored.
-- An error replaces a pending info notice.
-- An info notice never replaces a pending error.
+- An error raised after a pending info notice is shown first, joined with the info after it (`error; info`), so neither is lost and the result is an error.
+- An info notice never replaces a pending error; it is dropped.
 - Two notices of the same level are joined with `; `.
+
+A notice still pending from an earlier key press (the event loop handles up to `MAX_EVENTS_PER_FRAME` keys per tick) is replaced, as before, so repeated keys never pile up into one long message.
 
 So a listing error at startup does not hide the library-scan notice passed to `App::new`, which reports skipped entries; the two are joined. Likewise, "Renamed X to Y" cannot hide a listing or reload error raised in the same key press. `playback.take_notice()` in `tick` keeps its current precedence.
 - *Alternative*: list lazily on the first sidebar focus, and show "Press Tab to load playlists" until then. Rejected: the sidebar showing nothing until a key is pressed defeats the point of the change.
@@ -118,6 +120,8 @@ Instead, a helper `update_info(&Playlist)` writes the saved playlist's `Playlist
 - a reload in `install`.
 
 Rename and delete keep calling `refresh_playlists`, because they change the set of files.
+
+The count written by `update_info` comes from a full load, which may also match entries through symlinks (`canonicalize`). The listing matches lexically only (see `PlaylistInfo::tracks`), so for such a playlist the count can drop back to the lexical one at the next sidebar focus. This is accepted: both counts are correct for what they measure, and the difference only appears for entries reached through links.
 
 ### D6. Help overlay: `Mode::Help { scroll: usize }`
 Handled by `help_key`:
