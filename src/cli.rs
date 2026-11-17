@@ -6,37 +6,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueHint};
 
+use crate::keys;
 use crate::text::display_path;
-
-const KEYBINDINGS: &str = "\
-Keys:
-  Enter          play selected track
-  Space          pause / resume
-  s              stop
-  n / p          next / previous track
-  Left / Right   seek -5s / +5s
-  + (=) / -      volume up / down
-  z              toggle shuffle
-  r              cycle repeat (off / all / one)
-  /              search (Enter keeps filter, Esc clears)
-  Up/Down, k/j   move selection
-  PgUp / PgDn    move selection by a page
-  g/Home, G/End  first / last track
-  q, Ctrl+C      quit
-
-Playlists (stored as .m3u8 files in <DIR>/Playlists):
-  Tab            switch between library and playlists
-  a / A          add selected / all listed tracks to a playlist
-  Enter          open playlist; in a playlist, play from it
-  Esc            in a playlist: clear filter, then back to the list
-  d              in a playlist: remove the selected entry
-  J / K          in a playlist: move the selected entry down / up
-  R              in the playlists list: rename the selected playlist
-  D              in the playlists list: delete it (asks y/n; songs stay)";
 
 /// A keyboard-driven terminal music player for your local music folder.
 #[derive(Debug, Parser)]
-#[command(name = "kasset", version, about, after_help = KEYBINDINGS)]
+#[command(name = "kasset", version, about, after_help = keys::help_text())]
 pub struct Cli {
     /// Music folder to open [default: your music directory, else the current directory]
     #[arg(value_name = "DIR", value_hint = ValueHint::DirPath)]
@@ -102,8 +77,31 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("Usage: kasset [DIR]"));
         assert!(help.contains("pause / resume"));
-        assert!(help.contains("switch between library and playlists"));
-        assert!(help.contains("add selected / all listed tracks"));
+        assert!(help.contains("move focus between the sidebar and the main pane"));
+        assert!(help.contains("add the selected / every listed track to a playlist"));
+        assert!(help.contains("<DIR>/Playlists"));
+    }
+
+    /// Spec: *Help lists playlist keys* (and `?`).
+    #[test]
+    fn help_lists_playlist_keys() {
+        let help = Cli::command().render_long_help().to_string();
+        for (keys, action) in [
+            ("Tab, Shift+Tab", "move focus"),
+            ("a / A", "add the selected"),
+            ("d", "remove the selected entry"),
+            ("J / K", "move the selected entry down / up"),
+            ("R", "rename the selected playlist"),
+            ("D", "delete the selected playlist"),
+            ("?", "show every key"),
+        ] {
+            let listed = help.lines().any(|line| {
+                let line = line.trim_start();
+                line.strip_prefix(keys)
+                    .is_some_and(|rest| rest.starts_with("  ") && rest.contains(action))
+            });
+            assert!(listed, "--help does not list {keys:?} ({action})");
+        }
     }
 
     #[test]

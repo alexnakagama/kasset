@@ -125,7 +125,7 @@ Handled by `help_key`:
 - Ctrl+C quits (already handled before mode dispatch);
 - every other key, including `?`, `Esc` and `q`, sets `Mode::Normal` and is consumed.
 
-The overlay is centred over the whole screen above the status line, at most 64 columns wide. It draws the key table grouped as Playback, Navigation & search, Library, Sidebar & playlists, Help & quit. Lines are truncated with `…`, never wrapped, so the number of lines does not depend on the width. `keys::help_line_count()` is the single count, and both the renderer and `App` use it.
+The overlay is centred over the whole screen above the status line, at most 64 columns wide. It draws the key table grouped as Library, Sidebar & playlists, Playback, Navigation & search, Help & quit. The bar lists its labels in table order, so this order puts each view's own keys before the shared ones, which matters because the bar is cut at the width. Lines are truncated with `…`, never wrapped, so the number of lines does not depend on the width. `keys::help_line_count()` is the single count, and both the renderer and `App` use it.
 
 `scroll` is clamped in `App` to `help_line_count() - help_rows` (saturating). `help_rows` is the overlay's visible height, reported back by the event loop exactly like `page_size`: `ui::View` records it while the overlay is drawn and `terminal::run` calls `app.set_help_rows`. Without that, `j` at the bottom would keep growing an invisible offset and `k` would appear dead.
 
@@ -134,7 +134,7 @@ Two more rules:
 - PgUp/PgDn move by `help_rows`. `help_rows` keeps its last value between openings and is at least 1.
 
 ### D7. One key table: new `src/keys.rs`
-`keys.rs` holds `pub const GROUPS: &[Group]`. A `Group` has a title and entries. Each entry has `keys` (e.g. `"J / K"`), `action` (the long text), and an optional `(bar_label, &[BarContext])`. The bar label is a short form such as `"J/K move"`, and the contexts say in which bars it appears.
+`keys.rs` holds `pub const GROUPS: &[Group]`. A `Group` has a title and entries. Each entry has `keys` (e.g. `"J / K"`, ASCII so `--help` aligns), `action` (the long text), and `bar: &[Bar]`. A `Bar` is a short label such as `"J/K move"` plus the contexts whose bar shows it. A prompt's labels sit on the entry that opens the prompt: the picker and "New playlist…" labels on `a / A`, the rename labels on `R`, the confirmation labels on `D`, the search labels on `/`, and the overlay labels on `?`. Within an entry, labels are listed in the order they are drawn.
 
 `BarContext` is one of:
 - Library, Playlist, Sidebar — Normal mode, by `view()`;
