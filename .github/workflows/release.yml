@@ -51,11 +51,11 @@ jobs:
             os: ubuntu-22.04-arm
             test: true
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             test: true
           # Cross-compiled on Apple Silicon; tests can't run natively there.
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             test: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
