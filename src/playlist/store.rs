@@ -7,6 +7,13 @@
 //! fails if the name is taken, falling back to check-then-rename only on
 //! filesystems without hard links.
 //!
+//! Nothing is ever written outside the playlists folder: a playlist that is a
+//! symbolic link to a file outside it (judged by where it resolves, so `..`
+//! and link chains count) is read-only. This is checked when the playlist is
+//! listed or loaded, and again right before each save. A dangling link is not
+//! a playlist: it is not listed, cannot be loaded, and a save through a link
+//! that became dangling fails as `NotFound`.
+//!
 //! Replacing the file gives it a new inode: owner and group are restored on a
 //! best-effort basis, but extended attributes, ACLs and other hard links to the
 //! old file are not kept.
@@ -236,6 +243,36 @@ impl FsStore {
         }
     }
 
+    /// The file to replace when saving `path`: the file itself or, for a
+    /// symbolic link, its resolved target, which must lie inside the
+    /// playlists folder (both resolved, so `..`, link chains and a symlinked
+    /// `Playlists` folder are all judged by where they really lead).
+    fn write_target(&self, path: &Path) -> Result<PathBuf, StoreError> {
+        if !fs::symlink_metadata(path)
+            .map_err(StoreError::io(Action::Save))?
+            .file_type()
+            .is_symlink()
+        {
+            return Ok(path.to_owned());
+        }
+        let target = fs::canonicalize(path).map_err(StoreError::io(Action::Save))?;
+        let dir = fs::canonicalize(&self.dir).map_err(StoreError::io(Action::Save))?;
+        if target.starts_with(&dir) {
+            Ok(target)
+        } else {
+            Err(StoreError::ReadOnly(ReadOnlyReason::LinksOutside))
+        }
+    }
+
+    /// Whether `path` is a symbolic link to a file outside the playlists
+    /// folder, which saving refuses to write.
+    fn links_outside(&self, path: &Path) -> bool {
+        matches!(
+            self.write_target(path),
+            Err(StoreError::ReadOnly(ReadOnlyReason::LinksOutside))
+        )
+    }
+
     /// Names of `.m3u8` files in the folder, unfiltered and unsorted.
     fn file_stems(&self) -> io::Result<Vec<String>> {
         let entries = match fs::read_dir(&self.dir) {
@@ -304,15 +341,20 @@ impl FsStore {
                     .filter(|(len, _)| *len <= budget)
                     .and_then(|(len, path)| {
                         budget -= len;
+                        let outside = self.links_outside(&path);
                         let (content, truncated, _) = read_limited(&path, MAX_FILE_BYTES).ok()?;
-                        Some(Playlist::parse(
+                        let mut playlist = Playlist::parse(
                             name.clone(),
                             path,
                             &content,
                             truncated,
                             resolver,
                             Matching::Lexical,
-                        ))
+                        );
+                        if outside {
+                            playlist.editable = Err(ReadOnlyReason::LinksOutside);
+                        }
+                        Some(playlist)
                     });
                 PlaylistInfo {
                     tracks: loaded.as_ref().map(|p| p.tracks().len()),
@@ -353,6 +395,9 @@ impl PlaylistStore for FsStore {
             resolver,
             Matching::Full,
         );
+        if self.links_outside(&playlist.path) {
+            playlist.editable = Err(ReadOnlyReason::LinksOutside);
+        }
         playlist.stamp = Some(stamp);
         Ok(playlist)
     }
@@ -407,7 +452,9 @@ impl PlaylistStore for FsStore {
                 ),
             });
         };
-        let target = write_target(&playlist.path).map_err(StoreError::io(Action::Save))?;
+        // Checked again here, not only on load: the link may have been
+        // repointed since.
+        let target = self.write_target(&playlist.path)?;
         let meta = fs::metadata(&target).map_err(StoreError::io(Action::Save))?;
         if FileStamp::of(&meta) != stamp {
             return Ok(SaveOutcome::ChangedOnDisk);
@@ -556,15 +603,6 @@ fn not_a_file() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "not a regular file")
 }
 
-/// The file to replace when saving: the link target for a symlink.
-fn write_target(path: &Path) -> io::Result<PathBuf> {
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        fs::canonicalize(path)
-    } else {
-        Ok(path.to_owned())
-    }
-}
-
 /// `.<file name>.<kind>-<pid>` next to `path`.
 fn temp_path(path: &Path, kind: &str) -> io::Result<PathBuf> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
@@ -698,6 +736,7 @@ fn sync_dir(_dir: &Path) {}
 mod tests {
     use super::*;
     use crate::library::Track;
+    use crate::playlist::EditError;
     use anyhow::{Result, bail};
     use std::time::Duration;
 
@@ -1175,13 +1214,16 @@ mod tests {
     fn symlinked_playlist_stays_a_link() -> Result<()> {
         let f = fixture()?;
         f.create("Gym", &[0])?;
-        let elsewhere = f.root.join("elsewhere");
-        fs::create_dir(&elsewhere)?;
-        let target = elsewhere.join("real.m3u8");
+        // A link to a file elsewhere in the playlists folder, spelled with
+        // `..` so only its resolved location keeps it inside.
+        let archive = f.store.dir().join("archive");
+        fs::create_dir(&archive)?;
+        let target = archive.join("real.m3u8");
         fs::write(&target, b"#EXTM3U\n../Band/A.flac\n")?;
-        std::os::unix::fs::symlink(&target, f.file("Running"))?;
+        std::os::unix::fs::symlink("../Playlists/archive/real.m3u8", f.file("Running"))?;
 
         let mut p = f.store.load("Running", &f.resolver)?;
+        assert_eq!(p.editable(), Ok(()));
         p.add(&[1], &f.library)?;
         assert_eq!(f.store.save(&mut p)?, SaveOutcome::Saved);
         assert!(
@@ -1205,6 +1247,145 @@ mod tests {
         );
         f.store.delete("Run")?;
         assert!(target.exists());
+        Ok(())
+    }
+
+    /// A link planted in a shared music folder must not let an edit rewrite
+    /// whatever it points to (here a stand-in for a shell start-up file).
+    #[cfg(unix)]
+    #[test]
+    fn playlist_linked_outside_the_folder_is_read_only() -> Result<()> {
+        let f = fixture()?;
+        f.create("Gym", &[0])?;
+        let outside = f.root.join("bashrc");
+        let original = b"#EXTM3U\n../Band/A.flac\n";
+        fs::write(&outside, original)?;
+        std::os::unix::fs::symlink("../bashrc", f.file("Mix"))?;
+
+        let listed = f.store.list(&f.resolver)?;
+        let mix = listed.iter().find(|i| i.name == "Mix");
+        assert_eq!(
+            mix.and_then(|i| i.read_only),
+            Some(ReadOnlyReason::LinksOutside),
+            "{listed:?}"
+        );
+
+        let mut p = f.store.load("Mix", &f.resolver)?;
+        assert_eq!(p.editable(), Err(ReadOnlyReason::LinksOutside));
+        assert_eq!(p.tracks().len(), 1, "still readable and playable");
+        assert!(matches!(
+            p.add(&[1], &f.library),
+            Err(EditError::ReadOnly(ReadOnlyReason::LinksOutside))
+        ));
+        assert!(matches!(
+            f.store.save(&mut p),
+            Err(StoreError::ReadOnly(ReadOnlyReason::LinksOutside))
+        ));
+        assert_eq!(fs::read(&outside)?, original);
+
+        // Renaming and deleting only touch the link inside the folder.
+        f.store.rename("Mix", "Old mix")?;
+        f.store.delete("Old mix")?;
+        assert_eq!(fs::read(&outside)?, original);
+        Ok(())
+    }
+
+    /// The check is repeated when saving: a link repointed after the playlist
+    /// was loaded is not followed.
+    #[cfg(unix)]
+    #[test]
+    fn link_repointed_outside_after_load_is_not_written() -> Result<()> {
+        let f = fixture()?;
+        f.create("Gym", &[0])?;
+        let inside = f.store.dir().join("real.m3u8.bak");
+        fs::write(&inside, b"../Band/A.flac\n")?;
+        std::os::unix::fs::symlink(&inside, f.file("Mix"))?;
+        let mut p = f.store.load("Mix", &f.resolver)?;
+        p.add(&[1], &f.library)?;
+
+        let outside = f.root.join("bashrc");
+        fs::write(&outside, b"../Band/A.flac\n")?;
+        fs::remove_file(f.file("Mix"))?;
+        std::os::unix::fs::symlink(&outside, f.file("Mix"))?;
+        assert!(matches!(
+            f.store.save(&mut p),
+            Err(StoreError::ReadOnly(ReadOnlyReason::LinksOutside))
+        ));
+        assert_eq!(fs::read(&outside)?, b"../Band/A.flac\n");
+        assert_eq!(fs::read(&inside)?, b"../Band/A.flac\n");
+        Ok(())
+    }
+
+    /// A chain is judged by its end: `A -> B` stays inside the folder, but
+    /// `B` leads out of it.
+    #[cfg(unix)]
+    #[test]
+    fn link_chain_leading_outside_is_read_only() -> Result<()> {
+        let f = fixture()?;
+        f.create("Gym", &[0])?;
+        let outside = f.root.join("bashrc");
+        fs::write(&outside, b"../Band/A.flac\n")?;
+        std::os::unix::fs::symlink("../bashrc", f.store.dir().join("hop.m3u8.bak"))?;
+        std::os::unix::fs::symlink("hop.m3u8.bak", f.file("Mix"))?;
+
+        let mut p = f.store.load("Mix", &f.resolver)?;
+        assert_eq!(p.editable(), Err(ReadOnlyReason::LinksOutside));
+        p.editable = Ok(()); // as if the check on load had been missed
+        p.add(&[1], &f.library)?;
+        assert!(matches!(
+            f.store.save(&mut p),
+            Err(StoreError::ReadOnly(ReadOnlyReason::LinksOutside))
+        ));
+        assert_eq!(fs::read(&outside)?, b"../Band/A.flac\n");
+        Ok(())
+    }
+
+    /// A dangling link is not a playlist, and a link that becomes dangling
+    /// after loading is reported as gone; nothing is written either way.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_links_are_not_written() -> Result<()> {
+        let f = fixture()?;
+        f.create("Gym", &[0])?;
+        let missing = f.root.join("missing.m3u8");
+        std::os::unix::fs::symlink(&missing, f.file("Ghost"))?;
+        assert_eq!(f.names()?, ["Gym"]);
+        assert!(matches!(
+            f.store.load("Ghost", &f.resolver),
+            Err(StoreError::NotFound)
+        ));
+
+        let inside = f.store.dir().join("real.m3u8.bak");
+        fs::write(&inside, b"../Band/A.flac\n")?;
+        std::os::unix::fs::symlink(&inside, f.file("Mix"))?;
+        let mut p = f.store.load("Mix", &f.resolver)?;
+        p.add(&[1], &f.library)?;
+        fs::remove_file(f.file("Mix"))?;
+        std::os::unix::fs::symlink(&missing, f.file("Mix"))?;
+        assert!(matches!(f.store.save(&mut p), Err(StoreError::NotFound)));
+        assert!(!missing.exists());
+        assert_eq!(fs::read(&inside)?, b"../Band/A.flac\n");
+        Ok(())
+    }
+
+    /// When `Playlists` itself is a link (e.g. to a synced folder), a playlist
+    /// linking to another file in that folder is inside it, not outside.
+    #[cfg(unix)]
+    #[test]
+    fn links_within_a_symlinked_playlists_folder_are_editable() -> Result<()> {
+        let f = fixture()?;
+        let synced = f.root.join("synced");
+        fs::create_dir(&synced)?;
+        fs::write(synced.join("real.m3u8.bak"), b"../Band/A.flac\n")?;
+        std::os::unix::fs::symlink(&synced, f.store.dir())?;
+        std::os::unix::fs::symlink(synced.join("real.m3u8.bak"), f.file("Mix"))?;
+
+        let mut p = f.store.load("Mix", &f.resolver)?;
+        assert_eq!(p.editable(), Ok(()));
+        p.add(&[1], &f.library)?;
+        assert_eq!(f.store.save(&mut p)?, SaveOutcome::Saved);
+        let saved = fs::read(synced.join("real.m3u8.bak"))?;
+        assert!(saved.ends_with(b"../Band/B.flac\n"));
         Ok(())
     }
 

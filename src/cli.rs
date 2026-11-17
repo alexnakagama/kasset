@@ -43,7 +43,7 @@ pub struct Cli {
     pub dir: Option<PathBuf>,
 }
 
-/// Resolves the library root: the givn folder, else the user's music
+/// Resolves the library root: the given folder, else the user's music
 /// directory (the `XDG_MUSIC_DIR` entry of the XDG user-dirs config, i.e.
 /// `~/.config/user-dirs.dirs`, on Linux; else `~/Music`), else the current
 /// directory.

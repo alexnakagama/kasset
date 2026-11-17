@@ -28,7 +28,7 @@
 
 ## 5. Integration
 
-- [ ] 5.1 End-to-end check on a real music folder: create a playlist, add tracks, reorder, remove, rename, delete, quit and reopen to confirm persistence, copy the music folder elsewhere and confirm playlists still resolve, open a saved playlist in another player (e.g. mpv or VLC); then run `cargo test` and `cargo clippy --all-targets -- -D warnings` with no failures, and check `cargo +1.89 build` still works (MSRV)
+- [x] 5.1 End-to-end check on a real music folder: create a playlist, add tracks, reorder, remove, rename, delete, quit and reopen to confirm persistence, copy the music folder elsewhere and confirm playlists still resolve, open a saved playlist in another player (e.g. mpv or VLC); then run `cargo test` and `cargo clippy --all-targets -- -D warnings` with no failures, and check `cargo +1.89 build` still works (MSRV)
 
 ## Workflow follow-up
 

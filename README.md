@@ -148,12 +148,15 @@ library (a moved file, a hand-written line) are kept in place, never dropped,
 and reported when the playlist is opened. Comments, a byte order mark,
 Windows line endings, a missing final newline and the file's permission bits
 are kept; a playlist that is a symbolic link stays a link and its target is
-updated.
+updated, as long as the target is inside `Playlists/` too. A playlist linking
+to a file outside `Playlists/` (one planted in a downloaded music folder, say)
+can be played, renamed and deleted but is read-only, so kasset never writes
+through it.
 
-This is the only place kasset writes to: nothing outside `Playlists/` (or the
-target of a symlinked playlist) is ever modified, and only when you create,
-edit, rename or delete a playlist. Saving writes a dot-prefixed temporary file next to the
-playlist and renames it over the original.
+This is the only place kasset writes to: nothing outside `Playlists/` is ever
+modified, and only when you create, edit, rename or delete a playlist. Saving
+writes a dot-prefixed temporary file next to the playlist and renames it over
+the original.
 
 Shuffle plays every track once, in random order, before any repeats; the
 current track stays current when you turn it on. The search filter only

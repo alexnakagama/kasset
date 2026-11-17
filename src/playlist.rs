@@ -5,7 +5,8 @@
 //! touched: comments, extended-M3U tags, duplicates, entries that do not match
 //! the library, a byte order mark and a missing final newline all survive.
 //! Files that cannot be rewritten without losing data (not UTF-8, or over the
-//! size limits) are still parsed for playback but every edit is refused.
+//! size limits), and symbolic links to files outside the playlists folder, are
+//! still parsed for playback but every edit is refused.
 //!
 //! Playlist files are untrusted input: their size and entry count are bounded,
 //! entry paths are only ever resolved (never opened here) and names are
@@ -104,6 +105,11 @@ pub enum ReadOnlyReason {
     /// The file is over [`MAX_FILE_BYTES`] or [`MAX_ENTRIES`]; it was read only
     /// in part, so rewriting it would drop the rest.
     TooLarge,
+    /// The file is a symbolic link to a file outside the playlists folder
+    /// (resolved, link chains included). Saving would write wherever the link
+    /// points, so a link planted in a shared or downloaded music folder could
+    /// make kasset overwrite any file the user can write.
+    LinksOutside,
 }
 
 impl fmt::Display for ReadOnlyReason {
@@ -111,6 +117,9 @@ impl fmt::Display for ReadOnlyReason {
         f.write_str(match self {
             Self::NotUtf8 => "the playlist is not UTF-8 and cannot be edited",
             Self::TooLarge => "the playlist is over 16 MiB or 100 000 entries and cannot be edited",
+            Self::LinksOutside => {
+                "the playlist links to a file outside the Playlists folder and cannot be edited"
+            }
         })
     }
 }
