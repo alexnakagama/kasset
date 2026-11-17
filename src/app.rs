@@ -987,6 +987,13 @@ impl<A: Audio> App<A> {
                 }
             }
             Err(StoreError::NotFound) => self.playlist_gone(name),
+            Err(err @ StoreError::ReadOnly(_)) => {
+                // Typically a link repointed outside `Playlists/` since the
+                // playlist was read: reload so it shows as read-only.
+                if self.reload(name) {
+                    self.pending = Some(store_error(name, &err));
+                }
+            }
             Err(err) => self.pending = Some(store_error(name, &err)),
         }
     }
@@ -1151,6 +1158,13 @@ impl<A: Audio> App<A> {
                 }
             }
             Err(StoreError::NotFound) => self.playlist_gone(&name),
+            Err(err @ StoreError::ReadOnly(_)) => {
+                // Typically a link repointed outside `Playlists/` since the
+                // playlist was read: reload so it shows as read-only.
+                if self.reload(&name) {
+                    self.pending = Some(store_error(&name, &err));
+                }
+            }
             Err(err) => self.pending = Some(store_error(&name, &err)),
         }
     }
@@ -3115,6 +3129,73 @@ mod playlist_tests {
             b"../Band/LP/A.mp3\n",
             "target untouched"
         );
+        Ok(())
+    }
+
+    /// A playlist that links outside `Playlists/` can be played but not
+    /// edited, from the picker or inside it, so its target is never written.
+    #[cfg(unix)]
+    #[test]
+    fn playlist_linked_outside_is_refused_for_edits() -> Result<()> {
+        let mut m = abcd()?;
+        let target = m.root.join("outside.m3u8");
+        let original = b"../Band/LP/A.mp3\n../Band/LP/B.mp3\n";
+        fs::write(&target, original)?;
+        fs::create_dir_all(m.dir())?;
+        std::os::unix::fs::symlink(&target, m.file("Linked"))?;
+
+        m.select_in_library("C")?;
+        m.chars("a");
+        let marked = m
+            .picker()
+            .and_then(|p| p.choices().iter().find(|i| i.name == "Linked"))
+            .and_then(|i| i.read_only);
+        assert_eq!(marked, Some(crate::playlist::ReadOnlyReason::LinksOutside));
+        m.pick("Linked")?;
+        let status = m.status();
+        assert!(status.contains("outside the Playlists folder"), "{status}");
+        m.keys(&[KeyCode::Esc]);
+
+        m.open("Linked")?;
+        m.chars("d");
+        m.shift('J');
+        let status = m.status();
+        assert!(status.contains("outside the Playlists folder"), "{status}");
+        assert_eq!(fs::read(&target)?, original);
+        Ok(())
+    }
+
+    /// The link is repointed outside after the playlist was opened: the edit
+    /// is refused, nothing is written, and the playlist now shows read-only.
+    #[cfg(unix)]
+    #[test]
+    fn link_repointed_outside_while_open_is_reloaded_read_only() -> Result<()> {
+        let mut m = abcd()?;
+        fs::create_dir_all(m.dir())?;
+        let inside = m.dir().join("real.m3u8.bak");
+        let content = b"../Band/LP/A.mp3\n../Band/LP/B.mp3\n";
+        fs::write(&inside, content)?;
+        std::os::unix::fs::symlink(&inside, m.file("Linked"))?;
+        m.open("Linked")?;
+        assert!(
+            m.app
+                .open_playlist()
+                .is_some_and(|o| o.playlist().editable().is_ok())
+        );
+
+        let outside = m.root.join("outside.m3u8");
+        fs::write(&outside, content)?;
+        fs::remove_file(m.file("Linked"))?;
+        std::os::unix::fs::symlink(&outside, m.file("Linked"))?;
+        m.chars("d");
+        let status = m.status();
+        assert!(status.contains("outside the Playlists folder"), "{status}");
+        assert_eq!(
+            m.app.open_playlist().map(|o| o.playlist().editable()),
+            Some(Err(crate::playlist::ReadOnlyReason::LinksOutside))
+        );
+        assert_eq!(fs::read(&outside)?, content);
+        assert_eq!(fs::read(&inside)?, content);
         Ok(())
     }
 }

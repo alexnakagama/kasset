@@ -212,15 +212,26 @@ Every change to a playlist SHALL be saved to disk before the next key is handled
 - **THEN** both removals are saved and no "changed on disk" message appears
 
 ### Requirement: Saving keeps file identity
-Saving SHALL keep the playlist file's permission bits. When the playlist file is a symbolic link, the system SHALL save the file the link points to and keep the link.
+Saving SHALL keep the playlist file's permission bits. When the playlist file is a symbolic link whose target lies inside the `Playlists` folder, the system SHALL save the file the link points to and keep the link.
 
 #### Scenario: Symlinked playlist
-- **WHEN** `Running.m3u8` is a symbolic link to a file elsewhere and the user adds a track
+- **WHEN** `Running.m3u8` is a symbolic link to `Playlists/archive/Running.m3u8` and the user adds a track
 - **THEN** `Running.m3u8` is still a link and the target file contains the new track
 
 #### Scenario: Permissions kept
 - **WHEN** `Running.m3u8` has mode 0640 and the user removes a track
 - **THEN** the saved file still has mode 0640
+
+### Requirement: Links never lead writes outside the Playlists folder
+A playlist that is a symbolic link whose resolved target (following every link in a chain) lies outside the resolved `Playlists` folder SHALL be read-only: it can be listed, opened, played, renamed and deleted (acting on the link only), but every addition and entry edit SHALL be refused with a message saying it links outside the `Playlists` folder. The system SHALL repeat the check immediately before every save.
+
+#### Scenario: Link outside the Playlists folder
+- **WHEN** `Mix.m3u8` is a symbolic link to `~/.bashrc` (for example in a downloaded music folder) and the user tries to add a track to "Mix" or remove an entry from it
+- **THEN** "Mix" is marked read-only, the edit is refused with a message saying it links outside the `Playlists` folder, and `~/.bashrc` is unchanged
+
+#### Scenario: Link repointed after opening
+- **WHEN** "Mix" is open, linking inside `Playlists`, and another program repoints the link outside before the user adds a track
+- **THEN** nothing is written to the new target, an error is shown, and "Mix" is reloaded and shown as read-only
 
 ### Requirement: Write failures
 When a playlist cannot be saved, renamed or deleted (for example the music folder is read-only), the system SHALL show an error naming the playlist and leave the playlist as it was, both on disk and on screen. Playlists SHALL still be listable, openable and playable.

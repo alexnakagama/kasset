@@ -352,6 +352,7 @@ impl<A: Audio> Playback<A> {
     /// that fail to decode.
     pub fn tick(&mut self) {
         if let Some(err) = self.audio.take_device_error() {
+            let err = sanitize(&err).unwrap_or_else(|| "unknown error".to_owned());
             self.notice = Some(Notice::error(format!("Audio device error: {err}")));
         }
         if self.retry {
@@ -1001,6 +1002,16 @@ mod tests {
             p.take_notice()
                 .is_some_and(|n| n.text.contains("stream lost"))
         );
+    }
+
+    #[test]
+    fn device_errors_are_sanitized() {
+        let mut p = playback(1, &[]);
+        p.audio.device_error = Some("bad\x1b]0;title\x07 device".to_owned());
+        p.tick();
+        let text = p.take_notice().map(|n| n.text).unwrap_or_default();
+        assert!(text.contains("device"), "{text:?}");
+        assert!(!text.contains(['\x1b', '\x07']), "{text:?}");
     }
 
     #[test]

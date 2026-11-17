@@ -25,9 +25,10 @@ use crate::text::sanitize;
 /// Height of the now-playing panel, borders included.
 const NOW_PLAYING_HEIGHT: u16 = 6;
 
-const KEYS_LIBRARY: &str = "Enter play · Space pause · s stop · n/p next/prev · ←/→ seek · \
-                            +/- volume · z shuffle · r repeat · / search · \
-                            a/A add to playlist · Tab playlists · q quit";
+// Each bar puts its view's own keys first: the bar is cut at the terminal's width.
+const KEYS_LIBRARY: &str = "Enter play · a/A add selected/all to playlist · Tab playlists · / search · \
+                            Space pause · s stop · n/p next/prev · ←/→ seek · \
+                            +/- volume · z shuffle · r repeat · q quit";
 const KEYS_PLAYLISTS: &str = "Enter open · R rename · D delete · / search · Tab library · \
                               Space pause · s stop · n/p next/prev · ←/→ seek · +/- volume · \
                               z shuffle · r repeat · q quit";
@@ -1113,9 +1114,14 @@ mod tests {
 
     #[test]
     fn library_help_mentions_playlist_keys() {
+        // At a common 80-column width: the bar is cut there, so these keys
+        // must come before the transport keys.
         let app = library(3);
-        let screen = draw(&app, &mut View::default(), 200, 20);
-        assert!(screen[19].contains("a/A add to playlist"), "{screen:#?}");
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(
+            screen[19].contains("a/A add selected/all to playlist"),
+            "{screen:#?}"
+        );
         assert!(screen[19].contains("Tab playlists"), "{screen:#?}");
     }
 
