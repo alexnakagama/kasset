@@ -53,13 +53,13 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 3. Help overlay state (`src/app.rs`, `src/terminal.rs`)
 
-- [ ] 3.1 Add `Mode::Help { scroll }`, `?` in Normal mode, `help_key` (scroll keys with PgUp/PgDn by `help_rows`; Ctrl+C quits; any other key closes and is consumed) and `set_help_rows`, which also re-clamps `scroll` (D6). Feed `help_rows` from `ui::View` in `terminal::run`, next to `set_page_size`. Verify with key-sequence tests:
+- [x] 3.1 Add `Mode::Help { scroll }`, `?` in Normal mode, `help_key` (scroll keys with PgUp/PgDn by `help_rows`; Ctrl+C quits; any other key closes and is consumed) and `set_help_rows`, which also re-clamps `scroll` (D6). Feed `help_rows` from `ui::View` in `terminal::run`, next to `set_page_size`. Verify with key-sequence tests:
   - *Open and close help*: `q` closes without quitting;
   - *Not while typing*: `?` in Search mode is added to the query;
   - scrolling stops at the last page, and `k` moves back at once after over-pressing `j`;
   - a larger `set_help_rows` re-clamps `scroll`;
   - `Enter` while the overlay is open neither plays nor opens anything.
-- [ ] 3.2 Add `?` to the README keys table. The key table already has it from task 1.1. Verify by reading the README table.
+- [x] 3.2 Add `?` to the README keys table. The key table already has it from task 1.1. Verify by reading the README table.
 
 ## 4. Theme and two-pane layout (`src/theme.rs`, `src/ui.rs`)
 

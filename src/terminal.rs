@@ -216,6 +216,7 @@ fn event_loop<A: Audio>(
             .draw(|frame| ui::render(frame, app, view, now))
             .context("cannot draw to the terminal")?;
         app.set_page_size(view.page_size());
+        app.set_help_rows(view.help_rows());
 
         // A resize needs no handling here: `draw` adapts to the new size on
         // the next frame, which follows immediately.

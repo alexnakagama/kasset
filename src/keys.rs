@@ -253,7 +253,7 @@ pub const GROUPS: &[Group] = &[
         entries: &[
             Entry {
                 keys: "?",
-                action: "show every key (Up/Down, k/j, PgUp/PgDn, g/G scroll; other keys close)",
+                action: "show every key (Up/Down, k/j, PgUp/PgDn, g/Home, G/End scroll; other keys close)",
                 bar: &[
                     shown("↑/↓ scroll", &[Help]),
                     shown("any other key close", &[Help]),
@@ -295,10 +295,6 @@ pub fn help_lines() -> impl Iterator<Item = HelpLine> {
 
 /// How many lines the help has.
 #[must_use]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the help overlay (task 3.1)")
-)]
 pub fn help_line_count() -> usize {
     help_lines().count()
 }
