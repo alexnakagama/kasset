@@ -51,7 +51,7 @@ Layering, from pure logic outward:
 
 Features are specified and tracked with OpenSpec (`openspec/`, skills under `.claude/skills/`, commands `/opsx:propose|apply|update|sync|archive|explore`).
 
-- Current specs: `openspec/specs/{audio-playback,music-library,player-tui}/spec.md`.
-- Active change: `openspec/changes/add-playlists/` — `design.md` holds the numbered decisions (D1–D9) referenced in code and tasks; `tasks.md` tracks progress by task group. Mark tasks `[x]` as they are completed and verified.
+- Current specs: `openspec/specs/{audio-playback,music-library,player-tui,playlists}/spec.md`.
+- No active change. The playlists design decisions (D1–D9) referenced in code live in `openspec/changes/archive/2026-11-17-add-playlists/design.md`. In a change, `tasks.md` tracks progress by task group; mark tasks `[x]` as they are completed and verified.
 - Archived changes live in `openspec/changes/archive/`.
 - When adding keys, update the README keys tables, the `--help` summary in `src/cli.rs`, and the in-app key help bar together.
