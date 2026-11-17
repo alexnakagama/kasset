@@ -1,0 +1,139 @@
+# Pushing a tag like `v0.2.0` builds kasset for every platform below, tests
+# each native build, and publishes a GitHub Release with one archive per
+# platform plus a SHA256SUMS file. The tag must match `version` in Cargo.toml;
+# a tag with a suffix (`v0.2.0-rc.1`) is published as a pre-release. The build
+# deliberately uses no dependency cache, so release binaries never build from
+# a cache another branch wrote.
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Check tag matches Cargo.toml
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Compare versions
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "kasset") | .version')
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check-version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Ubuntu 22.04 links against an older glibc, so the binary also
+          # runs on older distributions.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            test: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            test: true
+          - target: aarch64-apple-darwin
+            os: macos-14
+            test: true
+          # Cross-compiled on Apple Silicon; tests can't run natively there.
+          - target: x86_64-apple-darwin
+            os: macos-14
+            test: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            test: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Test
+        if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="kasset-$TAG-$TARGET"
+          mkdir "$name"
+          cp "target/$TARGET/release/kasset" README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $name = "kasset-$env:TAG-$env:TARGET"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item "target/$env:TARGET/release/kasset.exe", README.md, LICENSE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum kasset-* > SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" --verify-tag --title "kasset $TAG" --generate-notes "${prerelease[@]}" dist/*
