@@ -276,11 +276,17 @@ mod tests {
     use anyhow::Result;
     use std::fs;
 
+    /// Paths relative to `root`, joined with `/` on every platform.
     fn names(paths: &[PathBuf], root: &Path) -> Vec<String> {
         let mut v: Vec<String> = paths
             .iter()
             .filter_map(|p| p.strip_prefix(root).ok())
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| {
+                p.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
             .collect();
         v.sort();
         v

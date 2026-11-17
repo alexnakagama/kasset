@@ -582,7 +582,12 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// An absolute library root on this platform (`/music` has no drive
+    /// letter, so it is not absolute on Windows).
+    #[cfg(not(windows))]
     const ROOT: &str = "/music";
+    #[cfg(windows)]
+    const ROOT: &str = r"C:\music";
 
     fn track(rel: &str) -> Track {
         Track {
