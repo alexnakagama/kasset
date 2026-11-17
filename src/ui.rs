@@ -43,6 +43,7 @@ const KEYS_PICKER: &str = "↑/↓ choose · Enter add · Esc cancel";
 const KEYS_NAME: &str = "type a name · Enter create · Esc cancel";
 const KEYS_RENAME: &str = "type a name · Enter rename · Esc cancel";
 const KEYS_CONFIRM: &str = "y delete · any other key cancel";
+const KEYS_HELP: &str = "↑/↓ scroll · any other key close";
 
 /// Start of the library title, before the library root.
 const TITLE_PREFIX: &str = " kasset · ";
@@ -110,6 +111,8 @@ pub struct View {
     offset: usize,
     /// List rows that fit on screen in the last frame.
     page_size: usize,
+    /// Help lines the overlay showed when last drawn (0 until it is drawn).
+    help_rows: usize,
 }
 
 impl View {
@@ -120,6 +123,16 @@ impl View {
             1
         } else {
             self.page_size
+        }
+    }
+
+    /// Help lines the overlay showed when last drawn (at least 1).
+    #[must_use]
+    pub const fn help_rows(&self) -> usize {
+        if self.help_rows == 0 {
+            1
+        } else {
+            self.help_rows
         }
     }
 }
@@ -134,6 +147,7 @@ fn key_help<A: Audio>(app: &App<A>) -> &'static str {
             NamePurpose::Rename(_) => KEYS_RENAME,
         },
         Mode::ConfirmDelete(_) => KEYS_CONFIRM,
+        Mode::Help { .. } => KEYS_HELP,
         Mode::Normal => match app.view() {
             Screen::Library => KEYS_LIBRARY,
             Screen::Playlists => KEYS_PLAYLISTS,
@@ -166,7 +180,8 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
         Mode::Picker(picker) => render_picker(frame, picker, list),
         Mode::NameInput(input) => render_name_input(frame, input, list),
         Mode::ConfirmDelete(name) => render_confirm_delete(frame, name, list),
-        Mode::Normal | Mode::Search => {}
+        // The help overlay is drawn from task 5.3 of the ui-refresh change.
+        Mode::Normal | Mode::Search | Mode::Help { .. } => {}
     }
 }
 

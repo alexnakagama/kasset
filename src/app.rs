@@ -21,6 +21,12 @@
 //! after rename and delete. The app's own edits (add, create, `d`/`J`/`K`,
 //! reloads) update the edited playlist's sidebar entry in place.
 //!
+//! `?` opens the help overlay ([`Mode::Help`]). Its scroll is bounded by the
+//! number of help lines the last frame showed ([`App::set_help_rows`], fed
+//! by the event loop like the list page size), so scrolling stops at the
+//! last page. Any key other than a scroll key closes it and does nothing
+//! else.
+//!
 //! Status messages raised during one key press go through [`App::notify`]:
 //! an error is never hidden by an info message raised after it, and two
 //! messages of the same level are joined.
@@ -35,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::keys;
 use crate::library::Track;
 use crate::playback::{Edit, Level, Notice, Playback, Source};
 use crate::player::Audio;
@@ -64,6 +71,13 @@ pub enum Mode {
     /// Asking whether to delete the named playlist: `y` deletes, any other
     /// key cancels.
     ConfirmDelete(String),
+    /// The help overlay, listing [`keys::help_lines`] from line `scroll`.
+    /// Scroll keys move it; any other key closes it and does nothing else.
+    Help {
+        /// First help line shown, at most
+        /// `keys::help_line_count() - help_rows` (see [`App::set_help_rows`]).
+        scroll: usize,
+    },
 }
 
 /// The "add to playlist" popup.
@@ -319,6 +333,10 @@ pub struct App<A: Audio> {
     pending_fresh: bool,
     /// Rows the list showed in the last frame (`PageUp`/`PageDown` step).
     page_size: usize,
+    /// Help lines the overlay showed when last drawn (at least 1); bounds
+    /// `Mode::Help`'s scroll and is its `PageUp`/`PageDown` step. Kept
+    /// between openings.
+    help_rows: usize,
     quit: bool,
 }
 
@@ -356,6 +374,7 @@ impl<A: Audio> App<A> {
             pending: notice,
             pending_fresh: true,
             page_size: 1,
+            help_rows: 1,
             quit: false,
         };
         app.refresh_playlists(None);
@@ -506,6 +525,22 @@ impl<A: Audio> App<A> {
         self.page_size = rows.max(1);
     }
 
+    /// Records how many help lines the overlay showed when last drawn, and
+    /// pulls an open overlay's scroll back within the new bound, so a taller
+    /// overlay never shows past the last line.
+    pub fn set_help_rows(&mut self, rows: usize) {
+        self.help_rows = rows.max(1);
+        let max = self.max_help_scroll();
+        if let Mode::Help { scroll } = &mut self.mode {
+            *scroll = (*scroll).min(max);
+        }
+    }
+
+    /// The largest help scroll: the last line is then at the bottom.
+    fn max_help_scroll(&self) -> usize {
+        keys::help_line_count().saturating_sub(self.help_rows)
+    }
+
     /// Raises `notice` for the status area. Within one key press, an error
     /// is never hidden: a later info notice is dropped, and an error raised
     /// after an info notice is shown first with the info after it. Notices
@@ -569,6 +604,7 @@ impl<A: Audio> App<A> {
             Mode::Picker(_) => self.picker_key(key),
             Mode::NameInput(_) => self.name_key(key),
             Mode::ConfirmDelete(_) => self.confirm_delete_key(key),
+            Mode::Help { .. } => self.help_key(key),
         }
     }
 
@@ -625,6 +661,7 @@ impl<A: Audio> App<A> {
                 self.notify(Notice::info(format!("Repeat {}", repeat.label())));
             }
             KeyCode::Char('/') => self.mode = Mode::Search,
+            KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
             KeyCode::Esc => {
                 if !self.query().is_empty() {
                     self.clear_filter();
@@ -717,6 +754,40 @@ impl<A: Audio> App<A> {
         } else {
             self.notify(Notice::info(format!("{} was not deleted", quoted(&name))));
         }
+    }
+
+    /// A key in the help overlay: scroll keys move it, stopping at the ends;
+    /// any other key (`?`, `Esc` and `q` included) closes it and is consumed.
+    /// Ctrl+C was already handled by [`App::handle_key`].
+    fn help_key(&mut self, key: KeyEvent) {
+        let Mode::Help { scroll } = self.mode else {
+            return;
+        };
+        let max = self.max_help_scroll();
+        let current = scroll.min(max);
+        // Letters with Ctrl or Alt are not scroll keys (Shift is: `G`).
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let moved = match key.code {
+            KeyCode::Up => current.saturating_sub(1),
+            KeyCode::Down => current.saturating_add(1),
+            KeyCode::PageUp => current.saturating_sub(self.help_rows),
+            KeyCode::PageDown => current.saturating_add(self.help_rows),
+            KeyCode::Home => 0,
+            KeyCode::End => max,
+            KeyCode::Char('k') if plain => current.saturating_sub(1),
+            KeyCode::Char('j') if plain => current.saturating_add(1),
+            KeyCode::Char('g') if plain => 0,
+            KeyCode::Char('G') if plain => max,
+            _ => {
+                self.mode = Mode::Normal;
+                return;
+            }
+        };
+        self.mode = Mode::Help {
+            scroll: moved.min(max),
+        };
     }
 
     /// Selection keys shared by the list modes; `true` when `code` was one.
@@ -4015,6 +4086,304 @@ mod playlist_tests {
         );
         assert_eq!(fs::read(&outside)?, content);
         assert_eq!(fs::read(&inside)?, content);
+        Ok(())
+    }
+
+    // --- Help overlay ---
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    fn press(app: &mut App<SilentAudio>, keys: &[KeyEvent]) {
+        for &k in keys {
+            app.handle_key(k);
+        }
+    }
+
+    /// Lines in the help, checked to be longer than every test view below.
+    fn help_total() -> usize {
+        let total = keys::help_line_count();
+        assert!(total > 12, "the help is longer than the test views");
+        total
+    }
+
+    fn help_scroll(app: &App<SilentAudio>) -> Option<usize> {
+        match app.mode() {
+            Mode::Help { scroll } => Some(*scroll),
+            _ => None,
+        }
+    }
+
+    /// Spec *Open and close help*: `?` opens it, `q` closes it without
+    /// quitting.
+    #[test]
+    fn question_mark_opens_help_and_q_closes_it_without_quitting() -> Result<()> {
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        press(a, &[ch('?')]);
+        assert_eq!(*a.mode(), Mode::Help { scroll: 0 });
+        press(a, &[ch('q')]);
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert!(!a.should_quit(), "q only closed the overlay");
+        press(a, &[ch('q')]);
+        assert!(a.should_quit(), "q quits again once closed");
+        Ok(())
+    }
+
+    #[test]
+    fn shifted_question_mark_opens_help() -> Result<()> {
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        a.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+        assert_eq!(help_scroll(a), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn help_opens_from_the_sidebar_too() -> Result<()> {
+        let mut m = abcd()?;
+        m.keys(&[KeyCode::Tab]);
+        m.chars("?");
+        assert_eq!(help_scroll(&m.app), Some(0));
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.app.view(), View::Playlists, "focus unchanged");
+        Ok(())
+    }
+
+    #[test]
+    fn help_keys_close_and_are_consumed() -> Result<()> {
+        for close in [
+            ch('?'),
+            key(KeyCode::Esc),
+            ch('q'),
+            ch(' '),
+            ch('n'),
+            ch('r'),
+            ch('s'),
+            ch('z'),
+            ch('/'),
+            key(KeyCode::Tab),
+            key(KeyCode::Left),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT),
+        ] {
+            let mut m = abcd()?;
+            let a = &mut m.app;
+            press(a, &[ch('?'), close]);
+            assert_eq!(*a.mode(), Mode::Normal, "{close:?} closes help");
+            assert_eq!(a.focus(), Focus::Main, "{close:?} did nothing else");
+            assert_eq!(a.selected(), Some(0), "{close:?} did nothing else");
+            assert_eq!(a.query(), "", "{close:?} did nothing else");
+            assert_eq!(a.playback().current(), None, "{close:?} did nothing else");
+            assert!(!a.should_quit(), "{close:?} does not quit");
+            let now = Instant::now();
+            a.tick(now);
+            assert!(a.status(now).is_none(), "{close:?} raised no notice");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn question_mark_with_ctrl_or_alt_does_not_open_help() -> Result<()> {
+        let mut m = abcd()?;
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            m.app
+                .handle_key(KeyEvent::new(KeyCode::Char('?'), modifiers));
+            assert_eq!(*m.app.mode(), Mode::Normal, "{modifiers:?}+?");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_j_scrolls_help() -> Result<()> {
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        a.set_help_rows(5);
+        press(a, &[ch('?')]);
+        a.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(help_scroll(a), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_help() -> Result<()> {
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        press(a, &[ch('?')]);
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(a.should_quit());
+        Ok(())
+    }
+
+    #[test]
+    fn key_releases_leave_help_open() -> Result<()> {
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        press(a, &[ch('?')]);
+        a.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(help_scroll(a), Some(0));
+        Ok(())
+    }
+
+    /// `Enter` with the overlay open neither plays (library) nor opens
+    /// (sidebar) anything: it only closes the overlay.
+    #[test]
+    fn enter_in_help_neither_plays_nor_opens() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.chars("?");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.app.playback().current(), None, "nothing played");
+
+        m.select_playlist("Gym")?;
+        m.chars("?");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.app.view(), View::Playlists, "focus stays on the sidebar");
+        assert!(m.app.open_playlist().is_none(), "Gym was not opened");
+        Ok(())
+    }
+
+    /// Spec *Not while typing*: `?` is a search character in Search mode.
+    #[test]
+    fn question_mark_while_searching_is_typed() -> Result<()> {
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        press(a, &[ch('/'), ch('?')]);
+        assert_eq!(*a.mode(), Mode::Search);
+        assert_eq!(a.query(), "?");
+        Ok(())
+    }
+
+    #[test]
+    fn question_mark_in_a_name_prompt_is_typed() -> Result<()> {
+        let mut m = abcd()?;
+        m.chars("a");
+        m.keys(&[KeyCode::Enter]); // "New playlist…"
+        m.chars("Why?");
+        assert_eq!(m.name_input().map(NameInput::text), Some("Why?"));
+        Ok(())
+    }
+
+    #[test]
+    fn help_scroll_stops_at_the_last_page_and_k_moves_back_at_once() -> Result<()> {
+        let total = help_total();
+        let rows = 5;
+        let last = total - rows;
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        a.set_help_rows(rows);
+        press(a, &[ch('?'), ch('j'), key(KeyCode::Down)]);
+        assert_eq!(help_scroll(a), Some(2));
+        press(a, &[ch('k'), key(KeyCode::Up), key(KeyCode::Up)]);
+        assert_eq!(help_scroll(a), Some(0), "stops at the top");
+
+        for _ in 0..total * 2 {
+            press(a, &[ch('j')]);
+        }
+        assert_eq!(help_scroll(a), Some(last), "stops at the last page");
+        press(a, &[ch('k')]);
+        assert_eq!(help_scroll(a), Some(last - 1), "k moves back at once");
+        Ok(())
+    }
+
+    #[test]
+    fn help_page_and_jump_keys() -> Result<()> {
+        let total = help_total();
+        let rows = 4;
+        let last = total - rows;
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        a.set_help_rows(rows);
+        press(a, &[ch('?'), key(KeyCode::PageDown)]);
+        assert_eq!(help_scroll(a), Some(rows), "PgDn moves by help_rows");
+        press(a, &[key(KeyCode::PageUp)]);
+        assert_eq!(help_scroll(a), Some(0));
+        press(a, &[key(KeyCode::PageUp)]);
+        assert_eq!(help_scroll(a), Some(0), "PgUp stops at the top");
+        a.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(help_scroll(a), Some(last));
+        press(a, &[key(KeyCode::PageDown)]);
+        assert_eq!(help_scroll(a), Some(last), "PgDn stops at the last page");
+        press(a, &[ch('g')]);
+        assert_eq!(help_scroll(a), Some(0));
+        press(a, &[key(KeyCode::End)]);
+        assert_eq!(help_scroll(a), Some(last));
+        press(a, &[key(KeyCode::Home)]);
+        assert_eq!(help_scroll(a), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn help_that_fits_does_not_scroll() -> Result<()> {
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        a.set_help_rows(keys::help_line_count() + 10);
+        press(
+            a,
+            &[ch('?'), ch('j'), key(KeyCode::PageDown), key(KeyCode::End)],
+        );
+        assert_eq!(help_scroll(a), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn taller_help_rows_reclamp_the_scroll() -> Result<()> {
+        let total = help_total();
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        a.set_help_rows(3);
+        press(a, &[ch('?'), key(KeyCode::End)]);
+        assert_eq!(help_scroll(a), Some(total - 3));
+        a.set_help_rows(10);
+        assert_eq!(help_scroll(a), Some(total - 10), "re-clamped on resize");
+        a.set_help_rows(total + 5);
+        assert_eq!(help_scroll(a), Some(0), "everything fits");
+        a.set_help_rows(3);
+        assert_eq!(help_scroll(a), Some(0), "a shorter view keeps the scroll");
+        Ok(())
+    }
+
+    #[test]
+    fn help_rows_is_at_least_one_and_kept_between_openings() -> Result<()> {
+        let total = help_total();
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        a.set_help_rows(0);
+        press(a, &[ch('?'), key(KeyCode::PageDown)]);
+        assert_eq!(help_scroll(a), Some(1), "a zero height counts as 1");
+        a.set_help_rows(6);
+        press(a, &[key(KeyCode::Esc), ch('?')]);
+        assert_eq!(help_scroll(a), Some(0), "reopens at the top");
+        press(a, &[key(KeyCode::End)]);
+        assert_eq!(help_scroll(a), Some(total - 6), "6 rows kept");
+        Ok(())
+    }
+
+    #[test]
+    fn help_rows_outside_help_change_nothing_else() -> Result<()> {
+        let mut m = abcd()?;
+        let a = &mut m.app;
+        a.set_help_rows(2);
+        assert_eq!(*a.mode(), Mode::Normal);
+        press(a, &[ch('/')]);
+        a.set_help_rows(1);
+        assert_eq!(*a.mode(), Mode::Search);
         Ok(())
     }
 }

@@ -131,6 +131,7 @@ the status bar says how many entries were left out.
 | `↑` / `↓`, `k` / `j`   | move the selection                       |
 | `PgUp` / `PgDn`        | move the selection by a page             |
 | `g` / `Home`, `G` / `End` | first / last row                      |
+| `?`                    | show every key; `↑`/`↓`, `k`/`j`, `PgUp`/`PgDn`, `g`/`Home`, `G`/`End` scroll it, any other key closes it |
 | `q`, `Ctrl+C`          | quit                                     |
 
 While searching, typed characters go to the query, so letter keys do not act
