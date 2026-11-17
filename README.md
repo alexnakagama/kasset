@@ -275,15 +275,25 @@ KASSET_SAMPLE=/path/to/song.mp3 cargo test -- --ignored   # also plays a sample
 
 ### Releasing
 
-Bump `version` in `Cargo.toml`, commit, then push a matching tag:
+1. Bump `version` in `Cargo.toml` and merge it to `master`.
+2. Do a dry run of the release on `master`: Actions → Release → Run workflow,
+   or `gh workflow run Release --ref master` (follow it with `gh run watch`).
+   It tests, builds and packages every platform without publishing; the
+   archives can be downloaded from the run page to try them.
+3. Once it is green, push a tag matching the version:
 
-```sh
-git tag v0.2.0 && git push origin v0.2.0
-```
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
 
-The `Release` workflow (`.github/workflows/release.yml`) checks that the tag
-matches `Cargo.toml`, tests and builds every platform, and publishes a GitHub
-Release with the archives and `SHA256SUMS`.
+The `Release` workflow (`.github/workflows/release.yml`) then checks that the
+tag matches `Cargo.toml`, tests and builds every platform again, and publishes
+a GitHub Release with the archives and `SHA256SUMS`. A tag with a suffix
+(`v0.2.0-rc.1`) is published as a pre-release. Pull requests that change
+`Cargo.toml`, `Cargo.lock`, `.cargo/` or the workflow get the dry run
+automatically. If a tagged build fails nothing is published: fix it, then
+move the tag with `git tag -d v0.2.0 && git push origin :refs/tags/v0.2.0`
+and push it again.
 
 ## License
 

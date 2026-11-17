@@ -19,7 +19,7 @@ cargo +1.89 build                             # MSRV check (rust-version = 1.89)
 
 Whenever dependencies change, re-check `rust-version` against the highest dependency MSRV (`cargo metadata`).
 
-CI (`.github/workflows/ci.yml`) runs clippy + tests on Linux, macOS and Windows plus an MSRV build. Releases: bump `version` in `Cargo.toml`, push tag `vX.Y.Z`; `release.yml` checks the tag matches, tests, builds 5 targets and publishes a GitHub Release. Code must stay warning-free on non-unix too (gate unix-only test helpers with `#[cfg(unix)]`). `.cargo/config.toml` links the MSVC C runtime statically so `kasset.exe` needs no VC++ Redistributable.
+CI (`.github/workflows/ci.yml`) runs clippy + tests on Linux, macOS and Windows plus an MSRV build. Releases: bump `version` in `Cargo.toml`, dry-run `gh workflow run Release --ref master` (also runs on PRs touching Cargo.toml/Cargo.lock/.cargo/release.yml; builds + packages, never publishes), then push tag `vX.Y.Z`; `release.yml` checks the tag matches, tests, builds 5 targets and publishes a GitHub Release. Code must stay warning-free on non-unix too (gate unix-only test helpers with `#[cfg(unix)]`). `.cargo/config.toml` links the MSVC C runtime statically so `kasset.exe` needs no VC++ Redistributable.
 
 ## Lints and code rules
 

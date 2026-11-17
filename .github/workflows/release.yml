@@ -1,43 +1,73 @@
-# Pushing a tag like `v0.2.0` builds kasset for every platform below, tests
-# each native build, and publishes a GitHub Release with one archive per
-# platform plus a SHA256SUMS file. The tag must match `version` in Cargo.toml;
-# a tag with a suffix (`v0.2.0-rc.1`) is published as a pre-release. The build
-# deliberately uses no dependency cache, so release binaries never build from
-# a cache another branch wrote.
+# Builds kasset for every platform below, tests each native build, and
+# packages one archive per platform.
+#
+# - Pushing a tag like `v0.2.0` publishes a GitHub Release with the archives
+#   plus a SHA256SUMS file. The tag must match `version` in Cargo.toml; a tag
+#   with a suffix (`v0.2.0-rc.1`) is published as a pre-release.
+# - A dry run (the "Run workflow" button / `gh workflow run Release`, or a pull
+#   request touching the build setup) does everything except publishing; the
+#   archives are kept as run artifacts so they can be downloaded and tried.
+#
+# The build deliberately uses no dependency cache, so release binaries never
+# build from a cache another branch wrote.
 name: Release
 
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Supersede older dry runs of the same PR, but never cut a release short.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check-version:
-    name: Check tag matches Cargo.toml
+  prepare:
+    name: Check version
     runs-on: ubuntu-22.04
+    outputs:
+      label: ${{ steps.label.outputs.label }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Compare versions
+      - name: Pick the archive label
+        id: label
         env:
+          EVENT: ${{ github.event_name }}
           TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "kasset") | .version')
-          if [ "v$version" != "$TAG" ]; then
-            echo "::error::tag $TAG does not match Cargo.toml version $version"
-            exit 1
+          if [ "$EVENT" = push ]; then
+            if [ "v$version" != "$TAG" ]; then
+              echo "::error::tag $TAG does not match Cargo.toml version $version"
+              exit 1
+            fi
+            label="$TAG"
+          else
+            label="v$version-dev.${SHA:0:7}"
+            echo "::notice::dry run: archives are labelled $label and nothing is published"
           fi
+          echo "label=$label" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
-    needs: check-version
+    needs: prepare
     strategy:
       fail-fast: true
       matrix:
@@ -84,10 +114,10 @@ jobs:
       - name: Package (unix)
         if: runner.os != 'Windows'
         env:
-          TAG: ${{ github.ref_name }}
+          LABEL: ${{ needs.prepare.outputs.label }}
           TARGET: ${{ matrix.target }}
         run: |
-          name="kasset-$TAG-$TARGET"
+          name="kasset-$LABEL-$TARGET"
           mkdir "$name"
           cp "target/$TARGET/release/kasset" README.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
@@ -97,10 +127,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          TAG: ${{ github.ref_name }}
+          LABEL: ${{ needs.prepare.outputs.label }}
           TARGET: ${{ matrix.target }}
         run: |
-          $name = "kasset-$env:TAG-$env:TARGET"
+          $name = "kasset-$env:LABEL-$env:TARGET"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item "target/$env:TARGET/release/kasset.exe", README.md, LICENSE $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
@@ -111,10 +141,13 @@ jobs:
           name: ${{ matrix.target }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
+          retention-days: 14
 
   release:
     name: Publish release
     needs: build
+    # Only a pushed tag publishes; dry runs stop after the builds.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
