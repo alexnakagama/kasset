@@ -269,6 +269,10 @@ impl Signals {
         Ok(Self {})
     }
 
+    #[cfg_attr(
+        not(unix),
+        expect(clippy::unused_self, reason = "same signature as on unix")
+    )]
     fn received(&self) -> Option<i32> {
         #[cfg(unix)]
         {

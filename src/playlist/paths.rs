@@ -56,7 +56,7 @@ impl Resolver {
 
     /// The library index `raw` (an entry line) refers to, read relative to
     /// `folder` unless absolute.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[must_use]
     pub fn resolve(&self, folder: &Path, raw: &[u8]) -> Option<usize> {
         self.resolve_with(folder, raw, Matching::Full)
@@ -229,8 +229,10 @@ fn component_str(name: &std::ffi::OsStr) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     fn track(path: impl Into<PathBuf>) -> Track {
         Track {
             path: path.into(),

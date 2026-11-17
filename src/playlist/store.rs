@@ -736,6 +736,7 @@ fn sync_dir(_dir: &Path) {}
 mod tests {
     use super::*;
     use crate::library::Track;
+    #[cfg(unix)]
     use crate::playlist::EditError;
     use anyhow::{Result, bail};
     use std::time::Duration;

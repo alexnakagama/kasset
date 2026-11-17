@@ -13,7 +13,54 @@ leaving the terminal.
 - Playlists saved as `.m3u8` files inside your music folder, playable on
   their own and readable by other players
 
-## Requirements
+## Install
+
+### Prebuilt binary
+
+Download the archive for your platform from the
+[latest release](https://github.com/alexnakagama/kasset/releases/latest),
+extract it and put `kasset` (`kasset.exe` on Windows) somewhere on your `PATH`:
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 | `kasset-v<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `kasset-v<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `kasset-v<version>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `kasset-v<version>-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `kasset-v<version>-x86_64-pc-windows-msvc.zip` |
+
+For example, on Linux x86_64:
+
+```sh
+tar -xzf kasset-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+install -m 755 kasset-v0.1.0-x86_64-unknown-linux-gnu/kasset ~/.local/bin/
+```
+
+On Windows, extract the zip and put `kasset.exe` in a folder on your `PATH`.
+
+Each release also has a `SHA256SUMS` file to check a download against:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS          # Linux
+shasum -a 256 --check --ignore-missing SHA256SUMS      # macOS
+```
+
+On Windows, compare the output of `Get-FileHash kasset-*.zip` (PowerShell)
+with the matching line in `SHA256SUMS`.
+
+- **Linux:** the binary needs the ALSA runtime library (`libasound.so.2`),
+  which nearly every desktop system already has (`libasound2` /
+  `libasound2t64` on Debian and Ubuntu, `alsa-lib` on Fedora and Arch). It
+  needs glibc 2.35 or newer. PulseAudio and PipeWire systems work through
+  their ALSA compatibility layer.
+- **Windows:** the binary is statically linked against the C runtime, so it
+  needs no Visual C++ Redistributable.
+- **macOS:** the binary is not signed, so Gatekeeper blocks it the first time.
+  Clear the quarantine flag once: `xattr -d com.apple.quarantine kasset`.
+
+### From source
+
+Requirements:
 
 - Rust 1.89 or newer (`rustup` recommended)
 - On Linux, the ALSA development headers and `pkg-config`, needed to build the
@@ -28,11 +75,7 @@ leaving the terminal.
   sudo pacman -S alsa-lib pkgconf
   ```
 
-  PulseAudio and PipeWire systems work through their ALSA compatibility layer.
-
-macOS and Windows need no extra system packages.
-
-## Install
+macOS and Windows need no extra system packages. Then, from a checkout:
 
 ```sh
 cargo install --locked --path .
@@ -229,3 +272,19 @@ Two tests need real audio hardware and are ignored by default:
 cargo test -- --ignored                          # needs an output device
 KASSET_SAMPLE=/path/to/song.mp3 cargo test -- --ignored   # also plays a sample
 ```
+
+### Releasing
+
+Bump `version` in `Cargo.toml`, commit, then push a matching tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The `Release` workflow (`.github/workflows/release.yml`) checks that the tag
+matches `Cargo.toml`, tests and builds every platform, and publishes a GitHub
+Release with the archives and `SHA256SUMS`.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
