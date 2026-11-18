@@ -1523,9 +1523,16 @@ impl<A: Audio> App<A> {
             return;
         };
         // Names made outside kasset may be longer than the input allows;
-        // they are still shown whole and can be shortened.
+        // they are still shown whole and can be shortened. Listed names have
+        // no control or invisible characters, but may hold other whitespace
+        // (no-break or line separator), which is never typed or drawn raw:
+        // it is prefilled as a plain space, so `Enter` renames to a valid name.
+        let text = name
+            .chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .collect();
         self.mode = Mode::NameInput(NameInput {
-            text: name.clone(),
+            text,
             purpose: NamePurpose::Rename(name),
             error: None,
         });
@@ -3584,6 +3591,21 @@ mod playlist_tests {
             status.contains("Renamed \"Running\" to \"Morning run\""),
             "{status}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rename_prefill_turns_special_spaces_into_plain_spaces() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("a\u{a0}b\u{2028}c", &["A"])?;
+        m.select_playlist("a\u{a0}b\u{2028}c")?;
+        m.shift('R');
+        assert_eq!(m.name_input().map(NameInput::text), Some("a b c"));
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.listed(), ["a b c"]);
+        assert!(!m.file("a\u{a0}b\u{2028}c").exists());
+        assert!(m.file("a b c").exists());
         Ok(())
     }
 

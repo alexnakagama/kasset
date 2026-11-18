@@ -890,7 +890,7 @@ fn render_help(frame: &mut Frame, scroll: usize, area: Rect, view: &mut View) {
 /// left, keys indented and padded to `keys_width`, then the action.
 fn help_spans(line: HelpLine, keys_width: usize) -> Vec<Span<'static>> {
     match line {
-        HelpLine::Title(title) => vec![Span::styled(title, theme::HEADER)],
+        HelpLine::Title(title) => vec![Span::styled(title, theme::SECTION)],
         HelpLine::Key(entry) => vec![
             Span::styled(format!("  {:keys_width$}", entry.keys), theme::STRONG),
             Span::raw("  "),

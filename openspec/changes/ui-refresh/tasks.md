@@ -93,8 +93,8 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 6. Integration
 
-- [ ] 6.1 Run `cargo clippy --all-targets -- -D warnings`, `cargo test` and `cargo +1.89 build`. Verify that all three succeed. Also verify that no dependency was added (`git diff master -- Cargo.toml Cargo.lock` is empty).
-- [ ] 6.2 Run kasset in a real terminal or in a pty with the pyte harness, on a library with playlists. Check, with screenshots or a screen dump:
+- [x] 6.1 Run `cargo clippy --all-targets -- -D warnings`, `cargo test` and `cargo +1.89 build`. Verify that all three succeed. Also verify that no dependency was added (`git diff master -- Cargo.toml Cargo.lock` is empty).
+- [x] 6.2 Run kasset in a real terminal or in a pty with the pyte harness, on a library with playlists. Check, with screenshots or a screen dump:
   - both panes at 120 columns and the fallback at 60;
   - `Tab`/`Enter`/`Esc` flows, rename and delete from the sidebar;
   - the `?` overlay;
@@ -102,7 +102,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - resizing while playing.
 
   Verify the terminal is restored after `q`.
-- [ ] 6.3 Cross-check every scenario in `specs/player-tui/spec.md` and `specs/playlists/spec.md` of this change against a named test, or against step 6.2 for the visual ones. Verify by listing the mapping in the PR description, with no scenario left unmapped.
+- [x] 6.3 Cross-check every scenario in `specs/player-tui/spec.md` and `specs/playlists/spec.md` of this change against a named test, or against step 6.2 for the visual ones. Verify by listing the mapping in the PR description, with no scenario left unmapped.
 
 ## Workflow follow-up
 

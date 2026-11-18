@@ -52,8 +52,14 @@ pub const PROGRESS: Style = Style::new().fg(Color::Cyan);
 /// the search prompt.
 pub const STRONG: Style = Style::new().add_modifier(Modifier::BOLD);
 
-/// Column headers of a track table.
-pub const HEADER: Style = Style::new().add_modifier(Modifier::BOLD.union(Modifier::UNDERLINED));
+/// Column headers of a track table. Bold only: never underlined, since it
+/// sits right above the first row and must not look like
+/// [`SELECTED_UNFOCUSED`]; and colourless, since a structural label must
+/// not depend on `DarkGray`, which some themes draw as the background.
+pub const HEADER: Style = Style::new().add_modifier(Modifier::BOLD);
+/// Group titles in the help overlay, which has no selection to confuse
+/// them with.
+pub const SECTION: Style = Style::new().add_modifier(Modifier::BOLD.union(Modifier::UNDERLINED));
 
 /// A message drawn in place of an empty list, and placeholder text.
 pub const MESSAGE: Style = Style::new().add_modifier(Modifier::ITALIC);
@@ -99,5 +105,15 @@ mod tests {
     fn unfocused_border_is_not_dark_gray() {
         assert_ne!(BORDER_UNFOCUSED.fg, Some(Color::DarkGray));
         assert_ne!(border(true), border(false));
+    }
+
+    #[test]
+    fn header_does_not_look_like_a_selection() {
+        for selection in [SELECTED_FOCUSED, SELECTED_UNFOCUSED] {
+            assert_ne!(HEADER, selection);
+        }
+        assert!(!HEADER.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!HEADER.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(HEADER.fg, None, "headers must not depend on a colour");
     }
 }
