@@ -63,8 +63,8 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 4. Theme and two-pane layout (`src/theme.rs`, `src/ui.rs`)
 
-- [ ] 4.1 Add `src/theme.rs` with a `//!` doc and the style roles from D8. Move every colour and emphasis literal and `Stylize` shorthand out of `ui.rs`. Verify that `grep -nE "Color::|Modifier::|\.(bold|italic|dark_gray|red|green|cyan|yellow)\(\)" src/ui.rs` finds nothing outside `#[cfg(test)]`, and that the whole suite passes.
-- [ ] 4.2 Render the body as sidebar + main pane at a width of at least 70 columns, and only the focused pane below that, using `sidebar_list()` / `main_list()`. Draw focused and unfocused borders and selections per D8. Keep separate `sidebar_offset` / `main_offset` in `ui::View`, with `page_size` taken from the focused pane. Centre popups over the body. Verify with `TestBackend` tests:
+- [x] 4.1 Add `src/theme.rs` with a `//!` doc and the style roles from D8. Move every colour and emphasis literal and `Stylize` shorthand out of `ui.rs`. Verify that `grep -nE "Color::|Modifier::|\.(bold|italic|dark_gray|red|green|cyan|yellow)\(\)" src/ui.rs` finds nothing outside `#[cfg(test)]`, and that the whole suite passes.
+- [x] 4.2 Render the body as sidebar + main pane at a width of at least 70 columns, and only the focused pane below that, using `sidebar_list()` / `main_list()`. Draw focused and unfocused borders and selections per D8. Keep separate `sidebar_offset` / `main_offset` in `ui::View`, with `page_size` taken from the focused pane. Centre popups over the body. Verify with `TestBackend` tests:
   - *Both panes visible* at 100×30;
   - *Narrow terminal* at 60×24, before and after `Tab`;
   - *Widening the terminal*: the same `View` drawn at 60, then 100 columns;
@@ -72,12 +72,12 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - the selected row is reversed only in the focused pane, and underlined in the other;
   - both panes keep their own scroll position when focus moves;
   - the picker popup is drawn inside the body.
-- [ ] 4.3 Render the sidebar rows (playing marker only while a track is loaded, name elided at the end, right-aligned count, `DIM` read-only names, the "Library" row and separator, the empty and no-match hints below "Library") and the main pane titles (library root elided at the start, playlist name with read-only suffix). Verify with `TestBackend` tests:
+- [x] 4.3 Render the sidebar rows (playing marker only while a track is loaded, name elided at the end, right-aligned count, `DIM` read-only names, the "Library" row and separator, the empty and no-match hints below "Library") and the main pane titles (library root elided at the start, playlist name with read-only suffix). Verify with `TestBackend` tests:
   - *Playlist playing*, *Different source* and *Nothing played yet* (sidebar markers);
   - *No folder* (the hint shows below "Library");
   - a 300-character playlist name is elided without overflowing the sidebar;
   - a playlist name with control characters is drawn sanitised.
-- [ ] 4.4 Update the `ui.rs` `//!` doc, the CLAUDE.md `ui.rs` paragraph and module list (add `keys.rs` and `theme.rs`), and the README description of the screen (two panes, the narrow fallback, ambiguous-width glyphs under Terminal notes). Verify that clippy is clean and the whole suite passes.
+- [x] 4.4 Update the `ui.rs` `//!` doc, the CLAUDE.md `ui.rs` paragraph and module list (add `keys.rs` and `theme.rs`), and the README description of the screen (two panes, the narrow fallback, ambiguous-width glyphs under Terminal notes). Verify that clippy is clean and the whole suite passes.
 
 ## 5. Now-playing area, key bar and overlay rendering (`src/ui.rs`)
 

@@ -488,7 +488,6 @@ impl<A: Audio> Playback<A> {
 /// Playlists as the play order.
 impl<A: Audio> Playback<A> {
     /// Where the play order comes from.
-    #[cfg(test)]
     #[must_use]
     pub const fn source(&self) -> &Source {
         &self.source

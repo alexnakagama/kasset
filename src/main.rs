@@ -13,6 +13,7 @@ mod terminal;
 #[cfg(test)]
 mod test_support;
 mod text;
+mod theme;
 mod ui;
 
 use std::process::ExitCode;

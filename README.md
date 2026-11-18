@@ -114,6 +114,22 @@ without supported files opens normally and shows `No music found in <folder>`.
 Subfolders that cannot be read, broken links and symlink loops are skipped;
 the status bar says how many entries were left out.
 
+## The screen
+
+- **Sidebar** (left): "Library", then your playlists with their track counts.
+  Read-only playlists are drawn dimmed. While a track is loaded, the entry
+  that is the play order carries the playing marker (`▶`, `‖` or `■`).
+- **Main pane** (right): the tracks of the entry chosen in the sidebar, the
+  whole library or one playlist, with title, artist, album and length.
+- One pane has the keyboard focus: its border is highlighted and its
+  selected row is drawn in reverse video; the other pane's selected row is
+  only bold and underlined. `Tab` moves the focus.
+- On terminals narrower than 70 columns only the focused pane is shown, at
+  full width; keys work the same, and widening the terminal brings the
+  other pane back.
+- Below the panes: the now-playing panel, a status line for messages, and a
+  bar with the main keys for what has the focus.
+
 ## Keys
 
 | Key                    | Action                                   |
@@ -229,6 +245,10 @@ and the last error stays visible.
   exit for when `kasset` is stuck (for example on a stalled network mount): it
   ends the process at once without restoring the terminal. Run `reset` if the
   shell is left in a bad state afterwards.
+- The borders, the playing markers (`▶ ‖ ■`) and the ellipsis (`…`) are
+  Unicode characters of "ambiguous" East Asian width. Terminals set up to
+  draw those as double width (an option in some CJK setups) will misalign
+  the screen; use the default single-width setting.
 - While the UI is up, messages that audio libraries print to standard error
   are discarded so they cannot draw over the screen. When standard error is
   redirected to a file, they are kept there.
