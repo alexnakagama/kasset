@@ -81,15 +81,15 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 5. Now-playing area, key bar and overlay rendering (`src/ui.rs`)
 
-- [ ] 5.1 Replace the 6-row now-playing block with the 3-row area of D8: a top-rule block, a state/title/artist/album line with right-aligned `shuffle · repeat · vol` (the right part has priority on narrow widths), and a custom progress line instead of `Gauge`. Verify with `TestBackend` tests:
+- [x] 5.1 Replace the 6-row now-playing block with the 3-row area of D8: a top-rule block, a state/title/artist/album line with right-aligned `shuffle · repeat · vol` (the right part has priority on narrow widths), and a custom progress line instead of `Gauge`. Verify with `TestBackend` tests:
   - *Track playing*: "1:05" and "3:30" around a bar with about 31% `━` cells;
   - *Indicators*;
   - no track: "select a track and press Enter" and `-:--`;
   - unknown duration: an empty bar;
   - an 80-column frame with a 200-character title keeps the indicators intact.
-- [ ] 5.2 Draw the key bar from `keys::bar(context)`, cutting at whole labels and right-aligning `? help` only in the Normal-mode contexts (D7). Verify with `TestBackend` tests: *Help hint always visible* at 40 columns, *Playlist view help*, *Sidebar help*, *No help hint in prompts*, and no `? help` while searching.
-- [ ] 5.3 Render the help overlay from `keys::GROUPS` with scrolling, truncating lines and never wrapping them, and record `help_rows` in `ui::View`. Verify with `TestBackend` tests: *Help does not fit* (at 80×15 the first rows show, and after `j` the view moves one line), the full overlay at 100×50 shows every group title, the overlay's scrollable height equals `keys::help_line_count()`, and a 40-column overlay truncates lines with `…`.
-- [ ] 5.4 Update the README's now-playing and progress bar wording and the remaining doc comments that mention `NOW_PLAYING_HEIGHT` or the `Gauge`. Verify that `grep -rn "Gauge\|NOW_PLAYING_HEIGHT" src README.md` returns only code that is actually used, and that the whole suite and clippy pass.
+- [x] 5.2 Draw the key bar from `keys::bar(context)`, cutting at whole labels and right-aligning `? help` only in the Normal-mode contexts (D7). Verify with `TestBackend` tests: *Help hint always visible* at 40 columns, *Playlist view help*, *Sidebar help*, *No help hint in prompts*, and no `? help` while searching.
+- [x] 5.3 Render the help overlay from `keys::GROUPS` with scrolling, truncating lines and never wrapping them, and record `help_rows` in `ui::View`. Verify with `TestBackend` tests: *Help does not fit* (at 80×15 the first rows show, and after `j` the view moves one line), the full overlay at 100×50 shows every group title, the overlay's scrollable height equals `keys::help_line_count()`, and a 40-column overlay truncates lines with `…`.
+- [x] 5.4 Update the README's now-playing and progress bar wording and the remaining doc comments that mention `NOW_PLAYING_HEIGHT` or the `Gauge`. Verify that `grep -rn "Gauge\|NOW_PLAYING_HEIGHT" src README.md` returns only code that is actually used, and that the whole suite and clippy pass.
 
 ## 6. Integration
 

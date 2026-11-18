@@ -2,14 +2,23 @@
 //! the only state kept here is what the event loop feeds back to it and the
 //! panes' scroll positions ([`View`]).
 //!
-//! Layout, top to bottom: the body, the now-playing panel, the status line
-//! and the key bar. The body is two panes side by side, the sidebar
-//! ("Library" and the playlists) and the main pane (the library or the open
-//! playlist), when the terminal is at least [`TWO_PANE_MIN_WIDTH`] columns
-//! wide; below that only the focused pane is drawn, at full width. The
-//! focused pane has the focused border and the strong selection style
-//! ([`theme`]); each pane keeps its own scroll offset, and the page size fed
-//! back to the app is the focused pane's. Popups are centred over the body.
+//! Layout, top to bottom: the body, the now-playing area (a top rule, then
+//! the track line with the shuffle, repeat and volume indicators at its
+//! right end, then the progress line), the status line and the key bar. The
+//! body is two panes side by side, the sidebar ("Library" and the
+//! playlists) and the main pane (the library or the open playlist), when
+//! the terminal is at least [`TWO_PANE_MIN_WIDTH`] columns wide; below that
+//! only the focused pane is drawn, at full width. The focused pane has the
+//! focused border and the strong selection style ([`theme`]); each pane
+//! keeps its own scroll offset, and the page size fed back to the app is the
+//! focused pane's. Popups are centred over the body.
+//!
+//! The key bar and the help overlay are drawn from [`keys`], the single key
+//! table. The bar is cut at whole labels; in Normal mode `? help` keeps its
+//! place at the right end. The overlay is centred over everything above the
+//! status line, scrolls, and cuts its lines instead of wrapping them, so it
+//! always has [`keys::help_line_count`] lines; the rows it showed are kept
+//! in [`View`] (only while it is drawn) for the app to clamp its scroll.
 //!
 //! Every style comes from [`theme`]; this module holds no colour of its own.
 //!
@@ -26,20 +35,21 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph, Row, Table,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table,
     TableState, Wrap,
 };
 
 use crate::app::{
     App, Focus, ListView, MainView, Mode, NameInput, NamePurpose, Picker, View as Screen,
 };
+use crate::keys::{self, BarContext, HelpLine};
 use crate::playback::{Level, PlayState, clock};
 use crate::player::Audio;
 use crate::text::sanitize;
 use crate::theme;
 
-/// Height of the now-playing panel, borders included.
-const NOW_PLAYING_HEIGHT: u16 = 6;
+/// Height of the now-playing area: its top rule and two lines.
+const NOW_PLAYING_HEIGHT: u16 = 3;
 
 /// Narrowest terminal, in columns, that shows the sidebar and the main pane
 /// side by side.
@@ -48,23 +58,20 @@ pub const TWO_PANE_MIN_WIDTH: u16 = 70;
 /// Narrowest and widest sidebar in the two-pane layout, borders included.
 const SIDEBAR_WIDTH: (u16, u16) = (22, 32);
 
-// Each bar puts its view's own keys first: the bar is cut at the terminal's width.
-const KEYS_LIBRARY: &str = "Enter play · a/A add selected/all to playlist · Tab focus · / search · \
-                            Space pause · s stop · n/p next/prev · ←/→ seek · \
-                            +/- volume · z shuffle · r repeat · q quit";
-const KEYS_PLAYLISTS: &str = "Enter open · R rename · D delete · / search · Tab focus · \
-                              Space pause · s stop · n/p next/prev · ←/→ seek · +/- volume · \
-                              z shuffle · r repeat · q quit";
-// The edit keys come first: the bar is cut at the terminal's width.
-const KEYS_PLAYLIST: &str = "Enter play · d remove · J/K move · Esc sidebar · / search · \
-                             Tab focus · Space pause · s stop · n/p next/prev · ←/→ seek · \
-                             +/- volume · z shuffle · r repeat · q quit";
-const KEYS_SEARCH: &str = "type to filter · Enter keep · Esc clear · ↑/↓ move · Ctrl+C quit";
-const KEYS_PICKER: &str = "↑/↓ choose · Enter add · Esc cancel";
-const KEYS_NAME: &str = "type a name · Enter create · Esc cancel";
-const KEYS_RENAME: &str = "type a name · Enter rename · Esc cancel";
-const KEYS_CONFIRM: &str = "y delete · any other key cancel";
-const KEYS_HELP: &str = "↑/↓ scroll · any other key close";
+/// Drawn between two labels of the key bar.
+const BAR_SEPARATOR: &str = " · ";
+
+/// Least space kept between the key bar's labels and `? help`, and between
+/// the now-playing line's text and its indicators.
+const GAP: usize = 2;
+
+/// Least width the now-playing line keeps for the state and the start of
+/// the title when the indicators take the rest: marker, space, 3 columns
+/// of title and the ellipsis.
+const NOW_PLAYING_MIN_LEFT: usize = 6;
+
+/// The help overlay's title.
+const HELP_TITLE: &str = " Keys ";
 
 /// Start of the library pane's title, before the library root.
 const LIBRARY_PREFIX: &str = " Library · ";
@@ -134,6 +141,42 @@ fn elide_end(text: &str, max: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+/// `spans` cut at the end to fit `max` columns, with `…` in the style of the
+/// span that was cut marking the cut. Spans after the cut are dropped.
+fn fit_spans(spans: Vec<Span<'_>>, max: usize) -> Vec<Span<'_>> {
+    if spans.iter().map(Span::width).sum::<usize>() <= max {
+        return spans;
+    }
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut room = max - 1; // the ellipsis
+    let mut fitted = Vec::with_capacity(spans.len());
+    for span in spans {
+        let span_width = span.width();
+        if span_width <= room {
+            room -= span_width;
+            fitted.push(span);
+            continue;
+        }
+        let mut end = 0;
+        for (i, c) in span.content.char_indices() {
+            let w = width(&span.content[i..i + c.len_utf8()]);
+            if w > room {
+                break;
+            }
+            room -= w;
+            end = i + c.len_utf8();
+        }
+        fitted.push(Span::styled(
+            format!("{}…", &span.content[..end]),
+            span.style,
+        ));
+        break;
+    }
+    fitted
+}
+
 /// A playlist name ready to draw.
 fn shown_name(name: &str) -> String {
     sanitize(name).unwrap_or_default()
@@ -175,21 +218,21 @@ impl View {
     }
 }
 
-/// The key help for what is on screen.
-fn key_help<A: Audio>(app: &App<A>) -> &'static str {
+/// Which key bar fits what is on screen.
+fn bar_context<A: Audio>(app: &App<A>) -> BarContext {
     match app.mode() {
-        Mode::Search => KEYS_SEARCH,
-        Mode::Picker(_) => KEYS_PICKER,
+        Mode::Search => BarContext::Search,
+        Mode::Picker(_) => BarContext::Picker,
         Mode::NameInput(input) => match input.purpose() {
-            NamePurpose::Create(_) => KEYS_NAME,
-            NamePurpose::Rename(_) => KEYS_RENAME,
+            NamePurpose::Create(_) => BarContext::Name,
+            NamePurpose::Rename(_) => BarContext::Rename,
         },
-        Mode::ConfirmDelete(_) => KEYS_CONFIRM,
-        Mode::Help { .. } => KEYS_HELP,
+        Mode::ConfirmDelete(_) => BarContext::ConfirmDelete,
+        Mode::Help { .. } => BarContext::Help,
         Mode::Normal => match app.view() {
-            Screen::Library => KEYS_LIBRARY,
-            Screen::Playlists => KEYS_PLAYLISTS,
-            Screen::Playlist => KEYS_PLAYLIST,
+            Screen::Library => BarContext::Library,
+            Screen::Playlists => BarContext::Sidebar,
+            Screen::Playlist => BarContext::Playlist,
         },
     }
 }
@@ -207,14 +250,45 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
     render_body(frame, app, view, body);
     render_now_playing(frame, app, playing);
     render_status(frame, app, status, now);
-    frame.render_widget(Paragraph::new(key_help(app)).style(theme::DIM), keys);
+    render_key_bar(frame, bar_context(app), keys);
 
     match app.mode() {
         Mode::Picker(picker) => render_picker(frame, picker, body),
         Mode::NameInput(input) => render_name_input(frame, input, body),
         Mode::ConfirmDelete(name) => render_confirm_delete(frame, name, body),
-        // The help overlay is drawn from task 5.3 of the ui-refresh change.
-        Mode::Normal | Mode::Search | Mode::Help { .. } => {}
+        Mode::Help { scroll } => render_help(frame, *scroll, body.union(playing), view),
+        Mode::Normal | Mode::Search => {}
+    }
+}
+
+/// Draws `context`'s key bar: its labels left to right, stopping before the
+/// first one that does not fit whole, and in the Normal-mode contexts
+/// [`keys::HELP_HINT`] at the right end, which always keeps its place.
+fn render_key_bar(frame: &mut Frame, context: BarContext, area: Rect) {
+    let hint = matches!(
+        context,
+        BarContext::Library | BarContext::Playlist | BarContext::Sidebar
+    );
+    let room = if hint {
+        usize::from(area.width).saturating_sub(width(keys::HELP_HINT) + GAP)
+    } else {
+        usize::from(area.width)
+    };
+    let mut text = String::new();
+    for label in keys::bar(context) {
+        let separator = if text.is_empty() { "" } else { BAR_SEPARATOR };
+        if width(&text) + width(separator) + width(label) > room {
+            break;
+        }
+        text.push_str(separator);
+        text.push_str(label);
+    }
+    frame.render_widget(Line::styled(text, theme::DIM), area);
+    if hint {
+        frame.render_widget(
+            Line::styled(keys::HELP_HINT, theme::DIM).right_aligned(),
+            area,
+        );
     }
 }
 
@@ -768,13 +842,74 @@ fn render_confirm_delete(frame: &mut Frame, name: &str, area: Rect) {
     );
 }
 
+/// Draws the help overlay over `area` from line `scroll` of
+/// [`keys::help_lines`], and records how many lines fit in
+/// [`View::help_rows`]. Lines are cut with `…`, never wrapped, so the line
+/// count is the same at every width.
+fn render_help(frame: &mut Frame, scroll: usize, area: Rect, view: &mut View) {
+    let keys_width = keys::keys_width();
+    let total = keys::help_line_count();
+    let widest = keys::help_lines()
+        .map(|line| help_spans(line, keys_width).iter().map(Span::width).sum())
+        .max()
+        .unwrap_or(0);
+    // As wide as the widest line (borders and padding included), so nothing
+    // is cut on a wide enough terminal.
+    let popup_width = u16::try_from(widest + 4).unwrap_or(u16::MAX);
+    let height = u16::try_from(total.saturating_add(2)).unwrap_or(u16::MAX);
+    let popup = centered(area, popup_width, height);
+    let mut block = Block::bordered()
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(HELP_TITLE, theme::STRONG));
+    let inner = block.inner(popup);
+    let rows = usize::from(inner.height);
+    view.help_rows = rows;
+    // The app clamps `scroll` with the previous frame's rows; clamp again
+    // so a resize never shows blank lines past the end.
+    let first = scroll.min(total.saturating_sub(rows));
+    let shown = rows.min(total - first);
+    // The position, only when it fits beside the title on the top border.
+    let position = format!(" {}–{} of {total} ", first + 1, first + shown);
+    let border = usize::from(popup.width).saturating_sub(2);
+    if shown < total && width(HELP_TITLE) + width(&position) <= border {
+        block = block.title_top(Line::from(position).right_aligned());
+    }
+
+    let room = usize::from(inner.width);
+    let lines: Vec<Line> = keys::help_lines()
+        .skip(first)
+        .take(rows)
+        .map(|line| Line::from(fit_spans(help_spans(line, keys_width), room)))
+        .collect();
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One help line as drawn, laid out like `kasset --help`: titles flush
+/// left, keys indented and padded to `keys_width`, then the action.
+fn help_spans(line: HelpLine, keys_width: usize) -> Vec<Span<'static>> {
+    match line {
+        HelpLine::Title(title) => vec![Span::styled(title, theme::HEADER)],
+        HelpLine::Key(entry) => vec![
+            Span::styled(format!("  {:keys_width$}", entry.keys), theme::STRONG),
+            Span::raw("  "),
+            Span::raw(entry.action),
+        ],
+        HelpLine::Blank => Vec::new(),
+    }
+}
+
 /// The first row to show so that `selected` is on screen, moving the previous
 /// `offset` as little as possible and never leaving blank rows at the bottom.
 /// The result is always within the list (`< len`, or 0 when it is empty), so
 /// `offset..` is a valid slice start even when no row fits (`rows == 0`).
+/// A `selected` past the end (e.g. a stale offset passed for want of a
+/// selection) counts as the last row.
 fn scroll(offset: usize, selected: usize, rows: usize, len: usize) -> usize {
+    let selected = selected.min(len.saturating_sub(1));
     if rows == 0 {
-        return selected.min(len.saturating_sub(1));
+        return selected;
     }
     let offset = offset.min(len.saturating_sub(rows)).min(selected);
     if selected >= offset + rows {
@@ -792,14 +927,17 @@ const fn state_marker(state: PlayState) -> &'static str {
     }
 }
 
+/// Draws the now-playing area: a top rule titled "Now playing", the state,
+/// title, artist and album with the indicators at the right, and the
+/// progress line.
 fn render_now_playing<A: Audio>(frame: &mut Frame, app: &App<A>, area: Rect) {
-    let block = Block::bordered()
+    let block = Block::default()
+        .borders(Borders::TOP)
         .padding(Padding::horizontal(1))
         .title(" Now playing ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [heading, details, progress, modes] =
-        Layout::vertical([Constraint::Length(1); 4]).areas(inner);
+    let [info, progress] = Layout::vertical([Constraint::Length(1); 2]).areas(inner);
 
     let playback = app.playback();
     let state = playback.state();
@@ -808,70 +946,84 @@ fn render_now_playing<A: Audio>(frame: &mut Frame, app: &App<A>, area: Rect) {
         PlayState::Paused => theme::PAUSED,
         PlayState::Stopped => theme::STOPPED,
     };
-    let state_label = Span::styled(
-        format!("{} {}", state_marker(state), state.label()),
-        state_style,
-    );
-
+    let mut left = vec![
+        Span::styled(state_marker(state), state_style),
+        Span::raw(" "),
+    ];
     if let Some(track) = playback.current_track() {
-        frame.render_widget(
-            Line::from(vec![
-                state_label,
-                Span::raw("  "),
-                Span::styled(track.title.as_str(), theme::STRONG),
-            ]),
-            heading,
-        );
-        frame.render_widget(
-            Line::from(format!("{} — {}", track.artist, track.album)),
-            details,
-        );
+        left.push(Span::styled(track.title.as_str(), theme::STRONG));
+        left.push(Span::raw(format!(" — {} · {}", track.artist, track.album)));
     } else {
-        frame.render_widget(
-            Line::from(vec![
-                state_label,
-                Span::raw("  "),
-                Span::styled("select a track and press Enter", theme::MESSAGE),
-            ]),
-            heading,
-        );
+        left.push(Span::styled(
+            "select a track and press Enter",
+            theme::MESSAGE,
+        ));
     }
-
-    let position = playback.position();
-    let duration = playback.duration();
-    let label = format!(
-        "{} / {}",
-        clock(position),
-        duration.map_or_else(|| "-:--".to_owned(), clock)
+    let indicators = format!(
+        "shuffle {} · repeat {} · vol {}%",
+        if playback.shuffle() { "on" } else { "off" },
+        playback.repeat().label(),
+        playback.volume().percent()
     );
+
+    // The indicators come first; the text keeps at least the state and the
+    // start of the title, and gets the rest.
+    let available = usize::from(info.width);
+    let left_width: usize = left.iter().map(Span::width).sum();
+    let indicators = elide_end(
+        &indicators,
+        available.saturating_sub(left_width.min(NOW_PLAYING_MIN_LEFT) + GAP),
+    );
+    let indicators_width = width(&indicators);
+    let left_room = if indicators_width == 0 {
+        available
+    } else {
+        available.saturating_sub(indicators_width + GAP)
+    };
+    frame.render_widget(Line::from(fit_spans(left, left_room)), info);
+    frame.render_widget(Line::from(indicators).right_aligned(), info);
+
     frame.render_widget(
-        Gauge::default()
-            .ratio(progress_ratio(position, duration))
-            .label(label)
-            .use_unicode(true)
-            .gauge_style(theme::PROGRESS),
+        progress_line(playback.position(), playback.duration(), progress.width),
         progress,
-    );
-
-    let on_off = |on: bool| if on { "on" } else { "off" };
-    frame.render_widget(
-        Line::from(format!(
-            "Volume {}%   Shuffle {}   Repeat {}",
-            playback.volume().percent(),
-            on_off(playback.shuffle()),
-            playback.repeat().label()
-        )),
-        modes,
     );
 }
 
-/// Fraction of the track played, always within 0–1 (the gauge panics
-/// otherwise); 0 when the length is unknown.
-fn progress_ratio(position: Duration, duration: Option<Duration>) -> f64 {
-    match duration {
-        Some(d) if !d.is_zero() => (position.as_secs_f64() / d.as_secs_f64()).clamp(0.0, 1.0),
-        _ => 0.0,
-    }
+/// `elapsed ━━━━╸──── total` in `columns` columns. The bar takes the columns
+/// the two times leave; it is empty when the length is unknown.
+fn progress_line(position: Duration, duration: Option<Duration>, columns: u16) -> Line<'static> {
+    let elapsed = clock(position);
+    let total = duration.map_or_else(|| "-:--".to_owned(), clock);
+    let times = u16::try_from(width(&elapsed) + width(&total) + 2).unwrap_or(u16::MAX);
+    let cells = columns.saturating_sub(times);
+    let filled = filled_cells(position, duration, cells);
+    // The head marks a track that has started but not reached the end.
+    let started = !position.is_zero() && duration.is_some_and(|d| !d.is_zero());
+    let head = u16::from(started && filled < cells);
+    let cell = |glyph: &str, n: u16| glyph.repeat(usize::from(n));
+    Line::from(vec![
+        Span::raw(elapsed),
+        Span::raw(" "),
+        Span::styled(cell("━", filled), theme::PROGRESS),
+        Span::styled(cell("╸", head), theme::PROGRESS),
+        Span::styled(cell("─", cells - filled - head), theme::DIM),
+        Span::raw(" "),
+        Span::raw(total),
+    ])
+}
+
+/// How many of `cells` cells of the progress bar are filled: the played
+/// fraction of the track, rounded to the nearest cell and always within
+/// `0..=cells`; 0 when the length is unknown or zero.
+fn filled_cells(position: Duration, duration: Option<Duration>, cells: u16) -> u16 {
+    let Some(total) = duration.map(|d| d.as_millis()).filter(|&ms| ms > 0) else {
+        return 0;
+    };
+    let played = position.as_millis().min(total);
+    // Exact rounding in integers. A `Duration` has under 2^74 millis and
+    // `cells` under 2^16, so nothing here can overflow a u128.
+    let filled = (played * u128::from(cells) + total / 2) / total;
+    u16::try_from(filled).map_or(cells, |f| f.min(cells))
 }
 
 fn render_status<A: Audio>(frame: &mut Frame, app: &App<A>, area: Rect, now: Instant) {
@@ -1047,8 +1199,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn now_playing_shows_track_progress_and_modes() {
+    /// A one-track library ("Song" by "Band" on "LP", 3:30 long) playing
+    /// at 1:05.
+    fn playing_at_1_05() -> App<SilentAudio> {
         let mut tracks = vec![track("Song", "Band", "LP")];
         tracks[0].duration = Some(Duration::from_secs(210));
         let mut app = App::new(
@@ -1060,16 +1213,138 @@ mod tests {
         );
         press(&mut app, KeyCode::Enter);
         app.playback_mut().audio_mut().position = Duration::from_secs(65);
+        app
+    }
+
+    /// Spec *Track playing*.
+    #[test]
+    fn now_playing_shows_the_track_and_its_progress() {
+        let app = playing_at_1_05();
         let screen = draw(&app, &mut View::default(), 80, 20);
-        assert!(screen_contains(&screen, "▶ Playing  Song"), "{screen:#?}");
-        assert!(screen_contains(&screen, "Band — LP"));
-        assert!(screen_contains(&screen, "1:05 / 3:30"));
-        assert!(screen_contains(
-            &screen,
-            "Volume 100%   Shuffle off   Repeat off"
-        ));
-        let ratio = progress_ratio(Duration::from_secs(65), Some(Duration::from_secs(210)));
-        assert!((ratio - 0.31).abs() < 0.01, "{ratio}");
+        // Rule, then the two lines of the area, above the status and key bar.
+        assert!(screen[15].contains(" Now playing "), "{screen:#?}");
+        assert!(screen[16].starts_with(" ▶ Song — Band · LP"), "{screen:#?}");
+        let progress = &screen[17];
+        assert!(progress.starts_with(" 1:05 ━"), "{progress}");
+        assert!(progress.ends_with("─ 3:30 "), "{progress}");
+        // " 1:05 " and " 3:30 " plus the padding leave 78 - 10 cells.
+        let cells = 78 - 10;
+        let filled = progress.chars().filter(|&c| c == '━').count();
+        assert_eq!(filled, (cells * 65 * 10 + 2100 / 2) / 2100, "{progress}");
+        assert!(
+            filled.abs_diff(cells * 31 / 100) <= 1,
+            "about 31%: {progress}"
+        );
+        assert_eq!(progress.chars().filter(|&c| c == '╸').count(), 1);
+        assert_eq!(
+            progress.chars().filter(|&c| c == '─').count(),
+            cells - filled - 1
+        );
+    }
+
+    /// Spec *Indicators*.
+    #[test]
+    fn now_playing_shows_shuffle_repeat_and_volume() {
+        let mut app = playing_at_1_05();
+        let default = draw(&app, &mut View::default(), 80, 20);
+        assert!(
+            default[16].ends_with("shuffle off · repeat off · vol 100% "),
+            "{default:#?}"
+        );
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('r'));
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Char('-'));
+        }
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(
+            screen[16].ends_with("shuffle on · repeat all · vol 70% "),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn now_playing_without_a_track_says_what_to_do() {
+        let app = library(3);
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        assert!(
+            screen[16].starts_with(" ■ select a track and press Enter"),
+            "{screen:#?}"
+        );
+        assert!(screen[17].starts_with(" 0:00 ─"), "{screen:#?}");
+        assert!(screen[17].ends_with("─ -:-- "), "{screen:#?}");
+        assert!(!screen[17].contains('━') && !screen[17].contains('╸'));
+    }
+
+    #[test]
+    fn unknown_length_draws_an_empty_bar() {
+        let mut tracks = vec![track("Song", "Band", "LP")];
+        tracks[0].duration = None;
+        let mut app = App::new(
+            tracks,
+            SilentAudio::default(),
+            no_store(),
+            "/m".to_owned(),
+            None,
+        );
+        press(&mut app, KeyCode::Enter);
+        app.playback_mut().audio_mut().position = Duration::from_secs(65);
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        let progress = &screen[17];
+        assert!(progress.starts_with(" 1:05 ─"), "{progress}");
+        assert!(progress.ends_with("─ -:-- "), "{progress}");
+        assert!(
+            !progress.contains('━') && !progress.contains('╸'),
+            "{progress}"
+        );
+    }
+
+    #[test]
+    fn long_title_never_pushes_out_the_indicators() {
+        let title = "T".repeat(200);
+        let mut app = App::new(
+            vec![track(&title, "Band", "LP")],
+            SilentAudio::default(),
+            no_store(),
+            "/m".to_owned(),
+            None,
+        );
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&app, &mut View::default(), 80, 20);
+        let line = &screen[16];
+        assert!(
+            line.ends_with("  shuffle off · repeat off · vol 100% "),
+            "{line}"
+        );
+        assert!(line.starts_with(" ▶ TTT"), "{line}");
+        assert!(line.contains("T…"), "the title is cut: {line}");
+        // So narrow that the indicators give way: the state and the start
+        // of the title stay.
+        let screen = draw(&app, &mut View::default(), 20, 20);
+        assert!(screen[16].starts_with(" ▶ TTT…"), "{screen:#?}");
+        assert!(screen[16].contains("shuf"), "{screen:#?}");
+    }
+
+    #[test]
+    fn progress_bar_fill_is_always_in_range() {
+        let s = Duration::from_secs;
+        assert_eq!(filled_cells(s(10), None, 50), 0);
+        assert_eq!(filled_cells(s(10), Some(Duration::ZERO), 50), 0);
+        assert_eq!(filled_cells(s(500), Some(s(200)), 50), 50, "past the end");
+        assert_eq!(filled_cells(s(100), Some(s(200)), 50), 25);
+        assert_eq!(filled_cells(s(65), Some(s(210)), 100), 31, "rounded");
+        assert_eq!(filled_cells(s(100), Some(s(200)), 0), 0);
+        assert_eq!(
+            filled_cells(Duration::MAX, Some(Duration::MAX), u16::MAX),
+            u16::MAX
+        );
+        assert_eq!(filled_cells(s(1), Some(Duration::MAX), u16::MAX), 0);
+        // The bar takes exactly the columns the times leave.
+        for columns in [0, 1, 5, 9, 10, 11, 80, u16::MAX] {
+            let line = progress_line(s(65), Some(s(210)), columns);
+            let cells: usize = line.spans[2..5].iter().map(Span::width).sum();
+            assert_eq!(cells, usize::from(columns.saturating_sub(10)), "{columns}");
+        }
     }
 
     #[test]
@@ -1133,10 +1408,10 @@ mod tests {
         let app = library(100);
         let mut view = View::default();
         draw(&app, &mut view, 60, 20);
-        // 20 - 6 (now playing) - 2 (status, keys) - 2 (borders) - 1 (header)
-        assert_eq!(view.page_size(), 9);
+        // 20 - 3 (now playing) - 2 (status, keys) - 2 (borders) - 1 (header)
+        assert_eq!(view.page_size(), 12);
         draw(&app, &mut view, 60, 40);
-        assert_eq!(view.page_size(), 29, "resize is picked up");
+        assert_eq!(view.page_size(), 32, "resize is picked up");
     }
 
     #[test]
@@ -1185,14 +1460,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_ratio_is_always_in_range() {
-        let s = Duration::from_secs;
-        assert!(progress_ratio(s(10), None).abs() < f64::EPSILON);
-        assert!(progress_ratio(s(10), Some(Duration::ZERO)).abs() < f64::EPSILON);
-        assert!((progress_ratio(s(500), Some(s(200))) - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
     fn scroll_keeps_the_selection_visible() {
         assert_eq!(scroll(0, 0, 10, 100), 0);
         assert_eq!(scroll(0, 15, 10, 100), 6);
@@ -1202,6 +1469,12 @@ mod tests {
         assert_eq!(scroll(3, 7, 0, 100), 7);
         assert_eq!(scroll(9, 9, 0, 3), 2, "no row fits: still within the list");
         assert_eq!(scroll(9, 9, 0, 0), 0);
+        assert_eq!(scroll(18, 18, 2, 3), 1, "selection past the end");
+        assert_eq!(scroll(18, 18, 5, 3), 0);
+        for (offset, selected, rows, len) in [(18, 18, 2, 3), (50, 99, 1, 1), (0, 7, 3, 0)] {
+            let first = scroll(offset, selected, rows, len);
+            assert!(first < len.max(1), "{offset} {selected} {rows} {len}");
+        }
     }
 
     /// A library of A, B, C by "Band" under a temporary root, with playlists
@@ -1400,35 +1673,291 @@ mod tests {
         Ok(())
     }
 
+    /// The key bar: the screen's last line.
+    fn key_bar(screen: &[String]) -> &str {
+        screen.last().map_or("", String::as_str)
+    }
+
     #[test]
     fn library_help_mentions_playlist_keys() {
         // At a common 80-column width: the bar is cut there, so these keys
         // must come before the transport keys.
         let app = library(3);
         let screen = draw(&app, &mut View::default(), 80, 20);
-        assert!(
-            screen[19].contains("a/A add selected/all to playlist"),
-            "{screen:#?}"
-        );
-        assert!(screen[19].contains("Tab focus"), "{screen:#?}");
+        let bar = key_bar(&screen);
+        assert!(bar.starts_with("Enter play · a/A add · Tab focus"), "{bar}");
+        assert!(bar.ends_with("? help"), "{bar}");
     }
 
+    /// Spec *Help hint always visible*.
+    #[test]
+    fn help_hint_stays_at_the_right_end_of_a_cut_bar() {
+        let app = library(3);
+        let screen = draw(&app, &mut View::default(), 40, 20);
+        let bar = key_bar(&screen);
+        assert!(bar.ends_with("? help"), "{bar}");
+        // Cut at whole labels, with room left before the hint.
+        assert!(
+            bar.starts_with("Enter play · a/A add · Tab focus  "),
+            "{bar}"
+        );
+        assert!(!bar.contains("Space"), "{bar}");
+        let labels = &bar[..bar.len() - "? help".len()];
+        assert!(!labels.trim_end().ends_with('·'), "{bar}");
+        // Every Normal-mode label fits at a width wide enough for all.
+        let screen = draw(&app, &mut View::default(), 300, 20);
+        let bar = key_bar(&screen);
+        for label in keys::bar(BarContext::Library) {
+            assert!(bar.contains(label), "{label}: {bar}");
+        }
+        assert!(bar.ends_with("? help"), "{bar}");
+        // Too narrow for anything but the hint, and narrower still.
+        for w in [9, 6, 3, 1] {
+            let screen = draw(&app, &mut View::default(), w, 20);
+            let bar = key_bar(&screen);
+            assert!(!bar.contains("Enter"), "{w}: {bar}");
+            if w >= 6 {
+                assert!(bar.ends_with("? help"), "{w}: {bar}");
+            }
+        }
+    }
+
+    /// Specs *Playlist view help* and *Sidebar help*.
     #[test]
     fn open_playlist_help_bar_shows_the_edit_keys() -> anyhow::Result<()> {
         let (_tmp, mut app) = with_playlists()?;
         keys(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
         // Narrow enough that the bar is cut: the edit keys come first.
-        let screen = draw(&app, &mut View::default(), 50, 20);
-        let bar = &screen[19];
+        let screen = draw(&app, &mut View::default(), 60, 20);
+        let bar = key_bar(&screen);
         assert!(bar.contains("d remove"), "{screen:#?}");
         assert!(bar.contains("J/K move"), "{screen:#?}");
-        assert!(bar.contains("Esc sidebar"), "{screen:#?}");
+        assert!(bar.ends_with("? help"), "{screen:#?}");
 
         press(&mut app, KeyCode::Esc);
-        let screen = draw(&app, &mut View::default(), 200, 20);
-        assert!(screen[19].contains("R rename"), "{screen:#?}");
-        assert!(screen[19].contains("D delete"), "{screen:#?}");
+        let screen = draw(&app, &mut View::default(), 60, 20);
+        let bar = key_bar(&screen);
+        assert!(bar.starts_with("Enter open · R rename · D delete"), "{bar}");
+        assert!(bar.ends_with("? help"), "{bar}");
         Ok(())
+    }
+
+    /// Spec *No help hint in prompts*, and none while searching.
+    #[test]
+    fn prompts_and_search_have_no_help_hint() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        press(&mut app, KeyCode::Char('/'));
+        let screen = draw(&app, &mut View::default(), 200, 20);
+        let bar = key_bar(&screen);
+        assert!(
+            bar.starts_with("type to filter · Enter keep · Esc clear"),
+            "{bar}"
+        );
+        assert!(!bar.contains("? help"), "{bar}");
+
+        press(&mut app, KeyCode::Esc);
+        keys(&mut app, &[KeyCode::Tab, KeyCode::Down]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        let screen = draw(&app, &mut View::default(), 200, 20);
+        let bar = key_bar(&screen);
+        assert_eq!(bar.trim_end(), "type a name · Enter rename · Esc cancel");
+
+        press(&mut app, KeyCode::Esc);
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        let screen = draw(&app, &mut View::default(), 200, 20);
+        assert_eq!(
+            key_bar(&screen).trim_end(),
+            "y delete · any other key cancel"
+        );
+
+        press(&mut app, KeyCode::Esc); // cancels
+        press(&mut app, KeyCode::Char('?'));
+        let screen = draw(&app, &mut View::default(), 200, 20);
+        assert_eq!(
+            key_bar(&screen).trim_end(),
+            "↑/↓ scroll · any other key close"
+        );
+        Ok(())
+    }
+
+    /// Draws `app` like the event loop does: the frame, then the rows it
+    /// showed fed back to the app.
+    fn draw_and_feed_back(
+        app: &mut App<SilentAudio>,
+        view: &mut View,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let screen = draw(app, view, width, height);
+        app.set_page_size(view.page_size());
+        app.set_help_rows(view.help_rows());
+        screen
+    }
+
+    /// The text inside the help overlay's borders, line by line.
+    fn help_body(screen: &[String]) -> Vec<String> {
+        let corner = format!("┌{HELP_TITLE}");
+        let Some((top, line)) = screen.iter().enumerate().find(|(_, l)| l.contains(&corner)) else {
+            return Vec::new();
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let left = chars
+            .windows(2)
+            .position(|w| w[0] == '┌' && w[1] == ' ')
+            .unwrap_or(0);
+        let right = chars
+            .iter()
+            .skip(left)
+            .position(|&c| c == '┐')
+            .map_or(chars.len(), |i| left + i);
+        screen
+            .iter()
+            .skip(top + 1)
+            .map(|l| l.chars().collect::<Vec<char>>())
+            .take_while(|l| l.get(left) == Some(&'│'))
+            .map(|l| {
+                let inside: String = l[left + 1..right.min(l.len())].iter().collect();
+                inside.trim().to_owned()
+            })
+            .collect()
+    }
+
+    /// Spec *Help does not fit*.
+    #[test]
+    fn help_overlay_scrolls_when_it_does_not_fit() {
+        let mut app = library(3);
+        let mut view = View::default();
+        press(&mut app, KeyCode::Char('?'));
+        let screen = draw_and_feed_back(&mut app, &mut view, 80, 15);
+        let body = help_body(&screen);
+        // 15 rows - status - keys - 2 borders.
+        assert_eq!(view.help_rows(), 11, "{screen:#?}");
+        assert_eq!(body.len(), 11, "{screen:#?}");
+        assert_eq!(body[0], "Library", "{screen:#?}");
+        assert!(body[1].starts_with("Enter"), "{screen:#?}");
+        let total = keys::help_line_count();
+        assert!(
+            screen_contains(&screen, &format!(" 1–11 of {total} ")),
+            "{screen:#?}"
+        );
+
+        press(&mut app, KeyCode::Char('j'));
+        let screen = draw_and_feed_back(&mut app, &mut view, 80, 15);
+        let moved = help_body(&screen);
+        assert_eq!(moved[..10], body[1..], "one line down: {screen:#?}");
+        assert!(screen_contains(&screen, " 2–12 of "), "{screen:#?}");
+
+        // At the end, the last line of the table is the last line shown.
+        press(&mut app, KeyCode::End);
+        let screen = draw_and_feed_back(&mut app, &mut view, 80, 15);
+        let body = help_body(&screen);
+        assert!(body[10].starts_with("q, Ctrl+C"), "{screen:#?}");
+        assert!(
+            screen_contains(&screen, &format!(" {}–{total} of {total} ", total - 10)),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn full_help_overlay_shows_every_group_and_line() {
+        let mut app = library(3);
+        let mut view = View::default();
+        press(&mut app, KeyCode::Char('?'));
+        let screen = draw_and_feed_back(&mut app, &mut view, 100, 50);
+        let body = help_body(&screen);
+        // The scrollable height is the table's line count, all on screen.
+        assert_eq!(view.help_rows(), keys::help_line_count(), "{screen:#?}");
+        assert_eq!(body.len(), keys::help_line_count(), "{screen:#?}");
+        for group in keys::GROUPS {
+            assert!(body.iter().any(|l| l == group.title), "{}", group.title);
+        }
+        for (line, shown) in keys::help_lines().zip(&body) {
+            match line {
+                HelpLine::Title(title) => assert_eq!(shown, title),
+                HelpLine::Key(entry) => {
+                    assert!(shown.starts_with(entry.keys), "{shown}");
+                    let kept = shown.strip_suffix('…').unwrap_or(shown);
+                    let kept = kept.split_at(keys::keys_width()).1.trim_start();
+                    assert!(entry.action.starts_with(kept), "{shown}");
+                }
+                HelpLine::Blank => assert!(shown.is_empty(), "{shown}"),
+            }
+        }
+        assert!(
+            !screen_contains(&screen, " of "),
+            "no position when all fit"
+        );
+        // Scrolling does nothing when everything fits.
+        press(&mut app, KeyCode::Char('j'));
+        let again = draw_and_feed_back(&mut app, &mut view, 100, 50);
+        assert_eq!(screen, again);
+        // The overlay is as wide as its widest line: nothing is cut on a
+        // wide terminal.
+        let screen = draw_and_feed_back(&mut app, &mut view, 120, 50);
+        let body = help_body(&screen);
+        assert_eq!(body.len(), keys::help_line_count(), "{screen:#?}");
+        assert!(!body.iter().any(|l| l.ends_with('…')), "{screen:#?}");
+        assert!(
+            body.iter().any(|l| l.ends_with("other keys close)")),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn narrow_help_overlay_cuts_lines_instead_of_wrapping() {
+        let mut app = library(3);
+        let mut view = View::default();
+        press(&mut app, KeyCode::Char('?'));
+        let screen = draw_and_feed_back(&mut app, &mut view, 40, 60);
+        let body = help_body(&screen);
+        assert_eq!(body.len(), keys::help_line_count(), "never wrapped");
+        // Borders and padding leave 36 columns.
+        assert!(
+            body.iter().all(|l| Span::raw(l.as_str()).width() <= 36),
+            "{screen:#?}"
+        );
+        let cut = body.iter().filter(|l| l.ends_with('…')).count();
+        assert!(cut > 0, "{screen:#?}");
+        assert!(
+            body[1].starts_with("Enter") && body[1].ends_with('…'),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn help_rows_are_kept_while_the_overlay_is_closed() {
+        let mut app = library(3);
+        let mut view = View::default();
+        press(&mut app, KeyCode::Char('?'));
+        draw_and_feed_back(&mut app, &mut view, 80, 15);
+        assert_eq!(view.help_rows(), 11);
+        press(&mut app, KeyCode::Char('x')); // closes
+        draw_and_feed_back(&mut app, &mut view, 80, 30);
+        assert_eq!(view.help_rows(), 11, "only the overlay sets it");
+        // So the first PgDn after reopening moves by what was shown.
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(*app.mode(), Mode::Help { scroll: 11 });
+    }
+
+    #[test]
+    fn help_overlay_at_tiny_sizes_does_not_panic() {
+        let mut app = library(3);
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::End);
+        for (w, h) in [
+            (0, 0),
+            (1, 1),
+            (2, 3),
+            (10, 5),
+            (80, 4),
+            (5, 80),
+            (300, 2),
+            (64, 6),
+        ] {
+            let mut view = View::default();
+            draw_and_feed_back(&mut app, &mut view, w, h);
+        }
     }
 
     #[test]
@@ -1489,6 +2018,67 @@ mod tests {
             draw(&app, &mut View::default(), w, h);
         }
         Ok(())
+    }
+
+    /// Text and width of `spans`.
+    fn joined(spans: &[Span<'_>]) -> (String, usize) {
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let w = spans.iter().map(Span::width).sum();
+        (text, w)
+    }
+
+    #[test]
+    fn fit_spans_cuts_across_spans_within_the_width() {
+        let spans = || vec![Span::raw("ab"), Span::styled("日本", theme::STRONG)];
+        assert_eq!(joined(&fit_spans(spans(), 6)), ("ab日本".to_owned(), 6));
+        // The cut lands in the second span: a wide char that does not fit
+        // whole is dropped, and the ellipsis takes that span's style.
+        let cut = fit_spans(spans(), 5);
+        assert_eq!(joined(&cut), ("ab日…".to_owned(), 5));
+        assert_eq!(cut[1].style, theme::STRONG);
+        assert_eq!(joined(&fit_spans(spans(), 4)), ("ab…".to_owned(), 3));
+        assert_eq!(joined(&fit_spans(spans(), 3)), ("ab…".to_owned(), 3));
+        // The cut lands in the first span; later spans are dropped.
+        let cut = fit_spans(spans(), 2);
+        assert_eq!(joined(&cut), ("a…".to_owned(), 2));
+        assert_eq!(cut.len(), 1);
+        assert_eq!(joined(&fit_spans(spans(), 1)), ("…".to_owned(), 1));
+        assert_eq!(joined(&fit_spans(spans(), 0)), (String::new(), 0));
+        // Zero-width characters cost nothing and stay with their base.
+        let combining = vec![Span::raw("e\u{301}e\u{301}e\u{301}")];
+        assert_eq!(joined(&fit_spans(combining, 3)).1, 3);
+        let combining = vec![Span::raw("e\u{301}e\u{301}e\u{301}x")];
+        assert_eq!(
+            joined(&fit_spans(combining, 3)),
+            ("e\u{301}e\u{301}…".to_owned(), 3)
+        );
+        for max in 0..8 {
+            assert!(joined(&fit_spans(spans(), max)).1 <= max, "{max}");
+        }
+    }
+
+    #[test]
+    fn help_position_is_dropped_when_it_does_not_fit_the_border() {
+        let mut app = library(3);
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('j'));
+        let total = keys::help_line_count();
+        for w in [6, 10, 14, 20, 24] {
+            let mut view = View::default();
+            let screen = draw_and_feed_back(&mut app, &mut view, w, 15);
+            let top = screen
+                .iter()
+                .find(|l| l.contains('┌'))
+                .cloned()
+                .unwrap_or_default();
+            let position = format!(" of {total} ");
+            let fits = usize::from(w)
+                >= 2 + HELP_TITLE.len() + format!(" 2–12 of {total} ").chars().count();
+            assert_eq!(top.contains(&position), fits, "{w}: {top}");
+            if top.contains(&position) {
+                assert!(top.contains(HELP_TITLE), "{w}: {top}");
+            }
+        }
     }
 
     #[test]
@@ -1695,14 +2285,14 @@ mod tests {
         let (_tmp, mut app) = many(100, 30)?;
         let mut view = View::default();
         draw(&app, &mut view, 100, 20);
-        // Body 12 rows: the table has 12 - 2 borders - 1 header rows.
-        assert_eq!(view.page_size(), 9, "the main pane's page");
+        // Body 15 rows: the table has 15 - 2 borders - 1 header rows.
+        assert_eq!(view.page_size(), 12, "the main pane's page");
         press(&mut app, KeyCode::End);
         draw(&app, &mut view, 100, 20);
         keys(&mut app, &[KeyCode::Tab, KeyCode::End]);
         let screen = draw(&app, &mut view, 100, 20);
         // The sidebar's rows below "Library" and its separator.
-        assert_eq!(view.page_size(), 8, "the sidebar's page");
+        assert_eq!(view.page_size(), 11, "the sidebar's page");
         assert!(screen_contains(&screen, "P29"), "{screen:#?}");
         assert!(!screen_contains(&screen, "P00"), "{screen:#?}");
         assert!(
@@ -1936,7 +2526,8 @@ mod tests {
         }
         keys(&mut app, &[KeyCode::Tab, KeyCode::Tab]); // listed again
         assert_eq!(app.playlists().len(), 3);
-        for h in [11, 10, 9, 30, 11] {
+        // Body heights from 6 down to 1: from a few sidebar rows to none.
+        for h in [11, 10, 9, 8, 7, 6, 30, 11] {
             draw(&app, &mut view, 100, h);
             draw(&app, &mut view, 60, h);
         }
@@ -1945,6 +2536,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         draw(&app, &mut view, 100, 11);
+        draw(&app, &mut view, 100, 8);
         let screen = draw(&app, &mut view, 100, 30);
         assert!(screen_contains(&screen, "P02"), "{screen:#?}");
         Ok(())

@@ -28,18 +28,6 @@ pub enum PlayState {
     Paused,
 }
 
-impl PlayState {
-    /// Label for the now-playing panel.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Stopped => "Stopped",
-            Self::Playing => "Playing",
-            Self::Paused => "Paused",
-        }
-    }
-}
-
 /// Where the play order comes from; compared by the interface to decide
 /// whether an open playlist is the one playing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
