@@ -168,6 +168,7 @@ Tests check that:
   - `ERROR`: red + bold;
   - `PAUSED`: yellow;
   - `PROGRESS`: cyan.
+  - `HEADER`: bold only, no colour, for track table column headers. `SECTION`: bold and underlined, for the help overlay's group titles. *Changed during task 6.2:* `HEADER` was first bold and underlined, the same as `SELECTED_UNFOCUSED`, so in an unfocused track pane the selected first row looked like a second header line. It has no colour because `DarkGray` is invisible on some themes. The overlay has no selection, so its titles keep that style under their own role.
 
   Every `Color::` / `Modifier::` literal in `ui.rs` moves there, and so does every `Stylize` shorthand used for colour or emphasis (`.dark_gray()`, `.bold()`, `.italic()`). The module starts with a `//!` doc. The unfocused border is deliberately not `DarkGray`, which is invisible on some dark themes such as Solarized.
 - **Vertical layout:** `[body Min(3), now-playing Length(3), status Length(1), keys Length(1)]`. That is 5 fixed rows instead of 8.
