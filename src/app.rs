@@ -485,6 +485,19 @@ impl<A: Audio> App<A> {
         self.playlists.get(value.checked_sub(1)?)
     }
 
+    /// The sidebar value of the entry that is the play order (0 for
+    /// "Library"), while a track is loaded. `None` before anything was
+    /// played, and while a deleted playlist plays on (no entry is its order).
+    #[must_use]
+    pub fn sidebar_playing(&self) -> Option<usize> {
+        self.playback.current_track()?;
+        match self.playback.source() {
+            Source::Library => Some(0),
+            Source::Playlist(name) => self.sidebar_value_of(name),
+            Source::Detached => None,
+        }
+    }
+
     /// The sidebar value of playlist `name`, if it is listed.
     fn sidebar_value_of(&self, name: &str) -> Option<usize> {
         self.playlists
