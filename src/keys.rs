@@ -17,10 +17,6 @@
 use std::fmt::Write as _;
 
 /// The hint drawn at the right end of the bar in Normal mode.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "drawn by the key bar (task 5.2)")
-)]
 pub const HELP_HINT: &str = "? help";
 
 /// Widest bar label allowed, in terminal columns.
@@ -300,7 +296,8 @@ pub fn help_line_count() -> usize {
 }
 
 /// Width of the widest `keys` column (ASCII, so bytes are columns).
-fn keys_width() -> usize {
+#[must_use]
+pub fn keys_width() -> usize {
     help_lines()
         .filter_map(|line| match line {
             HelpLine::Key(entry) => Some(entry.keys.len()),
@@ -335,10 +332,7 @@ pub fn help_text() -> String {
 }
 
 /// The labels of `context`'s key bar, in the order they are drawn.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "drawn by the key bar (task 5.2)")
-)]
+#[must_use]
 pub fn bar(context: BarContext) -> Vec<&'static str> {
     GROUPS
         .iter()
