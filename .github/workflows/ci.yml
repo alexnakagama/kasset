@@ -10,9 +10,13 @@ on:
 permissions:
   contents: read
 
+# PR runs are grouped per PR number, never by ref: a pull_request run queued
+# after its PR is merged resolves github.ref to the base branch and would
+# otherwise cancel the master push run. Only PR runs cancel older ones; every
+# push to master is tested to completion.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
