@@ -46,7 +46,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 3. App state and the `v` key (`src/app.rs`, `src/keys.rs`, `src/cli.rs`, `README.md`)
 
-- [ ] 3.1 Add the `Visualizer` state to `App` (D4): `on` (initially `true`), `spectrum`, the fed-back `fits` and `bars`, and a reusable sample buffer.
+- [x] 3.1 Add the `Visualizer` state to `App` (D4): `on` (initially `true`), `spectrum`, the fed-back `fits` and `bars`, and a reusable sample buffer.
   - Add `set_spectrum_layout(fits, bars)`, `visualizer_on()`, `spectrum_levels()` and `visualizer_animating()`.
   - In `tick`, update the spectrum only when `on && fits && bars > 0`. Pass samples only while `PlayState::Playing` and `written` has advanced within `STALE_AFTER` (250 ms); otherwise pass `None`. When the strip is not shown, reset the levels instead.
   - Update the `app.rs` `//!` doc.
@@ -58,9 +58,9 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - `visualizer_animating()` is true while playing and while falling, and false once idle, when off, or when `!fits`;
   - with `fits` false, no spectrum update happens;
   - when `ToneAudio` stops advancing `written` while `Playing`, the levels fall to idle after `STALE_AFTER`.
-- [ ] 3.2 Handle `v` in Normal mode from either pane:
+- [x] 3.2 Handle `v` in Normal mode from either pane:
   - it toggles `on`;
-  - while `!fits`, it notifies as `Level::Info`: "visualizer on: needs a terminal at least 24 rows tall" when turning it on, "visualizer off" when turning it off;
+  - while `!fits`, it notifies as `Level::Info`: "Visualizer on: needs a terminal at least 24 rows tall" when turning it on, "Visualizer off" when turning it off;
   - while the strip is visible, it shows no notice.
 
   Verify with key-sequence tests:
@@ -70,7 +70,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - `v` with `fits` true gives no notice;
   - `/` then `v` adds `v` to the query and leaves `on` unchanged (spec *Not while typing*);
   - `v` in the help overlay and in a prompt keeps that mode's existing behaviour.
-- [ ] 3.3 Add the "Display" group with the `v` entry ("show / hide the visualizer", `bar: &[]`) to `keys::GROUPS`, inserted after "Navigation & search" and before "Help & quit" (D7). Add the same row to the README keys table. Verify:
+- [x] 3.3 Add the "Display" group with the `v` entry ("show / hide the visualizer", `bar: &[]`) to `keys::GROUPS`, inserted after "Navigation & search" and before "Help & quit" (D7). Add the same row to the README keys table. Verify:
   - the existing `keys.rs` tests and the `ui.rs` help-overlay tests pass unchanged; the one at `src/ui.rs:1854` needs "Help & quit" to stay last;
   - every bar is unchanged;
   - a new test shows `help_text()` and `help_lines()` contain `v` and "show / hide the visualizer" (spec *Listed in the help*);

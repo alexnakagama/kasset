@@ -79,6 +79,7 @@ mod tests {
         assert!(help.contains("pause / resume"));
         assert!(help.contains("move focus between the sidebar and the main pane"));
         assert!(help.contains("add the selected / every listed track to a playlist"));
+        assert!(help.contains("show / hide the visualizer"));
         assert!(help.contains("<DIR>/Playlists"));
     }
 

@@ -55,6 +55,10 @@ const NOW_PLAYING_HEIGHT: u16 = 3;
 /// side by side.
 pub const TWO_PANE_MIN_WIDTH: u16 = 70;
 
+/// Shortest terminal, in rows, that shows the spectrum strip (with the
+/// visualizer on). The app also names it in the `v` notice.
+pub const SPECTRUM_MIN_HEIGHT: u16 = 24;
+
 /// Narrowest and widest sidebar in the two-pane layout, borders included.
 const SIDEBAR_WIDTH: (u16, u16) = (22, 32);
 

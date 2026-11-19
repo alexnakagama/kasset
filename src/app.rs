@@ -27,6 +27,16 @@
 //! last page. Any key other than a scroll key closes it and does nothing
 //! else.
 //!
+//! The spectrum visualizer is on at start; `v` (Normal mode, either pane)
+//! turns it off or on, with a status message when the terminal is too short
+//! for the strip, where the change cannot be seen. Whether the strip fits and
+//! how many bars it has are fed back by the event loop
+//! ([`App::set_spectrum_layout`]). [`App::tick`] measures the spectrum only
+//! while the strip is shown, and passes samples only while playing with
+//! audio arriving (the tap's count advanced within [`STALE_AFTER`]), so a
+//! paused, stopped or stalled track lets the bars fall. While the strip is
+//! not shown, no FFT runs and the levels are reset.
+//!
 //! Status messages raised during one key press go through [`App::notify`]:
 //! an error is never hidden by an info message raised after it, and two
 //! messages of the same level are joined.
@@ -43,13 +53,15 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::keys;
 use crate::library::Track;
-use crate::playback::{Edit, Level, Notice, Playback, Source};
+use crate::playback::{Edit, Level, Notice, PlayState, Playback, Source};
 use crate::player::Audio;
 use crate::playlist::{
     AddOutcome, Playlist, PlaylistInfo, PlaylistStore, Resolver, SaveOutcome, StoreError,
     validate_name,
 };
 use crate::text::{is_invisible_format, sanitize};
+use crate::ui::SPECTRUM_MIN_HEIGHT;
+use crate::visualizer::{FFT_SIZE, Spectrum};
 
 /// How long a transient status message stays on screen.
 pub const STATUS_TTL: Duration = Duration::from_secs(5);
@@ -337,7 +349,50 @@ pub struct App<A: Audio> {
     /// `Mode::Help`'s scroll and is its `PageUp`/`PageDown` step. Kept
     /// between openings.
     help_rows: usize,
+    visualizer: Visualizer,
     quit: bool,
+}
+
+/// How long the tap may go without new audio while playing before the
+/// visualizer treats it as stalled and lets the bars fall. The tap fills in
+/// bursts of one device callback, so this leaves room for large buffers.
+const STALE_AFTER: Duration = Duration::from_millis(250);
+
+/// The spectrum visualizer's state. Only [`App::tick`] measures, and only
+/// while the strip is shown, so a hidden strip costs no FFT.
+#[derive(Debug)]
+struct Visualizer {
+    /// Whether the user wants it (`v`); on at start, kept until quit.
+    on: bool,
+    spectrum: Spectrum,
+    /// Whether the last frame was tall enough for the strip (fed back by the
+    /// event loop, recorded even while `on` is false).
+    fits: bool,
+    /// Bars the last frame drew (0 when the strip was not drawn).
+    bars: usize,
+    /// Reused for [`Playback::recent_samples`], so ticks do not allocate.
+    samples: Vec<f32>,
+    /// The tap's last `written` count and when it was first seen, to notice
+    /// a tap that stopped filling while the state is still `Playing`.
+    last_written: Option<(u64, Instant)>,
+}
+
+impl Visualizer {
+    fn new() -> Self {
+        Self {
+            on: true,
+            spectrum: Spectrum::new(),
+            fits: false,
+            bars: 0,
+            samples: Vec::with_capacity(FFT_SIZE),
+            last_written: None,
+        }
+    }
+
+    /// Whether the strip is drawn, so the spectrum must be kept up to date.
+    const fn shown(&self) -> bool {
+        self.on && self.fits && self.bars > 0
+    }
 }
 
 impl<A: Audio> App<A> {
@@ -375,6 +430,7 @@ impl<A: Audio> App<A> {
             pending_fresh: true,
             page_size: 1,
             help_rows: 1,
+            visualizer: Visualizer::new(),
             quit: false,
         };
         app.refresh_playlists(None);
@@ -549,6 +605,51 @@ impl<A: Audio> App<A> {
         }
     }
 
+    /// Records whether the last frame was tall enough for the spectrum strip
+    /// and how many bars it drew (0 if none), like [`App::set_page_size`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "fed by the event loop from task group 4")
+    )]
+    pub const fn set_spectrum_layout(&mut self, fits: bool, bars: usize) {
+        self.visualizer.fits = fits;
+        self.visualizer.bars = bars;
+    }
+
+    /// Whether the visualizer is on (`v`), whether or not the strip fits.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "drawn by the UI from task group 4")
+    )]
+    pub const fn visualizer_on(&self) -> bool {
+        self.visualizer.on
+    }
+
+    /// The spectrum bar levels, lowest band first, each in `0.0..=1.0`. Its
+    /// length is the bar count of the last update and may differ from the
+    /// bars that fit now (right after a resize).
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "drawn by the UI from task group 4")
+    )]
+    pub fn spectrum_levels(&self) -> &[f32] {
+        self.visualizer.spectrum.levels()
+    }
+
+    /// Whether the strip is shown and its bars move: a track is playing or a
+    /// bar is still falling. The event loop redraws faster while it is.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "sets the frame rate from task group 4")
+    )]
+    pub fn visualizer_animating(&self) -> bool {
+        let vis = &self.visualizer;
+        vis.shown() && (self.playback.state() == PlayState::Playing || !vis.spectrum.is_idle())
+    }
+
     /// The largest help scroll: the last line is then at the bottom.
     fn max_help_scroll(&self) -> usize {
         keys::help_line_count().saturating_sub(self.help_rows)
@@ -591,6 +692,49 @@ impl<A: Audio> App<A> {
         if self.status.as_ref().is_some_and(|(_, until)| now >= *until) {
             self.status = None;
         }
+        self.update_visualizer(now);
+    }
+
+    /// Moves the spectrum on to `now`, after playback has been driven. While
+    /// the strip is not shown nothing is measured and the levels are reset,
+    /// so it never comes back showing a stale frame. Samples are passed only
+    /// while playing with fresh audio; otherwise the bars fall.
+    fn update_visualizer(&mut self, now: Instant) {
+        let vis = &mut self.visualizer;
+        if !vis.shown() {
+            vis.spectrum.reset();
+            vis.last_written = None;
+            return;
+        }
+        let playing = self.playback.state() == PlayState::Playing;
+        let recent = if playing {
+            self.playback.recent_samples(&mut vis.samples)
+        } else {
+            None
+        };
+        let fresh = match (recent, vis.last_written) {
+            (None, _) => {
+                // While playing, `None` means nothing is decoded yet (a new
+                // load): start over once audio arrives. While paused or
+                // stopped the record is kept, so on resume the pre-pause
+                // window counts as stale until new audio advances the tap.
+                if playing {
+                    vis.last_written = None;
+                }
+                false
+            }
+            (Some(recent), Some((written, since))) if written == recent.written => {
+                now.saturating_duration_since(since) < STALE_AFTER
+            }
+            (Some(recent), _) => {
+                vis.last_written = Some((recent.written, now));
+                true
+            }
+        };
+        let input = recent
+            .filter(|_| fresh)
+            .map(|recent| (vis.samples.as_slice(), recent.sample_rate));
+        vis.spectrum.update(input, vis.bars, now);
     }
 
     /// Stops audio, before quitting.
@@ -673,6 +817,7 @@ impl<A: Audio> App<A> {
                 let repeat = self.playback.cycle_repeat();
                 self.notify(Notice::info(format!("Repeat {}", repeat.label())));
             }
+            KeyCode::Char('v') => self.toggle_visualizer(),
             KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
             KeyCode::Esc => {
@@ -684,6 +829,20 @@ impl<A: Audio> App<A> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `v`: turns the visualizer off or on. When the terminal is too short
+    /// for the strip the change cannot be seen, so it is announced.
+    fn toggle_visualizer(&mut self) {
+        let vis = &mut self.visualizer;
+        vis.on = !vis.on;
+        if !vis.fits {
+            self.notify(Notice::info(if self.visualizer.on {
+                format!("Visualizer on: needs a terminal at least {SPECTRUM_MIN_HEIGHT} rows tall")
+            } else {
+                "Visualizer off".to_owned()
+            }));
         }
     }
 
@@ -3723,6 +3882,27 @@ mod playlist_tests {
     }
 
     #[test]
+    fn v_in_prompts_keeps_their_meaning() -> Result<()> {
+        let mut m = abcd()?;
+        m.write("Gym", &["A"])?;
+        m.select_playlist("Gym")?;
+        m.shift('D');
+        m.chars("v");
+        assert_eq!(*m.app.mode(), Mode::Normal, "v cancels the delete");
+        assert!(m.file("Gym").exists());
+        assert!(m.app.visualizer_on());
+
+        m.shift('R');
+        m.chars("v");
+        let Mode::NameInput(input) = m.app.mode() else {
+            bail!("not renaming");
+        };
+        assert_eq!(input.text(), "Gymv", "v is typed into the name");
+        assert!(m.app.visualizer_on());
+        Ok(())
+    }
+
+    #[test]
     fn confirm_delete_removes_only_the_playlist_file() -> Result<()> {
         let mut m = abcd()?;
         let songs: Vec<PathBuf> = m
@@ -4419,6 +4599,338 @@ mod playlist_tests {
         press(a, &[ch('/')]);
         a.set_help_rows(1);
         assert_eq!(*a.mode(), Mode::Search);
+        Ok(())
+    }
+}
+
+/// The visualizer state, `v`, and how the bars follow playback.
+#[cfg(test)]
+mod visualizer_tests {
+    use super::*;
+    use crate::test_support::{ToneAudio, no_store, track};
+    use crate::visualizer::FALL_TIME;
+
+    /// About one animation frame.
+    const STEP: Duration = Duration::from_millis(33);
+    const BARS: usize = 40;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    /// Two tracks over a 1 kHz tone at half scale (about −6 dB), before the
+    /// first frame: the strip's size is not known yet.
+    fn tone_app() -> App<ToneAudio> {
+        App::new(
+            vec![track("A", "Band", "LP"), track("B", "Band", "LP")],
+            ToneAudio::new(1_000.0, 0.5),
+            no_store(),
+            "/music".to_owned(),
+            None,
+        )
+    }
+
+    /// As [`tone_app`], with the strip drawn with [`BARS`] bars.
+    fn shown() -> App<ToneAudio> {
+        let mut a = tone_app();
+        a.set_spectrum_layout(true, BARS);
+        a
+    }
+
+    /// Ticks `frames` times, [`STEP`] apart, starting at `from`; returns the
+    /// time of the last tick.
+    fn run(a: &mut App<ToneAudio>, from: Instant, frames: u32) -> Instant {
+        let mut now = from;
+        for i in 0..frames {
+            now = from + STEP * i;
+            a.tick(now);
+        }
+        now
+    }
+
+    fn peak(a: &App<ToneAudio>) -> f32 {
+        a.spectrum_levels().iter().copied().fold(0.0, f32::max)
+    }
+
+    fn idle(a: &App<ToneAudio>) -> bool {
+        a.spectrum_levels().iter().all(|&level| level == 0.0)
+    }
+
+    /// The status text after a tick at `now`.
+    fn status(a: &mut App<ToneAudio>, now: Instant) -> Option<String> {
+        a.tick(now);
+        a.status(now).map(|n| n.text.clone())
+    }
+
+    /// Plays the first track and ticks until the bars are up; returns the
+    /// time of the last tick.
+    fn playing(a: &mut App<ToneAudio>, t0: Instant) -> Instant {
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.playback().state(), PlayState::Playing);
+        // The tone fills the tap over a few ticks.
+        run(a, t0, 4)
+    }
+
+    #[test]
+    fn on_at_start_and_not_animating_before_the_first_frame() {
+        let a = tone_app();
+        assert!(a.visualizer_on());
+        assert!(!a.visualizer_animating());
+        assert_eq!(a.spectrum_levels(), [] as [f32; 0]);
+    }
+
+    #[test]
+    fn bars_rise_while_playing() {
+        let mut a = shown();
+        playing(&mut a, Instant::now());
+        assert_eq!(a.spectrum_levels().len(), BARS);
+        assert!(peak(&a) > 0.5, "{:?}", a.spectrum_levels());
+        assert!(a.visualizer_animating());
+    }
+
+    #[test]
+    fn pause_makes_the_bars_fall_to_idle_in_about_a_second() {
+        let mut a = shown();
+        let t = playing(&mut a, Instant::now());
+        let top = peak(&a);
+        assert!(top > 0.5);
+
+        a.handle_key(ch(' '));
+        assert_eq!(a.playback().state(), PlayState::Paused);
+        a.tick(t + FALL_TIME / 2);
+        assert!((peak(&a) - (top - 0.5)).abs() < 0.01, "{}", peak(&a));
+        assert!(a.visualizer_animating(), "still falling");
+        a.tick(t + FALL_TIME);
+        assert!(idle(&a), "{:?}", a.spectrum_levels());
+        assert!(!a.visualizer_animating(), "paused and idle");
+        a.tick(t + FALL_TIME * 3);
+        assert!(idle(&a), "stays at zero while paused");
+
+        a.handle_key(ch(' '));
+        run(&mut a, t + FALL_TIME * 4, 3);
+        assert!(peak(&a) > 0.5, "back when resumed");
+    }
+
+    #[test]
+    fn stop_makes_the_bars_fall_too() {
+        let mut a = shown();
+        let t = playing(&mut a, Instant::now());
+        a.handle_key(ch('s'));
+        a.tick(t + FALL_TIME);
+        assert!(idle(&a));
+        assert!(!a.visualizer_animating());
+    }
+
+    #[test]
+    fn nothing_played_yet_shows_no_bars() {
+        let mut a = shown();
+        run(&mut a, Instant::now(), 10);
+        assert_eq!(a.spectrum_levels().len(), BARS);
+        assert!(idle(&a));
+        assert!(!a.visualizer_animating());
+    }
+
+    #[test]
+    fn a_new_track_drops_the_old_tracks_audio() {
+        let mut a = shown();
+        let t = playing(&mut a, Instant::now());
+        let top = peak(&a);
+        a.handle_key(ch('n'));
+        assert_eq!(a.playback().current(), Some(1));
+        // The new track's tap holds too little audio for a frame yet: the
+        // old bars fall instead of being measured again.
+        // Re-measuring the old window would put the bars straight back at
+        // `top`; instead they fall by one step. (`ToneAudio`, like `Player`,
+        // starts each load with an empty tap.)
+        a.tick(t + STEP);
+        assert!(peak(&a) < top - 0.02, "{} vs {top}", peak(&a));
+    }
+
+    #[test]
+    fn resuming_does_not_show_the_window_from_before_the_pause() {
+        let mut a = shown();
+        let t = playing(&mut a, Instant::now());
+        a.handle_key(ch(' '));
+        a.tick(t + FALL_TIME);
+        assert!(idle(&a));
+
+        // Resumed, but no new audio has reached the tap yet.
+        a.playback_mut().audio_mut().advancing = false;
+        a.handle_key(ch(' '));
+        assert_eq!(a.playback().state(), PlayState::Playing);
+        run(&mut a, t + FALL_TIME * 2, 3);
+        assert!(idle(&a), "old window shown again: {:?}", a.spectrum_levels());
+
+        a.playback_mut().audio_mut().advancing = true;
+        run(&mut a, t + FALL_TIME * 3, 2);
+        assert!(peak(&a) > 0.5, "new audio shows");
+    }
+
+    #[test]
+    fn turned_off_before_playing_measures_nothing() {
+        let mut a = shown();
+        a.handle_key(ch('v'));
+        playing(&mut a, Instant::now());
+        assert_eq!(a.spectrum_levels(), [] as [f32; 0], "no update ever ran");
+        assert!(!a.visualizer_animating());
+    }
+
+    #[test]
+    fn no_bars_means_not_animating() {
+        let mut a = tone_app();
+        a.set_spectrum_layout(true, 0);
+        playing(&mut a, Instant::now());
+        assert_eq!(a.spectrum_levels(), [] as [f32; 0]);
+        assert!(!a.visualizer_animating());
+    }
+
+    #[test]
+    fn a_stalled_tap_lets_the_bars_fall_while_playing() {
+        let mut a = shown();
+        let t = playing(&mut a, Instant::now());
+        let top = peak(&a);
+        a.playback_mut().audio_mut().advancing = false;
+
+        // `written` last changed at `t`: until STALE_AFTER after that, the
+        // same window is still measured and the bars hold.
+        a.tick(t + STEP);
+        a.tick(t + STALE_AFTER.saturating_sub(Duration::from_millis(1)));
+        assert!((peak(&a) - top).abs() < 0.01, "held: {}", peak(&a));
+
+        // From then on it is stale, and the bars fall although still Playing.
+        let stale = t + STALE_AFTER;
+        a.tick(stale);
+        a.tick(stale + FALL_TIME / 2);
+        assert!(peak(&a) < top - 0.4, "falling: {}", peak(&a));
+        a.tick(stale + FALL_TIME);
+        assert!(idle(&a), "{:?}", a.spectrum_levels());
+        assert_eq!(a.playback().state(), PlayState::Playing);
+        assert!(a.visualizer_animating(), "playing keeps the frame rate up");
+
+        a.playback_mut().audio_mut().advancing = true;
+        run(&mut a, stale + FALL_TIME * 2, 2);
+        assert!(peak(&a) > 0.5, "back when audio flows again");
+    }
+
+    #[test]
+    fn nothing_is_measured_while_the_strip_does_not_fit() {
+        let mut a = tone_app();
+        a.set_spectrum_layout(false, 0);
+        let t = playing(&mut a, Instant::now());
+        assert_eq!(a.spectrum_levels(), [] as [f32; 0], "no update ever ran");
+        assert!(!a.visualizer_animating());
+
+        // Bars fed back without room (inconsistent, but harmless).
+        a.set_spectrum_layout(false, BARS);
+        run(&mut a, t, 3);
+        assert_eq!(a.spectrum_levels(), [] as [f32; 0]);
+        assert!(!a.visualizer_animating());
+    }
+
+    #[test]
+    fn hiding_the_strip_resets_the_bars() {
+        let mut a = shown();
+        let t = playing(&mut a, Instant::now());
+        assert!(peak(&a) > 0.5);
+
+        a.set_spectrum_layout(false, 0);
+        a.tick(t + STEP);
+        assert!(idle(&a), "too short: reset at once, no fall");
+        assert!(!a.visualizer_animating());
+
+        a.set_spectrum_layout(true, BARS);
+        a.handle_key(ch('v'));
+        assert!(!a.visualizer_animating(), "off while playing");
+        a.tick(t + STEP * 2);
+        assert!(idle(&a));
+    }
+
+    #[test]
+    fn v_toggles_without_a_notice_while_the_strip_is_visible() {
+        let mut a = shown();
+        let now = Instant::now();
+        a.handle_key(ch('v'));
+        assert!(!a.visualizer_on());
+        assert_eq!(status(&mut a, now), None);
+        a.handle_key(ch('v'));
+        assert!(a.visualizer_on());
+        assert_eq!(status(&mut a, now), None);
+    }
+
+    #[test]
+    fn v_works_from_the_sidebar_too() {
+        let mut a = shown();
+        a.handle_key(key(KeyCode::Tab));
+        assert_eq!(a.focus(), Focus::Sidebar);
+        a.handle_key(ch('v'));
+        assert!(!a.visualizer_on());
+    }
+
+    #[test]
+    fn v_announces_the_change_while_the_terminal_is_too_short() {
+        let mut a = tone_app();
+        a.set_spectrum_layout(false, 0);
+        let now = Instant::now();
+        a.handle_key(ch('v'));
+        assert!(!a.visualizer_on());
+        assert_eq!(status(&mut a, now).as_deref(), Some("Visualizer off"));
+
+        a.handle_key(ch('v'));
+        assert!(a.visualizer_on(), "on, waiting for room");
+        assert_eq!(
+            status(&mut a, now).as_deref(),
+            Some("Visualizer on: needs a terminal at least 24 rows tall")
+        );
+
+        // The strip shows once the terminal is tall enough.
+        a.set_spectrum_layout(true, BARS);
+        assert!(a.visualizer_on());
+    }
+
+    #[test]
+    fn v_with_ctrl_or_alt_does_nothing() {
+        let mut a = shown();
+        a.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        a.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(a.visualizer_on());
+    }
+
+    #[test]
+    fn v_is_typed_into_a_search() {
+        let mut a = shown();
+        a.handle_key(ch('/'));
+        a.handle_key(ch('v'));
+        assert_eq!(a.query(), "v");
+        assert!(a.visualizer_on());
+    }
+
+    #[test]
+    fn v_closes_the_help_overlay_and_does_nothing_else() {
+        let mut a = shown();
+        a.handle_key(ch('?'));
+        a.handle_key(ch('v'));
+        assert_eq!(*a.mode(), Mode::Normal);
+        assert!(a.visualizer_on());
+    }
+
+    #[test]
+    fn v_in_the_picker_and_name_prompt_keeps_their_meaning() -> anyhow::Result<()> {
+        let mut a = shown();
+        a.handle_key(ch('a'));
+        assert!(matches!(a.mode(), Mode::Picker(_)));
+        a.handle_key(ch('v'));
+        assert!(matches!(a.mode(), Mode::Picker(_)), "not a picker key");
+        a.handle_key(key(KeyCode::Enter));
+        a.handle_key(ch('v'));
+        let Mode::NameInput(input) = a.mode() else {
+            anyhow::bail!("not naming a playlist: {:?}", a.mode());
+        };
+        assert_eq!(input.text(), "v");
+        assert!(a.visualizer_on());
         Ok(())
     }
 }
