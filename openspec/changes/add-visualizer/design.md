@@ -33,7 +33,7 @@ The parts of the current code that shape the approach:
 - the sample rate they were decoded at;
 - `written: u64`, the total number of samples ever flushed into it.
 
-`FFT_SIZE` is defined once, as `pub const` in `visualizer.rs`, and `player.rs` imports it. `TapBuffer` derives `Debug` and `Default`, so `SourceFlags` keeps both derives.
+`FFT_SIZE` is defined once, as `pub const` in `visualizer.rs`, and `player.rs` imports it. `TapBuffer` derives `Debug` and implements `Default` by hand. That `Default` preallocates the `FFT_SIZE` ring, so the audio thread never allocates. A derived `Default` would leave an empty `Vec` that grows on the audio thread. `SourceFlags` keeps both derives.
 
 **Mixing to mono.** `Guarded` caches `channels` and `sample_rate`, which it already stores, and tracks the span itself. In rodio 0.23, `current_span_len()` returns the **total** size of the current span, not the samples left (rodio `source/mod.rs:181`). The Symphonia decoder reports its current packet buffer's length, and replaces that buffer only inside `next()` (`decoder/symphonia.rs:163`). So:
 - `Guarded` keeps `span_left: usize`. It calls `inner.next()` first. If `span_left == 0` and no frame is half-built (`frame_count == 0`), it then reads `current_span_len()`, `channels()` and `sample_rate()`. It sets `span_left` to the reported length, and counts the sample just read in the new format. Reading after `next()` sees the new buffer, not the old one.
@@ -43,7 +43,7 @@ The parts of the current code that shape the approach:
 The per-sample path stays an add and two counters.
 - Each sample (`rodio::Sample`) is added to a running frame sum.
 - When a frame has `channels` samples, their mean is pushed as `f32` onto a local batch: a `Vec<f32>` with capacity 512, allocated once in `Guarded::new`.
-- If the channel count changes, the partial frame is discarded.
+- The format is only re-read on a frame boundary, so no frame is ever half-built when the channel count changes. Frames stay aligned by `Guarded`'s own count, even if a misbehaving source ends a span mid-frame. In that case the next span's format is read a few samples late, and its `span_left` counts the samples used to finish the old frame. The following format change is therefore seen a few samples late, mixed in the old layout for those samples. rodio requires spans to be whole frames, so only a malformed source hits this, and the cost is a slightly wrong spectrum frame.
 - If the sample rate changes, the pending batch is discarded, and the next flush clears the ring before appending. Samples at two different rates are never mixed in one window.
 
 **Handing over.** When the batch is full, `Guarded` calls `tap.try_lock()`:

@@ -97,6 +97,104 @@ impl crate::player::Audio for SilentAudio {
     }
 }
 
+/// An audio output that behaves like [`SilentAudio`] and, while a track is
+/// loaded, reports a sine wave of `frequency` Hz and `amplitude` (1.0 is full
+/// scale) as its recent samples. Each call to `recent_samples` while the
+/// track plays advances `written` by [`ToneAudio::STEP`] samples, unless
+/// `advancing` is false (a stalled decoder or device).
+#[derive(Debug)]
+pub struct ToneAudio {
+    pub silent: SilentAudio,
+    pub frequency: f32,
+    pub amplitude: f32,
+    pub sample_rate: u32,
+    pub advancing: bool,
+    written: std::cell::Cell<u64>,
+}
+
+impl ToneAudio {
+    /// Samples `written` advances by per call while playing.
+    pub const STEP: u64 = 1024;
+
+    /// A tone at `frequency` Hz and `amplitude`, sampled at 44.1 kHz.
+    pub fn new(frequency: f32, amplitude: f32) -> Self {
+        Self {
+            silent: SilentAudio::default(),
+            frequency,
+            amplitude,
+            sample_rate: 44_100,
+            advancing: true,
+            written: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl crate::player::Audio for ToneAudio {
+    fn load(
+        &mut self,
+        path: &std::path::Path,
+        start: std::time::Duration,
+        paused: bool,
+    ) -> anyhow::Result<()> {
+        self.silent.load(path, start, paused)?;
+        // A new load starts with an empty tap.
+        self.written.set(0);
+        Ok(())
+    }
+    fn set_paused(&mut self, paused: bool) {
+        self.silent.set_paused(paused);
+    }
+    fn stop(&mut self) {
+        self.silent.stop();
+        self.written.set(0);
+    }
+    fn set_volume(&mut self, volume: crate::player::Volume) {
+        self.silent.set_volume(volume);
+    }
+    fn position(&self) -> std::time::Duration {
+        self.silent.position()
+    }
+    fn duration(&self) -> Option<std::time::Duration> {
+        self.silent.duration()
+    }
+    fn status(&self) -> crate::player::Status {
+        self.silent.status()
+    }
+    fn take_device_error(&mut self) -> Option<String> {
+        self.silent.take_device_error()
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sample indices and rates in tests are far below 2^24"
+    )]
+    fn recent_samples(&self, out: &mut Vec<f32>) -> Option<crate::player::Recent> {
+        out.clear();
+        if !self.silent.loaded {
+            return None;
+        }
+        let playing = !self.silent.paused && !self.silent.ended;
+        if playing && self.advancing {
+            self.written.set(self.written.get() + Self::STEP);
+        }
+        let written = self.written.get();
+        if written == 0 {
+            return None;
+        }
+        let len = written.min(crate::visualizer::FFT_SIZE as u64);
+        let first = written - len;
+        let rate = self.sample_rate as f32;
+        out.extend((first..written).map(|i| {
+            // Reduce the phase per sample so it stays precise as `i` grows.
+            let cycles = (i as f32 * self.frequency / rate).fract();
+            self.amplitude * (std::f32::consts::TAU * cycles).sin()
+        }));
+        Some(crate::player::Recent {
+            sample_rate: self.sample_rate,
+            written,
+        })
+    }
+}
+
 /// A playlist store over a library root that does not exist: listing finds
 /// nothing and every write fails. For tests that do not involve playlists.
 pub fn no_store() -> Box<dyn crate::playlist::PlaylistStore> {

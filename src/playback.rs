@@ -1,11 +1,13 @@
 //! Playback control: ties the play order ([`Queue`]) to an audio output
 //! ([`Audio`]) and implements the transport commands, automatic advance and
-//! skipping tracks that cannot be played.
+//! skipping tracks that cannot be played. It also passes the newest decoded
+//! samples through for the visualizer ([`Playback::recent_samples`]), so
+//! nothing above it reaches the audio output directly.
 
 use std::time::Duration;
 
 use crate::library::Track;
-use crate::player::{Audio, SEEK_STEP, SeekFailed, Status, Volume, seek_target};
+use crate::player::{Audio, Recent, SEEK_STEP, SeekFailed, Status, Volume, seek_target};
 use crate::queue::{Advance, Queue, Repeat};
 use crate::text::{display_path, sanitize};
 
@@ -184,6 +186,16 @@ impl<A: Audio> Playback<A> {
         }
         let pos = self.audio.position();
         self.duration().map_or(pos, |d| pos.min(d))
+    }
+
+    /// The newest decoded mono samples of the loaded track, for the
+    /// visualizer; see [`Audio::recent_samples`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the visualizer from task group 3")
+    )]
+    pub fn recent_samples(&self, out: &mut Vec<f32>) -> Option<Recent> {
+        self.audio.recent_samples(out)
     }
 
     /// Length of the current track: from the decoder while it is loaded,
@@ -1515,5 +1527,39 @@ mod tests {
         assert_eq!(p.source(), &Source::Library);
         end_track(&mut p);
         assert_eq!(p.current(), Some(1));
+    }
+
+    #[test]
+    fn recent_samples_pass_the_tone_through_while_playing() {
+        use crate::test_support::{ToneAudio, track};
+        use crate::visualizer::FFT_SIZE;
+        let tracks = vec![track("a", "x", "y"), track("b", "x", "y")];
+        let mut p = Playback::new(tracks, ToneAudio::new(1_000.0, 0.5));
+        let mut out = vec![1.0; 8];
+        assert_eq!(p.recent_samples(&mut out), None, "nothing played yet");
+        assert_eq!(out, Vec::<f32>::new());
+
+        p.play(0);
+        assert_eq!(p.state(), PlayState::Playing);
+        let _first = p.recent_samples(&mut out);
+        let recent = p.recent_samples(&mut out);
+        assert_eq!(
+            recent,
+            Some(Recent {
+                sample_rate: 44_100,
+                written: 2 * ToneAudio::STEP
+            })
+        );
+        assert_eq!(out.len(), FFT_SIZE);
+        let peak = out.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+        assert!((0.45..=0.5).contains(&peak), "peak {peak}");
+
+        p.toggle_pause();
+        let paused = p.recent_samples(&mut out).map(|r| r.written);
+        assert_eq!(paused, Some(2 * ToneAudio::STEP), "no new audio while paused");
+
+        p.stop();
+        assert_eq!(p.recent_samples(&mut out), None);
+        assert_eq!(out, Vec::<f32>::new());
     }
 }

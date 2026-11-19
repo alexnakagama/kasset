@@ -26,9 +26,9 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 2. Audio tap (`src/player.rs`, `src/playback.rs`, `src/test_support.rs`)
 
-- [ ] 2.1 Add `TapBuffer` (a ring of the newest `FFT_SIZE` mono samples, the sample rate, and `written: u64`, deriving `Debug` and `Default`) as `tap: Mutex<TapBuffer>` in `SourceFlags` (D1). In `Guarded`:
+- [x] 2.1 Add `TapBuffer` (a ring of the newest `FFT_SIZE` mono samples, the sample rate, and `written: u64`, deriving `Debug`, with a manual `Default` that preallocates the ring so the audio thread never allocates) as `tap: Mutex<TapBuffer>` in `SourceFlags` (D1). In `Guarded`:
   - mix each frame of `rodio::Sample`s to mono `f32` and fill a 512-sample batch allocated in `Guarded::new`;
-  - track the span with `span_left`. After `inner.next()`, when `span_left == 0` and no frame is half-built, read `current_span_len()`, `channels()` and `sample_rate()`. That function returns the total span size, not the remainder. Treat `None` or `Some(0)` as 4096 samples. On a channel-count change, discard the partial frame; on a rate change, discard the batch and clear the ring (D1);
+  - track the span with `span_left`. After `inner.next()`, when `span_left == 0` and no frame is half-built, read `current_span_len()`, `channels()` and `sample_rate()`. That function returns the total span size, not the remainder. Treat `None` or `Some(0)` as 4096 samples. On a rate change, discard the batch and clear the ring (D1). Because the format is re-read only on a frame boundary, a channel-count change never meets a half-built frame;
   - flush the batch with `try_lock`: drop it on `WouldBlock`, recover from poison with `into_inner`, and add the flushed length to `written`.
 
    Update the `player.rs` `//!` doc with the tap's invariants: it never blocks or allocates on the audio thread, and it is taken before the volume. Verify with unit tests driving `Guarded` over a rodio `SamplesBuffer`, with no device:
@@ -39,7 +39,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - a two-span source whose channel count changes is mixed correctly per span, and a rate change clears the ring;
   - a span whose length is not a multiple of the old frame size, and a source reporting `current_span_len() == Some(0)` or `None`, keep frames aligned without re-reading on every sample;
   - `written` grows by each flushed batch.
-- [ ] 2.2 Add `Recent { sample_rate: u32, written: u64 }` and `Audio::recent_samples(&self, out: &mut Vec<f32>) -> Option<Recent>` with a default returning `None` (D2). It clears `out` and appends the whole ring. Implement it for `Player` by copying the loaded track's tap, converting the rate with `.get()`. Add a `Playback::recent_samples` pass-through. Add `ToneAudio` to `src/test_support.rs`: it behaves like `SilentAudio`, returns a sine of configurable frequency and amplitude, and can be told to stop advancing `written`. Verify:
+- [x] 2.2 Add `Recent { sample_rate: u32, written: u64 }` and `Audio::recent_samples(&self, out: &mut Vec<f32>) -> Option<Recent>` with a default returning `None` (D2). It clears `out` and appends the whole ring. Implement it for `Player` by copying the loaded track's tap, converting the rate with `.get()`. Add a `Playback::recent_samples` pass-through. Add `ToneAudio` to `src/test_support.rs`: it behaves like `SilentAudio`, returns a sine of configurable frequency and amplitude, and can be told to stop advancing `written`. Verify:
   - every existing test passes unchanged, since `SilentAudio` and `FakeAudio` are not edited;
   - a `Player`-level test (or a `Guarded` + `SourceFlags` test, if a device is unavailable) shows a new `load` starts with an empty tap (spec *Track change*);
   - `Playback::recent_samples` returns `ToneAudio`'s samples while playing.
