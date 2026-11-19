@@ -5,13 +5,6 @@ mod bounded_read;
 mod cli;
 mod keys;
 mod library;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "loaded and shown by the app and UI from task groups 3 and 4"
-    )
-)]
 mod lyrics;
 mod panic_guard;
 mod playback;

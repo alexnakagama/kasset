@@ -19,6 +19,20 @@
 //! unfocused border. It draws at most as many bars as fit, so levels
 //! measured for an older width never reach outside it. Whether the strip
 //! fits and how many bars it has are fed back to the app through [`View`].
+//! With the lyrics pane on and the terminal at least [`LYRICS_MIN_WIDTH`]
+//! columns wide, a third column, the lyrics pane, is drawn to the right of
+//! the main pane (about a third of the width, [`LYRICS_WIDTH`] columns at
+//! the least and the most), above the strip. The sidebar keeps the width it
+//! has in the two-pane layout and the main pane takes what is left. The
+//! lyrics pane never has focus, so it always has the unfocused border.
+//! Whether it fits is fed back to the app through [`View`], whether or not
+//! it is on. It shows "Nothing playing" before any track, nothing until the
+//! current track's lyrics are looked up ([`App::lyrics_ready`]), then "No
+//! lyrics" or the lyrics, wrapped by display width ([`lyric_rows`], kept
+//! in [`View`] until the lyrics or the pane's width change): timed
+//! lyrics with the current line in the playing style near the middle and
+//! earlier lines dimmed, plain lyrics scrolled in proportion to the
+//! position in the track.
 //! Popups are centred over the whole body, panes and strip together.
 //!
 //! The key bar and the help overlay are drawn from [`keys`], the single key
@@ -36,6 +50,7 @@
 //! sequence can reach the screen. Text that can be long (names, the library
 //! root, the search query) is elided to its area, never wrapped into others.
 
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -51,6 +66,7 @@ use crate::app::{
     App, Focus, ListView, MainView, Mode, NameInput, NamePurpose, Picker, View as Screen,
 };
 use crate::keys::{self, BarContext, HelpLine};
+use crate::lyrics::Lyrics;
 use crate::playback::{Level, PlayState, clock};
 use crate::player::Audio;
 use crate::text::sanitize;
@@ -66,6 +82,18 @@ pub const TWO_PANE_MIN_WIDTH: u16 = 70;
 /// Narrowest terminal, in columns, that shows the lyrics pane (with the
 /// lyrics pane on). The app also names it in the `l` notice.
 pub const LYRICS_MIN_WIDTH: u16 = 100;
+
+/// Narrowest and widest lyrics pane, borders included.
+const LYRICS_WIDTH: (u16, u16) = (28, 48);
+
+/// The lyrics pane's title.
+const LYRICS_TITLE: &str = " Lyrics ";
+
+/// The lyrics pane's message before any track was played.
+const NOTHING_PLAYING: &str = "Nothing playing";
+
+/// The lyrics pane's message for a track without lyrics.
+const NO_LYRICS: &str = "No lyrics";
 
 /// Shortest terminal, in rows, that shows the spectrum strip (with the
 /// visualizer on). The app also names it in the `v` notice.
@@ -229,6 +257,11 @@ pub struct View {
     /// Bars the spectrum strip had room for in the last frame (0 when it was
     /// not drawn).
     spectrum_bars: usize,
+    /// Whether the last frame was wide enough for the lyrics pane, whether
+    /// or not the pane is on.
+    lyrics_fits: bool,
+    /// The lyrics pane's rows as last wrapped.
+    lyrics_rows: Option<WrappedLyrics>,
 }
 
 impl View {
@@ -263,6 +296,12 @@ impl View {
     #[must_use]
     pub const fn spectrum_bars(&self) -> usize {
         self.spectrum_bars
+    }
+
+    /// Whether the last frame was wide enough for the lyrics pane.
+    #[must_use]
+    pub const fn lyrics_fits(&self) -> bool {
+        self.lyrics_fits
     }
 }
 
@@ -357,16 +396,30 @@ fn sidebar_width(body_width: u16) -> u16 {
     (body_width / 4).clamp(SIDEBAR_WIDTH.0, SIDEBAR_WIDTH.1)
 }
 
-/// Draws the sidebar and the main pane side by side, or only the focused
-/// one on a narrow terminal, and records the focused pane's page size.
+/// The lyrics pane's width for a body `body_width` columns wide: about a
+/// third of it, within [`LYRICS_WIDTH`].
+fn lyrics_width(body_width: u16) -> u16 {
+    (body_width / 3).clamp(LYRICS_WIDTH.0, LYRICS_WIDTH.1)
+}
+
+/// Draws the sidebar and the main pane side by side, with the lyrics pane
+/// to their right when it is on and fits, or only the focused pane on a
+/// narrow terminal, and records the focused pane's page size and whether
+/// the lyrics pane fits.
 fn render_body<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area: Rect) {
     let focus = app.focus();
+    view.lyrics_fits = area.width >= LYRICS_MIN_WIDTH;
     view.page_size = if area.width >= TWO_PANE_MIN_WIDTH {
-        let [side, main] = Layout::horizontal([
+        let lyrics = app.lyrics_on() && view.lyrics_fits;
+        let [side, main, lyrics_area] = Layout::horizontal([
             Constraint::Length(sidebar_width(area.width)),
             Constraint::Fill(1),
+            Constraint::Length(if lyrics { lyrics_width(area.width) } else { 0 }),
         ])
         .areas(area);
+        if lyrics {
+            render_lyrics(frame, app, &mut view.lyrics_rows, lyrics_area);
+        }
         let side_rows = render_sidebar(frame, app, &mut view.sidebar_offset, side, focus);
         let main_rows = render_main(frame, app, &mut view.main_offset, main, focus);
         match focus {
@@ -379,6 +432,242 @@ fn render_body<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area:
             Focus::Main => render_main(frame, app, &mut view.main_offset, area, focus),
         }
     };
+}
+
+/// How a row of the lyrics pane is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LyricRole {
+    /// A timed line before the current one: dimmed.
+    Past,
+    /// The current timed line: the playing style.
+    Current,
+    /// A timed line after the current one (or any, before the first line).
+    Future,
+    /// A line of untimed lyrics.
+    Plain,
+}
+
+impl LyricRole {
+    const fn style(self) -> Style {
+        match self {
+            Self::Past => theme::DIM,
+            Self::Current => theme::PLAYING,
+            Self::Future | Self::Plain => Style::new(),
+        }
+    }
+}
+
+/// One row of the lyrics pane: a lyric line, or part of a wrapped one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LyricRow {
+    /// Index of the lyric line the row belongs to.
+    line: usize,
+    text: String,
+}
+
+/// The lyrics' rows as last wrapped, kept while neither the lyrics (their
+/// [`App::lyrics_generation`]) nor the pane's width change, so a frame
+/// only picks the rows it shows.
+#[derive(Debug)]
+struct WrappedLyrics {
+    generation: u64,
+    columns: usize,
+    rows: Vec<LyricRow>,
+}
+
+/// Width of `text` as drawn: the sum of its grapheme clusters' widths, as
+/// the screen buffer counts them.
+fn drawn_width(text: &str) -> usize {
+    Span::raw(text)
+        .styled_graphemes(Style::new())
+        .map(|g| width(g.symbol))
+        .sum()
+}
+
+/// `text` wrapped into rows of at most `columns` display columns (at least
+/// 1): at spaces where possible, with a word wider than a row broken
+/// between grapheme clusters. A cluster wider than a whole row gets a row
+/// of its own. Blank text is one empty row.
+fn wrap(text: &str, columns: usize) -> Vec<String> {
+    let columns = columns.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let word_width = drawn_width(word);
+        let gap = usize::from(!row.is_empty());
+        if used + gap + word_width <= columns {
+            if gap == 1 {
+                row.push(' ');
+            }
+            row.push_str(word);
+            used += gap + word_width;
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        if word_width <= columns {
+            row.push_str(word);
+            used = word_width;
+            continue;
+        }
+        let span = Span::raw(word);
+        for grapheme in span.styled_graphemes(Style::new()) {
+            let grapheme_width = width(grapheme.symbol);
+            if used + grapheme_width > columns && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push_str(grapheme.symbol);
+            used += grapheme_width;
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// The rows of `lyrics` wrapped to `columns` display columns, in order,
+/// each with the index of its line.
+fn lyric_rows(lyrics: &Lyrics, columns: usize) -> Vec<LyricRow> {
+    let texts: Vec<&str> = match lyrics {
+        Lyrics::Synced(lines) => lines.iter().map(|l| l.text.as_str()).collect(),
+        Lyrics::Plain(lines) => lines.iter().map(String::as_str).collect(),
+    };
+    texts
+        .into_iter()
+        .enumerate()
+        .flat_map(|(line, text)| {
+            wrap(text, columns)
+                .into_iter()
+                .map(move |text| LyricRow { line, text })
+        })
+        .collect()
+}
+
+/// The rows (of `rows`, in line order) that line `current` takes.
+fn current_rows(rows: &[LyricRow], current: Option<usize>) -> Option<Range<usize>> {
+    let current = current?;
+    let start = rows.partition_point(|row| row.line < current);
+    let end = rows.partition_point(|row| row.line <= current);
+    (start < end).then_some(start..end)
+}
+
+/// How a row of line `line` is drawn while line `current` is current.
+fn row_role(lyrics: &Lyrics, line: usize, current: Option<usize>) -> LyricRole {
+    match (lyrics, current) {
+        (Lyrics::Plain(_), _) => LyricRole::Plain,
+        (Lyrics::Synced(_), Some(c)) if line < c => LyricRole::Past,
+        (Lyrics::Synced(_), Some(c)) if line == c => LyricRole::Current,
+        (Lyrics::Synced(_), _) => LyricRole::Future,
+    }
+}
+
+/// First row shown of `total` timed-lyric rows in a pane `height` rows
+/// tall: the current line's rows in the middle where possible (its first
+/// row at the top when it is taller than the pane), the top when there is
+/// no current line.
+fn synced_top(current: Option<&Range<usize>>, total: usize, height: usize) -> usize {
+    current
+        .map_or(0, |rows| {
+            rows.start
+                .saturating_sub(height.saturating_sub(rows.len()) / 2)
+        })
+        .min(total.saturating_sub(height))
+}
+
+/// First row shown of `total` plain-lyric rows in a pane `height` rows tall,
+/// at `position` in a track `duration` long: the rows that do not fit
+/// scroll by in proportion to the position, the top when the length is
+/// unknown or zero. Never past the last full screen.
+fn plain_top(total: usize, height: usize, position: Duration, duration: Option<Duration>) -> usize {
+    let span = total.saturating_sub(height);
+    let Some(length) = duration.map(|d| d.as_millis()).filter(|&ms| ms > 0) else {
+        return 0;
+    };
+    if span == 0 {
+        return 0;
+    }
+    let played = position.as_millis().min(length);
+    // Real spans (at most a few million rows) times `played` (under 2^74)
+    // fit a u128 easily; absurd ones saturate, and the result is clamped
+    // to `span` either way.
+    let top = u128::try_from(span).map_or(0, |span| span.saturating_mul(played) / length);
+    usize::try_from(top).map_or(span, |top| top.min(span))
+}
+
+/// Draws the lyrics pane in `area`: always unfocused, titled " Lyrics ".
+/// `wrapped` keeps the wrapped rows between frames.
+fn render_lyrics<A: Audio>(
+    frame: &mut Frame,
+    app: &App<A>,
+    wrapped: &mut Option<WrappedLyrics>,
+    area: Rect,
+) {
+    let (border, title) = theme::border(false);
+    let block = Block::bordered()
+        .border_style(border)
+        .title_style(title)
+        .padding(Padding::horizontal(1))
+        .title(LYRICS_TITLE);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let playback = app.playback();
+    // The offset of an empty pane is never used: it does not scroll.
+    let mut unused = 0;
+    if playback.current_track().is_none() {
+        *wrapped = None;
+        render_empty(frame, &mut unused, inner, NOTHING_PLAYING.to_owned());
+        return;
+    }
+    if !app.lyrics_ready() {
+        // Not looked up yet: drawn on the next frame, without a flash of
+        // "No lyrics" first.
+        return;
+    }
+    let Some(lyrics) = app.lyrics() else {
+        *wrapped = None;
+        render_empty(frame, &mut unused, inner, NO_LYRICS.to_owned());
+        return;
+    };
+
+    let generation = app.lyrics_generation();
+    let columns = usize::from(inner.width);
+    let rows = match wrapped {
+        Some(w) if w.generation == generation && w.columns == columns => &w.rows,
+        _ => {
+            &wrapped
+                .insert(WrappedLyrics {
+                    generation,
+                    columns,
+                    rows: lyric_rows(lyrics, columns),
+                })
+                .rows
+        }
+    };
+    let position = playback.position();
+    let height = usize::from(inner.height);
+    let current = lyrics.current(position);
+    let top = match lyrics {
+        Lyrics::Synced(_) => synced_top(current_rows(rows, current).as_ref(), rows.len(), height),
+        Lyrics::Plain(_) => plain_top(rows.len(), height, position, playback.duration()),
+    };
+    let lines: Vec<Line<'_>> = rows
+        .iter()
+        .skip(top)
+        .take(height)
+        .map(|row| {
+            Line::styled(
+                row.text.as_str(),
+                row_role(lyrics, row.line, current).style(),
+            )
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// How many bars fit `columns` inner columns: 1 column each, with a
@@ -1229,17 +1518,21 @@ mod tests {
         lines.iter().any(|l| l.contains(needle))
     }
 
+    /// `n` tracks, with the lyrics pane off so the two-pane geometry the
+    /// tests below measure is unchanged.
     fn library(n: usize) -> App<SilentAudio> {
         let tracks = (0..n)
             .map(|i| track(&format!("Song {i:02}"), "Band", "LP"))
             .collect();
-        App::new(
+        let mut app = App::new(
             tracks,
             SilentAudio::default(),
             no_store(),
             "/music".to_owned(),
             None,
-        )
+        );
+        app.set_lyrics_on(false);
+        app
     }
 
     fn press(app: &mut App<SilentAudio>, code: KeyCode) {
@@ -1611,7 +1904,8 @@ mod tests {
         )?;
         std::fs::write(dir.join("Gym.m3u8"), "../Band/LP/A.mp3\n../Band/LP/B.mp3\n")?;
         let store = Box::new(crate::playlist::FsStore::new(&root));
-        let app = App::new(tracks, SilentAudio::default(), store, "/m".to_owned(), None);
+        let mut app = App::new(tracks, SilentAudio::default(), store, "/m".to_owned(), None);
+        app.set_lyrics_on(false);
         Ok((tmp, app))
     }
 
@@ -2275,7 +2569,8 @@ mod tests {
             .map(|i| track(&format!("Song {i:02}"), "Band", "LP"))
             .collect();
         let store = Box::new(FsStore::new(&root));
-        let app = App::new(tracks, SilentAudio::default(), store, "/m".to_owned(), None);
+        let mut app = App::new(tracks, SilentAudio::default(), store, "/m".to_owned(), None);
+        app.set_lyrics_on(false);
         Ok((tmp, app))
     }
 
@@ -2703,6 +2998,7 @@ mod tests {
         app.set_page_size(view.page_size());
         app.set_help_rows(view.help_rows());
         app.set_spectrum_layout(view.spectrum_fits(), view.spectrum_bars());
+        app.set_lyrics_layout(view.lyrics_fits());
         buffer
     }
 
@@ -2987,5 +3283,684 @@ mod tests {
             press(&mut app, KeyCode::Tab);
         }
         Ok(())
+    }
+}
+
+/// The lyrics pane: layout, rows, scrolling and messages.
+#[cfg(test)]
+mod lyrics_tests {
+    use super::*;
+    use crate::library::Track;
+    use crate::lyrics::Line as LyricLine;
+    use crate::test_support::{SilentAudio, no_store, wav_bytes};
+    use anyhow::{Result, bail};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
+
+    /// Height without the spectrum strip (shorter than
+    /// [`SPECTRUM_MIN_HEIGHT`]): the panes' insides are 13 rows.
+    const SHORT: u16 = 20;
+
+    /// Rows inside the panes at [`SHORT`] rows: the body less two borders.
+    const INNER_ROWS: usize = (SHORT - NOW_PLAYING_HEIGHT - 2 - 2) as usize;
+
+    /// Tracks 200 s long named after `entries`, each with the given
+    /// sidecar text if any, in a temporary folder, in library order. The
+    /// lyrics pane is on (the default).
+    fn folder(entries: &[(&str, Option<&str>)]) -> Result<(tempfile::TempDir, App<SilentAudio>)> {
+        let tmp = tempfile::tempdir()?;
+        let mut tracks = Vec::new();
+        for (name, lyrics) in entries {
+            let path = tmp.path().join(format!("{name}.wav"));
+            std::fs::write(&path, wav_bytes())?;
+            if let Some(text) = lyrics {
+                std::fs::write(path.with_extension("lrc"), text)?;
+            }
+            tracks.push(Track {
+                path,
+                title: (*name).to_owned(),
+                artist: "Band".to_owned(),
+                album: "LP".to_owned(),
+                number: None,
+                duration: Some(Duration::from_secs(200)),
+            });
+        }
+        let app = App::new(
+            tracks,
+            SilentAudio::default(),
+            no_store(),
+            "/m".to_owned(),
+            None,
+        );
+        Ok((tmp, app))
+    }
+
+    fn press(app: &mut App<SilentAudio>, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// One turn of the event loop at `width`×`height`: tick, draw, feed
+    /// the layout back. Returns the drawn screen.
+    fn frame(app: &mut App<SilentAudio>, view: &mut View, width: u16, height: u16) -> Buffer {
+        let now = Instant::now();
+        app.tick(now);
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).unwrap_or_else(|never| match never {});
+        terminal
+            .draw(|f| render(f, app, view, now))
+            .unwrap_or_else(|never| match never {});
+        app.set_page_size(view.page_size());
+        app.set_help_rows(view.help_rows());
+        app.set_spectrum_layout(view.spectrum_fits(), view.spectrum_bars());
+        app.set_lyrics_layout(view.lyrics_fits());
+        terminal.backend().buffer().clone()
+    }
+
+    /// Two turns of the loop, so lyrics shown by the first are loaded and
+    /// drawn by the second.
+    fn settle(app: &mut App<SilentAudio>, view: &mut View, width: u16, height: u16) -> Buffer {
+        frame(app, view, width, height);
+        frame(app, view, width, height)
+    }
+
+    fn line(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height).map(|y| line(buffer, y)).collect()
+    }
+
+    /// The column where the lyrics pane starts on a `width`-column screen.
+    fn pane_x(width: u16) -> u16 {
+        width - lyrics_width(width)
+    }
+
+    /// The lyrics pane's inside, row by row, on a `width`-column screen:
+    /// inside the borders and the one-column padding.
+    fn pane_rows(buffer: &Buffer, width: u16) -> Vec<String> {
+        let from = pane_x(width) + 2;
+        let to = width - 2;
+        (1..=INNER_ROWS)
+            .filter_map(|y| u16::try_from(y).ok())
+            .map(|y| {
+                (from..to)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The style of the first character of the inside's row `row`.
+    fn row_style(buffer: &Buffer, width: u16, row: usize) -> Style {
+        let y = u16::try_from(row + 1).unwrap_or(u16::MAX);
+        buffer[(pane_x(width) + 2, y)].style()
+    }
+
+    fn is_playing(style: Style) -> bool {
+        style.fg == theme::PLAYING.fg && style.add_modifier.contains(Modifier::BOLD)
+    }
+
+    /// Whether `style` is the empty-list message style.
+    fn is_message(style: Style) -> bool {
+        style.add_modifier.contains(theme::MESSAGE.add_modifier)
+    }
+
+    /// `count` timed lines "Line 00", "Line 01", … one a second from 0:01.
+    fn numbered(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("[00:{:02}.00]Line {i:02}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Spec *Pane shown on a wide terminal*, *Lyrics pane visible*.
+    #[test]
+    fn wide_terminal_shows_three_panes_left_to_right() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", None)])?;
+        let mut view = View::default();
+        let screen = lines(&settle(&mut app, &mut view, 120, 30));
+        let top = &screen[0];
+        let (Some(side), Some(main), Some(lyrics)) = (
+            top.find("kasset"),
+            top.find("Library"),
+            top.find(LYRICS_TITLE.trim()),
+        ) else {
+            bail!("missing a pane: {screen:#?}");
+        };
+        assert!(side < main && main < lyrics, "{screen:#?}");
+        assert!(
+            top.contains(&format!("┌{LYRICS_TITLE}─")),
+            "titled: {screen:#?}"
+        );
+        assert!(view.lyrics_fits());
+        assert!(app.lyrics_shown());
+        Ok(())
+    }
+
+    /// Spec *Too narrow*.
+    #[test]
+    fn narrow_terminal_has_two_panes() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", None)])?;
+        let mut view = View::default();
+        for width in [90, LYRICS_MIN_WIDTH - 1] {
+            let screen = lines(&settle(&mut app, &mut view, width, 30));
+            assert!(!screen[0].contains("Lyrics"), "{screen:#?}");
+            assert!(screen[0].contains("Library"), "{screen:#?}");
+            assert!(!view.lyrics_fits());
+            assert!(app.lyrics_on(), "still on");
+        }
+        let screen = lines(&settle(&mut app, &mut view, LYRICS_MIN_WIDTH, 30));
+        assert!(screen[0].contains(LYRICS_TITLE), "{screen:#?}");
+        Ok(())
+    }
+
+    /// Spec *Width bounds*: a third of the width, 28 to 48 columns.
+    #[test]
+    fn pane_width_is_a_third_within_bounds() -> Result<()> {
+        assert_eq!(lyrics_width(100), 33);
+        assert_eq!(lyrics_width(120), 40);
+        assert_eq!(lyrics_width(200), 48);
+        assert_eq!(lyrics_width(70), 28);
+        let (_tmp, mut app) = folder(&[("song", None)])?;
+        let mut view = View::default();
+        for (width, pane) in [(100_u16, 33_u16), (200, 48)] {
+            let screen = settle(&mut app, &mut view, width, 30);
+            let x = width - pane;
+            assert_eq!(screen[(x, 0)].symbol(), "┌", "{:#?}", lines(&screen));
+            assert_eq!(screen[(x - 1, 0)].symbol(), "┐", "main pane ends");
+            assert_eq!(screen[(width - 1, 0)].symbol(), "┐");
+            // The sidebar keeps its two-pane width.
+            let side = sidebar_width(width);
+            assert_eq!(screen[(side - 1, 0)].symbol(), "┐", "{:#?}", lines(&screen));
+            assert_eq!(screen[(side, 0)].symbol(), "┌");
+        }
+        // At 100 columns the main pane keeps 42.
+        assert_eq!(100 - sidebar_width(100) - lyrics_width(100), 42);
+        Ok(())
+    }
+
+    /// Spec *Narrowing the terminal*.
+    #[test]
+    fn resizing_hides_and_shows_the_pane() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", Some("[00:01.00]Hello\n"))])?;
+        press(&mut app, KeyCode::Enter);
+        let mut view = View::default();
+        let wide = lines(&settle(&mut app, &mut view, 120, SHORT));
+        assert!(wide.iter().any(|l| l.contains("Hello")), "{wide:#?}");
+        let narrow = lines(&frame(&mut app, &mut view, 90, SHORT));
+        assert!(!narrow.iter().any(|l| l.contains("Lyrics")), "{narrow:#?}");
+        assert!(app.lyrics_on());
+        assert!(!app.lyrics_shown());
+        let wide = lines(&settle(&mut app, &mut view, 120, SHORT));
+        assert!(wide[0].contains(LYRICS_TITLE), "{wide:#?}");
+        assert!(wide.iter().any(|l| l.contains("Hello")), "{wide:#?}");
+        Ok(())
+    }
+
+    /// Spec *Spectrum below*.
+    #[test]
+    fn pane_ends_above_the_full_width_strip() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", None)])?;
+        assert!(app.visualizer_on());
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, 30);
+        let strip = 30 - NOW_PLAYING_HEIGHT - 2 - SPECTRUM_HEIGHT;
+        let x = pane_x(120);
+        assert_eq!(screen[(x, 0)].symbol(), "┌");
+        assert_eq!(
+            screen[(x, strip - 1)].symbol(),
+            "└",
+            "{:#?}",
+            lines(&screen)
+        );
+        assert_eq!(screen[(119, strip - 1)].symbol(), "┘");
+        let top = line(&screen, strip);
+        assert!(top.starts_with(&format!("┌{SPECTRUM_TITLE}")), "{top}");
+        assert!(top.ends_with('┐'), "full width: {top}");
+        Ok(())
+    }
+
+    /// Spec *Tab skips the pane*: focus only moves between the sidebar
+    /// and the main pane, and the lyrics border is never focused.
+    #[test]
+    fn tab_never_focuses_the_pane() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", None)])?;
+        let mut view = View::default();
+        let unfocused = theme::border(false).0;
+        let focused = theme::border(true).0;
+        assert_eq!(app.focus(), Focus::Main);
+        for expected in [Focus::Sidebar, Focus::Main, Focus::Sidebar] {
+            let screen = settle(&mut app, &mut view, 120, 30);
+            let corner = screen[(pane_x(120), 0)].style();
+            assert_eq!(corner.fg, unfocused.fg.or(Some(Color::Reset)));
+            assert_ne!(corner.fg, focused.fg);
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus(), expected);
+        }
+        Ok(())
+    }
+
+    /// Spec *Hide and show*: `l` hides the pane and the main pane widens.
+    #[test]
+    fn l_hides_the_pane_and_the_main_pane_widens() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", None)])?;
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, 30);
+        assert_eq!(screen[(pane_x(120) - 1, 0)].symbol(), "┐");
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.status(Instant::now()), None, "the change shows itself");
+        let screen = settle(&mut app, &mut view, 120, 30);
+        let top = line(&screen, 0);
+        assert!(!top.contains("Lyrics"), "{top}");
+        assert_eq!(screen[(pane_x(120) - 1, 0)].symbol(), "─", "{top}");
+        assert_eq!(screen[(119, 0)].symbol(), "┐", "main pane to the edge");
+        press(&mut app, KeyCode::Char('l'));
+        let screen = settle(&mut app, &mut view, 120, 30);
+        assert!(line(&screen, 0).contains(LYRICS_TITLE));
+        Ok(())
+    }
+
+    /// Spec *Widening with lyrics*: no frame shows "No lyrics" first.
+    #[test]
+    fn widening_never_flashes_no_lyrics() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", Some("[00:00.50]Hello\n"))])?;
+        press(&mut app, KeyCode::Enter);
+        let mut view = View::default();
+        settle(&mut app, &mut view, 90, SHORT);
+        let mut shown = false;
+        for _ in 0..3 {
+            let screen = lines(&frame(&mut app, &mut view, 120, SHORT));
+            assert!(!screen.iter().any(|l| l.contains(NO_LYRICS)), "{screen:#?}");
+            shown |= screen.iter().any(|l| l.contains("Hello"));
+        }
+        assert!(shown, "the lyrics appear");
+        Ok(())
+    }
+
+    /// Spec *Nothing played yet*.
+    #[test]
+    fn nothing_playing_at_start() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", Some("[00:01.00]Hello\n"))])?;
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, SHORT);
+        let rows = pane_rows(&screen, 120);
+        assert_eq!(rows[0], NOTHING_PLAYING, "{rows:#?}");
+        assert!(is_message(row_style(&screen, 120, 0)), "like an empty list");
+        Ok(())
+    }
+
+    /// Spec *Track without lyrics*: "No lyrics", and the side panes keep
+    /// their widths.
+    #[test]
+    fn no_lyrics_keeps_the_layout() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", None)])?;
+        press(&mut app, KeyCode::Enter);
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, SHORT);
+        let rows = pane_rows(&screen, 120);
+        assert_eq!(rows[0], NO_LYRICS, "{rows:#?}");
+        assert!(is_message(row_style(&screen, 120, 0)));
+        assert_eq!(screen[(pane_x(120), 0)].symbol(), "┌");
+        assert_eq!(screen[(sidebar_width(120), 0)].symbol(), "┌");
+        Ok(())
+    }
+
+    /// The row of the pane's inside showing `text`.
+    fn row_of(rows: &[String], text: &str) -> Option<usize> {
+        rows.iter().position(|r| r == text)
+    }
+
+    /// Spec *Current line highlighted*.
+    #[test]
+    fn current_line_is_highlighted_in_the_middle() -> Result<()> {
+        let text = numbered(40);
+        let (_tmp, mut app) = folder(&[("song", Some(&text))])?;
+        press(&mut app, KeyCode::Enter);
+        app.playback_mut().audio_mut().position = Duration::from_millis(21_500);
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, SHORT);
+        let rows = pane_rows(&screen, 120);
+        let Some(current) = row_of(&rows, "Line 20") else {
+            bail!("current line not shown: {rows:#?}");
+        };
+        assert_eq!(current, INNER_ROWS / 2, "in the middle: {rows:#?}");
+        assert!(is_playing(row_style(&screen, 120, current)));
+        assert_eq!(row_style(&screen, 120, current - 1).fg, theme::DIM.fg);
+        assert_eq!(row_style(&screen, 120, 0).fg, theme::DIM.fg);
+        let after = row_style(&screen, 120, current + 1);
+        assert!(!is_playing(after) && after.fg != theme::DIM.fg);
+        Ok(())
+    }
+
+    /// Spec *Before the first line*.
+    #[test]
+    fn before_the_first_line_nothing_is_highlighted() -> Result<()> {
+        let (_tmp, mut app) = folder(&[("song", Some("[00:20.00]First\n[00:25.00]Second\n"))])?;
+        press(&mut app, KeyCode::Enter);
+        app.playback_mut().audio_mut().position = Duration::from_secs(5);
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, SHORT);
+        let rows = pane_rows(&screen, 120);
+        assert_eq!(rows[..2], ["First", "Second"], "from the top: {rows:#?}");
+        for row in 0..INNER_ROWS {
+            assert!(!is_playing(row_style(&screen, 120, row)), "row {row}");
+        }
+        Ok(())
+    }
+
+    /// The text of the highlighted row, if any.
+    fn highlighted(screen: &Buffer) -> Option<String> {
+        let rows = pane_rows(screen, 120);
+        (0..INNER_ROWS)
+            .find(|&row| is_playing(row_style(screen, 120, row)))
+            .and_then(|row| rows.get(row).cloned())
+    }
+
+    /// Spec *Seeking*, *Paused*.
+    #[test]
+    fn highlight_follows_seeking_and_holds_while_paused() -> Result<()> {
+        let text = numbered(59);
+        let (_tmp, mut app) = folder(&[("song", Some(&text))])?;
+        press(&mut app, KeyCode::Enter);
+        app.playback_mut().audio_mut().position = Duration::from_millis(15_500);
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, SHORT);
+        assert_eq!(highlighted(&screen).as_deref(), Some("Line 14"));
+        press(&mut app, KeyCode::Right);
+        let position = app.playback().position();
+        assert!(position > Duration::from_millis(15_500), "seeked");
+        let expected = app
+            .lyrics()
+            .and_then(|l| l.current(position))
+            .map(|i| format!("Line {i:02}"));
+        let screen = frame(&mut app, &mut view, 120, SHORT);
+        assert_eq!(highlighted(&screen), expected, "on the next frame");
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.playback().state(), PlayState::Paused);
+        assert_eq!(app.lyrics_deadline(Instant::now()), None);
+        for _ in 0..2 {
+            let screen = frame(&mut app, &mut view, 120, SHORT);
+            assert_eq!(highlighted(&screen), expected, "held while paused");
+        }
+        Ok(())
+    }
+
+    /// Spec *Long line*: every row of a wrapped current line is
+    /// highlighted.
+    #[test]
+    fn long_current_line_wraps_highlighted() -> Result<()> {
+        let long = "word ".repeat(20);
+        let text = format!("[00:01.00]{long}\n[00:30.00]Next\n");
+        let (_tmp, mut app) = folder(&[("song", Some(&text))])?;
+        press(&mut app, KeyCode::Enter);
+        app.playback_mut().audio_mut().position = Duration::from_secs(2);
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, SHORT);
+        let rows = pane_rows(&screen, 120);
+        let wrapped: Vec<usize> = (0..INNER_ROWS)
+            .filter(|&row| rows[row].starts_with("word"))
+            .collect();
+        assert_eq!(wrapped.len(), 3, "99 columns in 36: {rows:#?}");
+        for row in wrapped {
+            assert!(is_playing(row_style(&screen, 120, row)), "row {row}");
+        }
+        Ok(())
+    }
+
+    /// Spec *Scroll with progress*.
+    #[test]
+    fn plain_lyrics_scroll_with_progress() -> Result<()> {
+        let total = INNER_ROWS * 3;
+        let text = (0..total)
+            .map(|i| format!("Row {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_tmp, mut app) = folder(&[("song", Some(&text))])?;
+        press(&mut app, KeyCode::Enter);
+        let mut view = View::default();
+        let screen = settle(&mut app, &mut view, 120, SHORT);
+        assert_eq!(pane_rows(&screen, 120)[0], "Row 00", "the start first");
+        app.playback_mut().audio_mut().position = Duration::from_secs(100);
+        let screen = frame(&mut app, &mut view, 120, SHORT);
+        let rows = pane_rows(&screen, 120);
+        // Half of the 26 rows that do not fit: the middle third.
+        assert_eq!(rows[0], format!("Row {INNER_ROWS:02}"), "{rows:#?}");
+        for row in 0..INNER_ROWS {
+            let style = row_style(&screen, 120, row);
+            assert!(!is_playing(style) && style.fg != theme::DIM.fg, "row {row}");
+        }
+        app.playback_mut().audio_mut().position = Duration::from_secs(200);
+        let screen = frame(&mut app, &mut view, 120, SHORT);
+        let rows = pane_rows(&screen, 120);
+        assert_eq!(
+            rows[INNER_ROWS - 1],
+            format!("Row {:02}", total - 1),
+            "the end"
+        );
+        Ok(())
+    }
+
+    /// Tiny and huge terminals draw without panicking, with the pane on
+    /// and lyrics loaded.
+    #[test]
+    fn odd_sizes_never_panic() -> Result<()> {
+        let text = format!("{}[00:02.00]{}\n", numbered(30), "漢字 ".repeat(40));
+        let (_tmp, mut app) = folder(&[("song", Some(&text))])?;
+        press(&mut app, KeyCode::Enter);
+        app.playback_mut().audio_mut().position = Duration::from_secs(3);
+        let mut view = View::default();
+        for (width, height) in [
+            (100, 1),
+            (100, 4),
+            (100, 6),
+            (1, 1),
+            (LYRICS_MIN_WIDTH, 2),
+            (500, 200),
+            (120, SHORT),
+        ] {
+            settle(&mut app, &mut view, width, height);
+        }
+        Ok(())
+    }
+
+    /// The wrapped rows are kept between frames and redone when the width
+    /// or the lyrics change (spec *Edited while hidden*).
+    #[test]
+    fn wrapped_rows_follow_width_and_reloads() -> Result<()> {
+        let (tmp, mut app) = folder(&[("song", Some("[00:01.00]Hello\n"))])?;
+        press(&mut app, KeyCode::Enter);
+        let mut view = View::default();
+        settle(&mut app, &mut view, 120, SHORT);
+        let columns = |view: &View| view.lyrics_rows.as_ref().map(|w| w.columns);
+        assert_eq!(columns(&view), Some(36));
+        settle(&mut app, &mut view, 200, SHORT);
+        assert_eq!(columns(&view), Some(44));
+        std::fs::write(tmp.path().join("song.lrc"), "[00:01.00]Edited\n")?;
+        let screen = lines(&frame(&mut app, &mut view, 200, SHORT));
+        assert!(
+            screen.iter().any(|l| l.contains("Hello")),
+            "not re-read while shown"
+        );
+        app.set_lyrics_on(false);
+        frame(&mut app, &mut view, 200, SHORT);
+        app.set_lyrics_on(true);
+        let screen = lines(&settle(&mut app, &mut view, 200, SHORT));
+        assert!(screen.iter().any(|l| l.contains("Edited")), "{screen:#?}");
+        assert!(!screen.iter().any(|l| l.contains("Hello")), "{screen:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_long_words_at_the_column() {
+        assert_eq!(wrap("hello world foo", 11), ["hello world", "foo"]);
+        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap("ab abcdefgh c", 4), ["ab", "abcd", "efgh", "c"]);
+        assert_eq!(wrap("", 10), [""]);
+        assert_eq!(wrap("   ", 10), [""]);
+        assert_eq!(wrap("short", 0), ["s", "h", "o", "r", "t"], "at least 1");
+    }
+
+    /// Wide (CJK) characters wrap by display width.
+    #[test]
+    fn wrap_counts_display_width() {
+        assert_eq!(wrap("日本語の歌詞", 5), ["日本", "語の", "歌詞"]);
+        assert_eq!(wrap("日本 語", 4), ["日本", "語"]);
+        assert_eq!(wrap("日", 1), ["日"], "a char wider than the row");
+        for text in ["日本語の歌詞です", "a 日本 bcdef 語の歌", "x"] {
+            for columns in 2..12 {
+                for row in wrap(text, columns) {
+                    assert!(width(&row) <= columns, "{row:?} in {columns}");
+                }
+            }
+        }
+    }
+
+    fn synced(texts: &[&str]) -> Lyrics {
+        Lyrics::Synced(
+            (0_u64..)
+                .zip(texts)
+                .map(|(i, &text)| LyricLine {
+                    at: Duration::from_secs(i),
+                    text: text.to_owned(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn lyric_rows_mark_past_current_and_future() {
+        let lyrics = synced(&["one", "two three four", "", "five"]);
+        let rows = lyric_rows(&lyrics, 5);
+        let lines: Vec<_> = rows.iter().map(|r| (r.line, r.text.as_str())).collect();
+        assert_eq!(
+            lines,
+            [
+                (0, "one"),
+                (1, "two"),
+                (1, "three"),
+                (1, "four"),
+                (2, ""),
+                (3, "five")
+            ]
+        );
+        assert_eq!(current_rows(&rows, Some(1)), Some(1..4));
+        assert_eq!(current_rows(&rows, Some(3)), Some(5..6));
+        assert_eq!(current_rows(&rows, None), None);
+        assert_eq!(current_rows(&rows, Some(9)), None, "no such line");
+        let roles: Vec<_> = rows
+            .iter()
+            .map(|r| row_role(&lyrics, r.line, Some(1)))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                LyricRole::Past,
+                LyricRole::Current,
+                LyricRole::Current,
+                LyricRole::Current,
+                LyricRole::Future,
+                LyricRole::Future,
+            ]
+        );
+        assert!(
+            rows.iter()
+                .all(|r| row_role(&lyrics, r.line, None) == LyricRole::Future)
+        );
+        let plain = Lyrics::Plain(vec!["a".to_owned(), String::new(), "b".to_owned()]);
+        let rows = lyric_rows(&plain, 20);
+        assert_eq!(rows.len(), 3, "a blank line is one row");
+        assert!(
+            rows.iter()
+                .all(|r| row_role(&plain, r.line, Some(1)) == LyricRole::Plain)
+        );
+    }
+
+    #[test]
+    fn synced_top_centres_the_current_line_within_bounds() {
+        assert_eq!(synced_top(None, 40, 10), 0);
+        assert_eq!(synced_top(Some(&(20..21)), 40, 10), 16, "4 rows above");
+        assert_eq!(synced_top(Some(&(20..24)), 40, 10), 17, "3 above, 3 below");
+        assert_eq!(
+            synced_top(Some(&(20..35)), 40, 10),
+            20,
+            "taller than the pane"
+        );
+        assert_eq!(synced_top(Some(&(2..3)), 40, 10), 0, "near the top");
+        assert_eq!(synced_top(Some(&(38..39)), 40, 10), 30, "near the end");
+        assert_eq!(synced_top(Some(&(3..5)), 5, 10), 0, "all fit");
+        assert_eq!(synced_top(Some(&(3..4)), 5, 0), 3, "no rows to show");
+    }
+
+    /// Clusters are never split, and rows are measured as the screen
+    /// draws them.
+    #[test]
+    fn wrap_keeps_grapheme_clusters_whole() {
+        let hearts = "❤\u{fe0f}".repeat(6);
+        let rows = wrap(&hearts, 5);
+        assert_eq!(
+            rows,
+            [
+                "❤\u{fe0f}❤\u{fe0f}",
+                "❤\u{fe0f}❤\u{fe0f}",
+                "❤\u{fe0f}❤\u{fe0f}"
+            ]
+        );
+        let accents = "e\u{301}".repeat(5);
+        assert_eq!(
+            wrap(&accents, 2),
+            ["e\u{301}e\u{301}", "e\u{301}e\u{301}", "e\u{301}"]
+        );
+        assert_eq!(wrap("\u{200b}", 1), ["\u{200b}"], "zero width");
+        assert_eq!(wrap("漢", 1), ["漢"], "wider than the row");
+        for text in [
+            hearts.as_str(),
+            accents.as_str(),
+            "a\u{200b}b\u{200b}c d",
+            "漢字 x",
+        ] {
+            for columns in 2..8 {
+                for row in wrap(text, columns) {
+                    assert!(drawn_width(&row) <= columns, "{row:?} in {columns}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_top_follows_progress_and_stays_in_span() {
+        let len = Some(Duration::from_secs(200));
+        let half = Duration::from_secs(100);
+        assert_eq!(plain_top(30, 10, half, len), 10, "half of 20");
+        assert_eq!(plain_top(30, 10, Duration::ZERO, len), 0);
+        assert_eq!(plain_top(30, 10, Duration::from_secs(200), len), 20);
+        assert_eq!(
+            plain_top(30, 10, Duration::from_secs(900), len),
+            20,
+            "past the end"
+        );
+        assert_eq!(plain_top(30, 10, half, None), 0, "unknown length");
+        assert_eq!(
+            plain_top(30, 10, half, Some(Duration::ZERO)),
+            0,
+            "zero length"
+        );
+        assert_eq!(plain_top(8, 10, half, len), 0, "all fit");
+        for (total, position, length) in [
+            (usize::MAX, Duration::MAX, Duration::MAX),
+            (usize::MAX, Duration::MAX, Duration::from_millis(1)),
+            (usize::MAX, Duration::from_millis(1), Duration::MAX),
+            (1_000, Duration::MAX, Duration::from_millis(3)),
+        ] {
+            let span = total.saturating_sub(10);
+            assert!(plain_top(total, 10, position, Some(length)) <= span);
+        }
     }
 }

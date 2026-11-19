@@ -66,7 +66,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 4. Lyrics pane and frame timing (`src/ui.rs`, `src/terminal.rs`, `CLAUDE.md`)
 
-- [ ] 4.1 In `render_body`, add the third column when `app.lyrics_on()` and the width is at least `LYRICS_MIN_WIDTH` (100), with width `(body/3).clamp(28, 48)`. Set `View::lyrics_fits` every frame, and feed it back through `terminal::event_loop` with `set_lyrics_layout` (D5). Update the `ui.rs` and `terminal.rs` `//!` docs. Verify with `TestBackend` tests:
+- [x] 4.1 In `render_body`, add the third column when `app.lyrics_on()` and the width is at least `LYRICS_MIN_WIDTH` (100), with width `(body/3).clamp(28, 48)`. Set `View::lyrics_fits` every frame, and feed it back through `terminal::event_loop` with `set_lyrics_layout` (D5). Update the `ui.rs` and `terminal.rs` `//!` docs. Verify with `TestBackend` tests:
   - at 120 columns there are three panes, left to right, with " Lyrics " titled (spec *Pane shown on a wide terminal*, *Lyrics pane visible*);
   - at 90 columns there are two panes (spec *Too narrow*);
   - at 100 and 200 columns the pane is 33 and 48 columns wide (spec *Width bounds*);
@@ -76,7 +76,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - `l` hides it and the main pane widens (spec *Hide and show*);
   - after widening 90 → 120 with a playing track that has lyrics, no frame shows "No lyrics" before the lyrics (spec *Widening with lyrics*);
   - every existing `ui.rs` test passes. The fixtures `library()`, `with_playlists()` and `many()` call `set_lyrics_on(false)`, so the two-pane geometry (`MAIN_X`, title elision, table columns) is unchanged. Only the new tests turn the pane on, never with an `l` key press that could raise a notice. Any test that needed another edit is listed in the review hand-off.
-- [ ] 4.2 Add `lyric_rows` and the lyrics renderer (D6): wrap by display width, keep the synced current line in the middle, scroll plain lyrics by progress, apply `PLAYING`/`DIM`/default styles, and show "Nothing playing" and "No lyrics" through `render_empty`. Verify with pure tests of `lyric_rows` and `TestBackend` tests:
+- [x] 4.2 Add `lyric_rows` and the lyrics renderer (D6): wrap by display width, keep the synced current line in the middle, scroll plain lyrics by progress, apply `PLAYING`/`DIM`/default styles, and show "Nothing playing" and "No lyrics" through `render_empty`. Verify with pure tests of `lyric_rows` and `TestBackend` tests:
   - the current line is highlighted near the middle and earlier lines are dimmed (spec *Current line highlighted*);
   - before the first line nothing is highlighted and the top is shown (spec *Before the first line*);
   - after a seek, the new line is highlighted on the next frame (spec *Seeking*);
@@ -85,7 +85,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - plain lyrics three times the pane's height show their middle at half-way (spec *Scroll with progress*), and the top when the duration is unknown or zero; `top <= span` always, computed in `u128` milliseconds with no float casts;
   - "No lyrics" is shown and the side panes keep their widths (spec *Track without lyrics*), and "Nothing playing" is shown at start (spec *Nothing played yet*);
   - wide (CJK) characters wrap by display width.
-- [ ] 4.3 Give `terminal::next_deadline` the lyric deadline and return the earlier of the two (D7). Verify:
+- [x] 4.3 Give `terminal::next_deadline` the lyric deadline and return the earlier of the two (D7). Verify:
   - the existing `next_deadline` tests pass with `None`;
   - a new test shows a lyric deadline earlier than `FRAME` wins, and a later one does not.
 
