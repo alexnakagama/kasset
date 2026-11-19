@@ -58,7 +58,7 @@ Layering, from pure logic outward:
 
 Features are specified and tracked with OpenSpec (`openspec/`, skills under `.claude/skills/`, commands `/opsx:propose|apply|update|sync|archive|explore`).
 
-- Current specs: `openspec/specs/{audio-playback,audio-visualizer,music-library,player-tui,playlists}/spec.md`.
-- No active change. Design decisions referenced in code: playlists D1–D9 in `openspec/changes/archive/2026-11-17-add-playlists/design.md`, visualizer D1–D9 in `openspec/changes/archive/2026-11-19-add-visualizer/design.md`. In a change, `tasks.md` tracks progress by task group; mark tasks `[x]` as they are completed and verified.
+- Current specs: `openspec/specs/{audio-playback,audio-visualizer,lyrics,music-library,player-tui,playlists}/spec.md`.
+- No active change. Design decisions referenced in code: playlists D1–D9 in `openspec/changes/archive/2026-11-17-add-playlists/design.md`, visualizer D1–D9 in `openspec/changes/archive/2026-11-19-add-visualizer/design.md`, lyrics D1–D8 in `openspec/changes/archive/2026-11-19-add-synced-lyrics/design.md`. In a change, `tasks.md` tracks progress by task group; mark tasks `[x]` as they are completed and verified.
 - Archived changes live in `openspec/changes/archive/`.
 - When adding or changing keys, update `keys::GROUPS` in `src/keys.rs` (it feeds `--help`, the help overlay and the key bar) and the README keys tables together.
