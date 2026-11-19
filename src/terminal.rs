@@ -8,6 +8,12 @@
 //! `reset`. While the
 //! UI is up, the process's standard error is pointed at `/dev/null` so that C
 //! libraries (ALSA in particular) cannot print over the screen.
+//!
+//! The loop ticks the app, draws, feeds the drawn layout back to the app,
+//! then waits for input until the next frame's deadline: [`FRAME`] after the
+//! frame started, or [`ANIMATION_FRAME`] while the spectrum strip is
+//! animating ([`App::visualizer_animating`]). The deadline is counted from
+//! the start of the frame, so drawing time does not slow the frame rate.
 
 use std::io::{self, IsTerminal, Stdout};
 use std::panic::{self, PanicHookInfo};
@@ -31,6 +37,10 @@ use crate::ui::{self, View};
 /// How long to wait for input before the next tick and redraw. Four frames a
 /// second keeps the elapsed time accurate to the second.
 const FRAME: Duration = Duration::from_millis(250);
+
+/// The frame interval while the spectrum strip is animating: about 30 frames
+/// a second, comfortably above the 25 the bars need to look smooth.
+const ANIMATION_FRAME: Duration = Duration::from_millis(33);
 
 /// Most input events handled between two redraws, so a flood of key repeats
 /// cannot starve the screen.
@@ -193,6 +203,17 @@ pub fn run<A: Audio>(app: &mut App<A>) -> Result<Exit> {
     }
 }
 
+/// When the frame that started at `frame_start` ends and the next one starts.
+fn next_deadline(frame_start: Instant, animating: bool) -> Instant {
+    frame_start + if animating { ANIMATION_FRAME } else { FRAME }
+}
+
+/// How long to wait for input at `now` before `deadline`: zero once it has
+/// passed.
+fn wait_until(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
+}
+
 fn event_loop<A: Audio>(
     tui: &mut Tui,
     app: &mut App<A>,
@@ -200,7 +221,8 @@ fn event_loop<A: Audio>(
     signals: &Signals,
 ) -> Result<Exit> {
     loop {
-        app.tick(Instant::now());
+        let frame_start = Instant::now();
+        app.tick(frame_start);
         if app.should_quit() {
             return Ok(Exit::Quit);
         }
@@ -217,10 +239,13 @@ fn event_loop<A: Audio>(
             .context("cannot draw to the terminal")?;
         app.set_page_size(view.page_size());
         app.set_help_rows(view.help_rows());
+        app.set_spectrum_layout(view.spectrum_fits(), view.spectrum_bars());
 
         // A resize needs no handling here: `draw` adapts to the new size on
         // the next frame, which follows immediately.
-        if event::poll(FRAME).context("cannot read terminal input")? {
+        let deadline = next_deadline(frame_start, app.visualizer_animating());
+        let wait = wait_until(deadline, Instant::now());
+        if event::poll(wait).context("cannot read terminal input")? {
             for _ in 0..MAX_EVENTS_PER_FRAME {
                 if let Event::Key(key) = event::read().context("cannot read terminal input")? {
                     app.handle_key(key);
@@ -342,4 +367,36 @@ mod stderr {
     }
 
     pub use imp::{restore, silence};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec *Animating*: at least 25 frames a second.
+    #[test]
+    fn animating_frames_are_frequent_enough() {
+        let start = Instant::now();
+        assert_eq!(next_deadline(start, true) - start, ANIMATION_FRAME);
+        assert!(ANIMATION_FRAME < Duration::from_secs(1) / 25);
+    }
+
+    /// Spec *Idle*: no more often than four times a second.
+    #[test]
+    fn idle_frames_are_no_more_than_four_a_second() {
+        let start = Instant::now();
+        assert_eq!(next_deadline(start, false) - start, FRAME);
+        assert!(FRAME >= Duration::from_secs(1) / 4);
+    }
+
+    #[test]
+    fn wait_counts_down_to_the_deadline_and_never_below_zero() {
+        let start = Instant::now();
+        let deadline = next_deadline(start, true);
+        assert_eq!(wait_until(deadline, start), ANIMATION_FRAME);
+        let later = start + Duration::from_millis(10);
+        assert_eq!(wait_until(deadline, later), Duration::from_millis(23));
+        let late = start + Duration::from_millis(500);
+        assert_eq!(wait_until(deadline, late), Duration::ZERO, "already passed");
+    }
 }

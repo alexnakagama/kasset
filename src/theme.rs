@@ -2,6 +2,13 @@
 //! with these roles only and holds no colour or emphasis of its own, so
 //! each colour keeps one meaning across the whole screen.
 //!
+//! Roles: [`PLAYING`] (green), the selections ([`SELECTED_FOCUSED`],
+//! [`SELECTED_UNFOCUSED`]), the pane borders and titles ([`BORDER_FOCUSED`],
+//! [`TITLE_FOCUSED`], [`BORDER_UNFOCUSED`]), [`DIM`] text, [`ERROR`] (red),
+//! [`PAUSED`] (yellow), [`STOPPED`], [`PROGRESS`] (cyan, like the focused
+//! border: both mark what is active), [`SPECTRUM`] (magenta), and the
+//! colourless [`STRONG`], [`HEADER`], [`SECTION`] and [`MESSAGE`].
+//!
 //! Invariants:
 //! - Only the terminal's named ANSI colours are used, so the scheme follows
 //!   the user's terminal theme.
@@ -47,6 +54,10 @@ pub const STOPPED: Style = DIM.add_modifier(Modifier::BOLD);
 
 /// The filled part of the progress bar.
 pub const PROGRESS: Style = Style::new().fg(Color::Cyan);
+
+/// The spectrum strip's bars. Their height carries the information, so the
+/// colour is decoration only; magenta is used by nothing else.
+pub const SPECTRUM: Style = Style::new().fg(Color::Magenta);
 
 /// Text that stands out without a colour: popup titles, the playing title,
 /// the search prompt.
@@ -105,6 +116,30 @@ mod tests {
     fn unfocused_border_is_not_dark_gray() {
         assert_ne!(BORDER_UNFOCUSED.fg, Some(Color::DarkGray));
         assert_ne!(border(true), border(false));
+    }
+
+    #[test]
+    fn spectrum_colour_has_no_other_meaning() {
+        assert_eq!(SPECTRUM.fg, Some(Color::Magenta));
+        for other in [
+            PLAYING,
+            SELECTED_FOCUSED,
+            SELECTED_UNFOCUSED,
+            BORDER_FOCUSED,
+            TITLE_FOCUSED,
+            BORDER_UNFOCUSED,
+            DIM,
+            ERROR,
+            PAUSED,
+            STOPPED,
+            PROGRESS,
+            STRONG,
+            HEADER,
+            SECTION,
+            MESSAGE,
+        ] {
+            assert_ne!(other.fg, SPECTRUM.fg, "{other:?}");
+        }
     }
 
     #[test]
