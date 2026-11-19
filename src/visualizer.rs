@@ -155,7 +155,8 @@ impl Spectrum {
     fn measure(&mut self, samples: &[f32], rate: u32, bars: usize) {
         // The window's mean (DC offset) is removed first: under the Hann window
         // it would leak into bins 0 and 1, which the lowest bands use at high
-        // sample rates, and light them up with no audible content.
+        // sample rates, and light them up with no audible content. Only a
+        // constant offset is removed; slow drift within the frame still leaks.
         let mean = samples.iter().copied().map(sanitize).sum::<f32>() / to_f32(FFT_SIZE);
         for ((slot, &sample), &weight) in self.buffer.iter_mut().zip(samples).zip(&self.window) {
             *slot = Complex::new((sanitize(sample) - mean) * weight, 0.0);
@@ -572,7 +573,7 @@ mod tests {
     #[test]
     fn the_lowest_bar_ignores_dc_at_high_rates() {
         // A DC offset alone (no audible content) must not light up bar 0.
-        for rate in [176_400, 192_000] {
+        for rate in [88_200, 96_000, 176_400, 192_000] {
             let spectrum = measured(&vec![0.5; FFT_SIZE], rate, 32);
             assert!(
                 spectrum.levels()[0] < 0.1,
