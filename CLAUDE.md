@@ -43,6 +43,7 @@ Layering, from pure logic outward:
 - `keys.rs` — the single key table `GROUPS` (D7) feeding `--help` (`help_text`), the help overlay (`help_lines`) and the key bar (`bar(BarContext)`).
 - `theme.rs` — style roles (D8): `PLAYING`, `SELECTED_FOCUSED`/`SELECTED_UNFOCUSED`, `BORDER_*`, `DIM`, `ERROR`, … Named ANSI colours only; each colour has one meaning.
 - `terminal.rs` — raw mode / alt screen setup and restore on every exit path (quit, error, signal, panic); redirects fd 2 to `/dev/null` while the UI is up so ALSA can't print over it. A second identical signal is an emergency exit.
+- `visualizer.rs` — pure spectrum analysis (`rustfft`): `Spectrum::update(samples+rate, bars, now)` windows the newest `FFT_SIZE` (2048) mono samples, takes peak magnitudes in log-spaced bands from 40 Hz to `min(16 kHz, rate/2)`, maps −60…0 dB to 0…1; bars rise at once and fall linearly over `FALL_TIME` (1 s); a bar-count change resets the levels (count clamped to `MAX_BARS`). DC offset is removed and bin 0 never used. Levels are always finite and in `0..=1`. Until groups 2–4 wire it in, `main.rs` gates it with `cfg_attr(not(test), expect(dead_code))`; remove that once it is used.
 - `library.rs` — recursive discovery (`walkdir`, skips unreadable dirs, broken links, loops; dedupes hard links by `(dev, ino)`), tag reading with file-name fallback, sorting.
 
 ## Testing conventions
@@ -56,6 +57,6 @@ Layering, from pure logic outward:
 Features are specified and tracked with OpenSpec (`openspec/`, skills under `.claude/skills/`, commands `/opsx:propose|apply|update|sync|archive|explore`).
 
 - Current specs: `openspec/specs/{audio-playback,music-library,player-tui,playlists}/spec.md`.
-- No active change. The playlists design decisions (D1–D9) referenced in code live in `openspec/changes/archive/2026-11-17-add-playlists/design.md`. In a change, `tasks.md` tracks progress by task group; mark tasks `[x]` as they are completed and verified.
+- Active change: `add-visualizer` (spectrum strip above the now-playing area; see its `design.md` D1–D9). The playlists design decisions (D1–D9) referenced in code live in `openspec/changes/archive/2026-11-17-add-playlists/design.md`. In a change, `tasks.md` tracks progress by task group; mark tasks `[x]` as they are completed and verified.
 - Archived changes live in `openspec/changes/archive/`.
 - When adding or changing keys, update `keys::GROUPS` in `src/keys.rs` (it feeds `--help`, the help overlay and the key bar) and the README keys tables together.

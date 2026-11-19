@@ -4,8 +4,8 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 1. Spectrum analysis (`Cargo.toml`, new `src/visualizer.rs`)
 
-- [ ] 1.1 Add `rustfft = "6.4"` to `[dependencies]`. Run `cargo metadata --format-version 1` and check that no package in the tree has a `rust-version` above 1.89 (D8). Verify with `cargo +1.89 build` and a clean `cargo build`. If the check finds a higher MSRV, stop and raise it before continuing.
-- [ ] 1.2 Add `src/visualizer.rs` with a `//!` doc stating its role and invariants (pure, no audio or terminal code, deterministic given `now`). Implement `Spectrum` as in D3:
+- [x] 1.1 Add `rustfft = "6.4"` to `[dependencies]`. Run `cargo metadata --format-version 1` and check that no package in the tree has a `rust-version` above 1.89 (D8). Verify with `cargo +1.89 build` and a clean `cargo build`. If the check finds a higher MSRV, stop and raise it before continuing.
+- [x] 1.2 Add `src/visualizer.rs` with a `//!` doc stating its role and invariants (pure, no audio or terminal code, deterministic given `now`). Implement `Spectrum` as in D3:
   - `pub const FFT_SIZE` = 2048 (also used by `player.rs`), a Hann window, and FFT planning with `FftPlanner::<f32>::new().plan_fft_forward`;
   - bin magnitudes as `2 · |X[k]| / Σw`, so a full-scale sine reads about 0 dB;
   - log-spaced bands from 40 Hz to `min(16 kHz, rate / 2)`, peak magnitude per band, centre-bin rule for bands narrower than one bin;
@@ -48,7 +48,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 - [ ] 3.1 Add the `Visualizer` state to `App` (D4): `on` (initially `true`), `spectrum`, the fed-back `fits` and `bars`, and a reusable sample buffer.
   - Add `set_spectrum_layout(fits, bars)`, `visualizer_on()`, `spectrum_levels()` and `visualizer_animating()`.
-  - In `tick`, update the spectrum only when `on && fits && bars > 0`. Pass samples only while `PlayState::Playing` and `written` has advanced within `STALE_AFTER` (250 ms); otherwise pass `None`. When the pane is not shown, reset the levels instead.
+  - In `tick`, update the spectrum only when `on && fits && bars > 0`. Pass samples only while `PlayState::Playing` and `written` has advanced within `STALE_AFTER` (250 ms); otherwise pass `None`. When the strip is not shown, reset the levels instead.
   - Update the `app.rs` `//!` doc.
 
   Verify with tests using `ToneAudio` and an injected `Instant`:
@@ -60,13 +60,13 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - when `ToneAudio` stops advancing `written` while `Playing`, the levels fall to idle after `STALE_AFTER`.
 - [ ] 3.2 Handle `v` in Normal mode from either pane:
   - it toggles `on`;
-  - while `!fits`, it notifies as `Level::Info`: "visualizer on: needs a terminal at least 110 columns wide" when turning it on, "visualizer off" when turning it off;
-  - while the pane is visible, it shows no notice.
+  - while `!fits`, it notifies as `Level::Info`: "visualizer on: needs a terminal at least 24 rows tall" when turning it on, "visualizer off" when turning it off;
+  - while the strip is visible, it shows no notice.
 
   Verify with key-sequence tests:
   - `v` `v` toggles off and on (spec *Hide and show*, state level);
-  - from off, `v` with `fits` false gives the "on" notice and leaves `on` true (spec *Turned on while too narrow*);
-  - from on, `v` with `fits` false gives the "off" notice (spec *Turned off while too narrow*);
+  - from off, `v` with `fits` false gives the "on" notice and leaves `on` true (spec *Turned on while too short*);
+  - from on, `v` with `fits` false gives the "off" notice (spec *Turned off while too short*);
   - `v` with `fits` true gives no notice;
   - `/` then `v` adds `v` to the query and leaves `on` unchanged (spec *Not while typing*);
   - `v` in the help overlay and in a prompt keeps that mode's existing behaviour.
@@ -76,22 +76,23 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - a new test shows `help_text()` and `help_lines()` contain `v` and "show / hide the visualizer" (spec *Listed in the help*);
   - `cargo run -- --help` lists it.
 
-## 4. Spectrum pane and frame rate (`src/ui.rs`, `src/theme.rs`, `src/terminal.rs`, `README.md`)
+## 4. Spectrum strip and frame rate (`src/ui.rs`, `src/theme.rs`, `src/terminal.rs`, `README.md`)
 
 - [ ] 4.1 Add `theme::SPECTRUM` (magenta) with a doc comment, and update the `theme.rs` `//!` doc's list of roles. Verify that `cargo test` covers the theme invariants already there, and that no `Color` appears in `ui.rs` outside tests.
-- [ ] 4.2 Implement the three-pane layout (D5): `THREE_PANE_MIN_WIDTH` = 110, `SPECTRUM_WIDTH` = (26, 40), and the pane with the unfocused border, title " Spectrum ", 1-column bars with 1-column gaps (`bars = (inner_width + 1) / 2`, drawing `min(levels.len(), bars)`), `█` fill and `▁…▇` tops in `theme::SPECTRUM`. Add `spectrum_fits` / `spectrum_bars` to `ui::View`, and feed them back with `app.set_spectrum_layout` in `terminal::event_loop`, next to `set_page_size`. Update the `ui.rs` `//!` doc. Verify with `TestBackend` tests:
-  - at 120 columns, three panes left to right (spec *Three panes visible*, *Pane shown on a wide terminal*);
-  - at 100 columns, two panes and `spectrum_fits` false (spec *Too narrow for the spectrum*);
-  - at 60 columns, one pane;
-  - after `v`, the pane is gone and the main pane is wider (spec *Hide and show*);
-  - resizing from 120 to 90 and back hides and restores the pane while `on` stays true (spec *Narrowing the terminal*);
+- [ ] 4.2 Implement the spectrum strip (D5): `SPECTRUM_HEIGHT` = 6 and `SPECTRUM_MIN_HEIGHT` = 24. Split the body into `[panes, strip]` when the visualizer is on and the terminal is at least 24 rows tall; draw the panes into `panes` with the existing width rules; keep popups centred over the whole body. The strip spans the full width, with the unfocused border, title " Spectrum ", 1-column bars with 1-column gaps (`bars = (inner_width + 1) / 2`, drawing `min(levels.len(), bars)`), `█` fill and `▁…▇` tops in `theme::SPECTRUM`. Add `spectrum_fits` / `spectrum_bars` to `ui::View`, and feed them back with `app.set_spectrum_layout` in `terminal::event_loop`, next to `set_page_size`. Update the `ui.rs` `//!` doc and its line in `CLAUDE.md`. Verify with `TestBackend` tests:
+  - at 80×30, two panes with the strip below them spanning the full width, above the now-playing area (spec *Strip shown on a tall terminal*, *Spectrum strip visible*);
+  - at 80×20, no strip and `spectrum_fits` false (spec *Too short for the strip*);
+  - at 60×30, one pane with the strip below it (spec *Shown in the one-pane layout*);
+  - after `v`, the strip is gone and the panes are taller (spec *Hide and show*);
+  - resizing from 30 to 20 rows and back hides and restores the strip while `on` stays true (spec *Shortening the terminal*);
   - given levels of 0, 0.5 and 1 draw an empty column, a half-height bar with the correct partial glyph, and a full bar;
   - `spectrum_bars` equals `(inner_width + 1) / 2`;
-  - drawing at 120 columns and then at 140 without a tick neither panics nor draws stray glyphs;
-  - `Tab` twice never focuses the spectrum pane (spec *Tab skips the pane*);
-  - every existing `ui.rs` test below 110 columns passes unchanged.
+  - drawing at 100 columns and then at 140 without a tick neither panics nor draws stray glyphs;
+  - a popup (the picker) is centred over the panes and the strip together;
+  - `Tab` twice never focuses the spectrum strip (spec *Tab skips the strip*);
+  - every existing `ui.rs` test passes unchanged, including those drawn at 24 rows or more (picker 60×24, help overlay 100×50, 120×50, 40×60, 80×30). If one depends on the panes' height, stop and raise it.
 - [ ] 4.3 Add `ANIMATION_FRAME` (33 ms) and a pure `next_deadline(frame_start, animating) -> Instant` to `terminal.rs`. In `event_loop`, poll for input until that deadline instead of a fixed `FRAME`, using `app.visualizer_animating()` (D6). Update the `terminal.rs` `//!` doc. Verify with unit tests: the deadline is 33 ms after the frame start while animating and `FRAME` after it otherwise, and a deadline already passed polls with zero (spec *Animating*, *Idle*).
-- [ ] 4.4 Describe the spectrum pane in the README's description of the screen, next to the two-pane layout: when it appears, `v`, and what the bars show. Verify by reading it against the specs.
+- [ ] 4.4 Describe the spectrum strip in the README's description of the screen, next to the two-pane layout: when it appears, `v`, and what the bars show. Verify by reading it against the specs.
 
 ## 5. Integration checks
 
@@ -100,7 +101,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - Space makes them fall to zero within about a second;
   - `n` and seeking do not show the old track's spectrum;
   - lowering the volume does not shrink them;
-  - narrowing the window below 110 columns hides the pane and widening restores it;
+  - shortening the window below 24 rows hides the strip and making it taller restores it;
   - `v` hides and shows it;
   - the bars do not flicker while playing, which would mean `STALE_AFTER` is too short for this device's buffer.
 

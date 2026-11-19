@@ -17,7 +17,7 @@ The parts of the current code that shape the approach:
 **Goals:**
 - Never block or allocate per sample on the audio thread.
 - Keep the analysis a pure, deterministic module, testable with synthetic signals and an injected clock, like `queue.rs`.
-- Cost nothing when the pane is not shown: no FFT, no fast redraw.
+- Cost nothing when the strip is not shown: no FFT, no fast redraw.
 
 **Non-Goals:**
 - Sample-accurate sync with the speakers. The device buffer delay (tens of ms) is accepted.
@@ -125,39 +125,41 @@ pub fn update(&mut self, input: Option<(&[f32], u32)>, bars: usize, now: Instant
 
 `App::tick(now)` updates the spectrum only when `on && fits && bars > 0`. It passes the samples only while `playback.state()` is `Playing` and new audio is arriving, and `None` otherwise. Paused, stopped, idle and stalled tracks therefore all fall to zero (spec: *Bars follow playback state*).
 
-`Visualizer` keeps the last `written` value and the `Instant` it last changed. If `written` has not advanced for `STALE_AFTER` (250 ms), the tap is stale and `None` is passed. `Guarded::next` runs inside the device callback, so `written` advances in bursts of one callback's worth of audio. 250 ms (the idle frame) leaves room for large ALSA, CoreAudio or WASAPI buffers, and the 1 s fall makes the extra delay harmless. It is a single constant, tuned in the 5.1 check if bars flicker. This covers a decoder that has ended before `Playback::tick` notices, and an output device that stopped pulling. Without it, the bars would freeze on the last window instead of falling. When the pane is not shown, the spectrum is not updated at all: no FFT runs. Its levels are reset, so the bars do not show a stale frame when the pane comes back.
+`Visualizer` keeps the last `written` value and the `Instant` it last changed. If `written` has not advanced for `STALE_AFTER` (250 ms), the tap is stale and `None` is passed. `Guarded::next` runs inside the device callback, so `written` advances in bursts of one callback's worth of audio. 250 ms (the idle frame) leaves room for large ALSA, CoreAudio or WASAPI buffers, and the 1 s fall makes the extra delay harmless. It is a single constant, tuned in the 5.1 check if bars flicker. This covers a decoder that has ended before `Playback::tick` notices, and an output device that stopped pulling. Without it, the bars would freeze on the last window instead of falling. When the strip is not shown, the spectrum is not updated at all: no FFT runs. Its levels are reset, so the bars do not show a stale frame when the strip comes back.
 
 `v` in Normal mode, from either pane, flips `on`. While `!fits`, the change cannot be seen, so `v` also calls `notify` with an `Info` notice:
-- turning it on: "visualizer on: needs a terminal at least 110 columns wide";
+- turning it on: "visualizer on: needs a terminal at least 24 rows tall";
 - turning it off: "visualizer off".
 
-When the pane is visible, the change speaks for itself and no notice is shown. In Search and in the prompts, `v` keeps its current meaning (typed text, or "any other key"), because those modes handle keys before Normal-mode dispatch.
+When the strip is visible, the change speaks for itself and no notice is shown. In Search and in the prompts, `v` keeps its current meaning (typed text, or "any other key"), because those modes handle keys before Normal-mode dispatch.
 
 New read-only accessors for `ui.rs` and `terminal.rs`:
 - `visualizer_on()`;
 - `spectrum_levels() -> &[f32]`;
 - `visualizer_animating()`: `on && fits && (state == Playing || !spectrum.is_idle())`.
 
-### D5. Layout: three panes from 110 columns
+### D5. Layout: a full-width strip from 24 rows
 
 `ui.rs` gains:
-- `THREE_PANE_MIN_WIDTH: u16 = 110`;
-- `SPECTRUM_WIDTH: (u16, u16) = (26, 40)`, sized like the sidebar: `body_width / 4`, clamped.
+- `SPECTRUM_HEIGHT: u16 = 6`: the strip's height, a border and 4 rows of bars;
+- `SPECTRUM_MIN_HEIGHT: u16 = 24`: the smallest terminal height that shows it.
 
-At 110 columns the layout is sidebar 27, main 56, spectrum 27; the main pane is never narrower than in a 70-column two-pane layout.
+At 24 rows the panes keep 13 rows (24 − 6 for the strip − 3 now-playing − 1 status − 1 key bar), with 11 list rows inside their borders. That is enough for the track list to stay usable.
 
-`render_body` picks the layout:
-- `width >= 110 && app.visualizer_on()`: three panes;
-- `width >= 70`: two panes, as today;
-- otherwise one pane, as today.
+`render` splits the screen vertically. It already uses `[body, now-playing, status, keys]`, and `body` becomes `[panes, strip]` when `app.visualizer_on() && height >= SPECTRUM_MIN_HEIGHT`, and stays the whole body otherwise. `render_body` draws the panes into `panes` exactly as today: two panes from `TWO_PANE_MIN_WIDTH` (70) columns, else only the focused pane. The width rules do not change, and the strip shows at every width.
 
-The spectrum pane:
+Popups (picker, name prompt, delete confirmation) keep centring over the whole body, panes and strip together. They therefore have the same room as in 0.2.0, and the existing popup tests at 24 or more rows see the same positions. The `?` overlay already covers everything above the status line and is unchanged.
+
+The spectrum strip:
 - always uses the unfocused border style, since it never has focus, with the title " Spectrum ";
+- spans the full terminal width;
 - draws bars 1 column wide with a 1-column gap between them, so `bars = (inner_width + 1) / 2`. These use `2 · bars − 1` columns, which fills an odd width exactly and leaves one empty column at the right of an even one;
 - draws `min(levels.len(), bars)` bars, so the first frame after a resize, drawn before the new bar count reaches `App`, cannot index out of range. On the next tick the levels are reset to the new count, and they rise again at once;
 - fills each bar from the bottom: full rows are `█`, and the top cell is one of `▁▂▃▄▅▆▇` from `level * rows * 8` eighths.
 
-`ui::View` gains `spectrum_fits: bool` (`body width >= 110`, whether or not the pane is on) and `spectrum_bars: usize` (0 when not drawn). `terminal::event_loop` feeds both back with `app.set_spectrum_layout(fits, bars)`, next to `set_page_size`. `fits` is recorded even while the pane is off, so `v` can tell whether the pane would appear.
+`ui::View` gains `spectrum_fits: bool` (terminal height `>= SPECTRUM_MIN_HEIGHT`, whether or not the strip is on) and `spectrum_bars: usize` (0 when not drawn). `terminal::event_loop` feeds both back with `app.set_spectrum_layout(fits, bars)`, next to `set_page_size`. `fits` is recorded even while the strip is off, so `v` can tell whether the strip would appear. `page_size` keeps being measured from the drawn pane, so it already accounts for the rows the strip takes.
+
+- *Alternative: a third pane to the right of the main pane, from 110 columns.* Rejected after review. It only shows on wide terminals, and it puts the visualizer far from the now-playing area it belongs with. The strip shows at every width and costs rows, which tall terminals have to spare.
 
 ### D6. Frame interval follows the visualizer
 
@@ -165,7 +167,7 @@ The spectrum pane:
 
 The loop keeps a deadline, `next_frame`: the time the current frame started plus `ANIMATION_FRAME` while `app.visualizer_animating()`, or plus `FRAME` otherwise. It polls for input until that deadline (zero if it has passed). Polling for a fixed 33 ms after drawing would add the draw time to every frame, leaving no margin over the spec's 25 fps on a slow machine.
 
-- **Idle cost.** When paused, the bars fall for up to a second at 30 fps, then the loop drops back to 250 ms. A hidden pane never speeds it up (spec: *Visualizer refresh rate*).
+- **Idle cost.** When paused, the bars fall for up to a second at 30 fps, then the loop drops back to 250 ms. A hidden strip never speeds it up (spec: *Visualizer refresh rate*).
 - **Other per-tick work.** `App::tick` also runs `playback.tick()` and the status expiry every frame. Both are cheap: `playback.tick()` reads `audio.status()` and makes at most a bounded number of retries per call. Retries and failure counting are per tick, so a run of unplayable tracks is skipped about 7 times faster while animating. Animation only runs while a track is playing, so this rarely matters, and the skip limit still holds.
 - **Redraw cost.** ratatui only sends changed cells, so 30 fps over SSH is a few hundred bytes per frame.
 
@@ -199,20 +201,22 @@ The deadline is computed by a pure function, `next_deadline(frame_start: Instant
   - `written` grows by each flushed batch.
 - **`app.rs`:** key sequences with `ToneAudio`:
   - `v` toggles;
-  - `v` while `!fits` gives the "on" or "off" notice, and gives none while the pane is visible;
+  - `v` while `!fits` gives the "on" or "off" notice, and gives none while the strip is visible;
   - `v` during search is typed;
   - pause makes the levels fall to idle;
   - a `ToneAudio` that stops advancing `written` while still `Playing` makes the levels fall after `STALE_AFTER`;
   - `visualizer_animating` in each state.
 - **`ui.rs`** (`TestBackend`):
-  - three panes at 120 columns, two at 100, one at 60;
-  - pane hidden after `v`;
+  - at 80×30 the strip spans the full width between the panes and the now-playing area; at 80×20 there is none; at 60×30 one pane with the strip below it;
+  - strip hidden after `v`, and the panes take its rows;
+  - resizing from 30 to 20 rows and back hides and restores it;
   - given levels draw the expected glyph columns;
-  - drawing at 120 columns and then at 140 without a tick neither panics nor draws stray glyphs;
-  - `View` reports `spectrum_fits` and `spectrum_bars`.
+  - drawing at 100 columns and then at 140 without a tick neither panics nor draws stray glyphs;
+  - `View` reports `spectrum_fits` and `spectrum_bars`;
+  - a popup is centred over the panes and the strip together.
 - **`keys.rs` / `cli.rs`:** `v` appears in `help_text` and `help_lines`, and "Help & quit" is still the last group.
 - **`terminal.rs`:** `next_deadline` is 33 ms after the frame start while animating and 250 ms otherwise.
-- **Existing tests:** every one must keep passing unchanged. Layouts below 110 columns are untouched.
+- **Existing tests:** every one must keep passing unchanged. Layouts below 24 rows are untouched. The existing `ui.rs` tests drawn at 24 rows or more (the picker at 60×24, the help overlay at 100×50, 120×50, 40×60 and 80×30) now also get the strip; popups and the overlay are placed as before, so they should pass as they are. If one turns out to depend on the panes' height, stop and raise it rather than edit the test.
 
 ## Risks / Trade-offs
 
@@ -220,7 +224,7 @@ The deadline is computed by a pure function, `next_deadline(frame_start: Instant
 - [The tap loses batches while the UI holds the lock] → The UI holds the lock only to copy 2048 floats. A lost batch only means one slightly older spectrum frame.
 - [The 2048-point window adds about 46 ms of history at 44.1 kHz] → Bars react a little slower than a smaller window would, in exchange for usable bass resolution. Accepted.
 - [Low bands share FFT bins and move together] → Inherent at this window size. The centre-bin rule keeps them stable instead of flickering.
-- [The 30 fps redraw costs CPU while playing] → It only happens with the pane visible and audio playing; `v` turns it off. On slow links, ratatui's diff keeps the output small.
+- [The 30 fps redraw costs CPU while playing] → It only happens with the strip visible and audio playing; `v` turns it off. On slow links, ratatui's diff keeps the output small.
 - [More compile time and binary size from `rustfft` and its dependencies] → The crates are small and have no C code. Release builds on all 5 targets are re-checked by the PR dry run, since `Cargo.toml` changes.
 - [Clippy pedantic cast lints in numeric code] → Casts are kept in a few documented helpers with narrowly scoped `allow`s, not a module-wide allow.
 
@@ -230,4 +234,4 @@ Nothing to migrate: no stored data or settings change, and no key changes meanin
 
 ## Open Questions
 
-- The exact spectrum width clamp `(26, 40)` and the colour (magenta) can be tuned after trying it in a real terminal, without spec changes.
+- The colour (magenta) can be tuned after trying it in a real terminal, without spec changes. The strip height (6) and the 24-row threshold are in the spec, so changing them needs a spec update.
