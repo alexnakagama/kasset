@@ -15,6 +15,11 @@ mod test_support;
 mod text;
 mod theme;
 mod ui;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into App and the UI in task groups 2 to 4")
+)]
+mod visualizer;
 
 use std::process::ExitCode;
 
