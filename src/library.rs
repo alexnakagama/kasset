@@ -1,19 +1,23 @@
-//! Discovering audio files under the library root and reading their metadata.
+//! Discovering audio files under the library root and reading their metadata
+//! (and, on demand, one track's lyrics tag). Files are opened without
+//! blocking and must be regular files; lofty runs inside `panic_guard::quietly`.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::Metadata;
+use std::io::BufReader;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use lofty::config::ParseOptions;
-use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
+use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
 use lofty::probe::Probe;
-use lofty::tag::{Accessor, Tag};
+use lofty::tag::{Accessor, ItemKey, Tag};
 use walkdir::WalkDir;
 
+use crate::bounded_read::open_regular;
 use crate::panic_guard::quietly;
 use crate::text::{display_path, sanitize};
 
@@ -165,7 +169,7 @@ pub fn discover(root: &Path) -> Result<Discovery> {
 /// Each field is taken from the first tag that has it, primary tag first.
 #[must_use]
 pub fn read_track(path: PathBuf) -> Track {
-    let tagged = read_tagged(&path);
+    let tagged = read_tagged(&path, scan_options());
     let tags = tagged.as_ref().map(ordered_tags).unwrap_or_default();
 
     let title = tag_text(&tags, Accessor::title).unwrap_or_else(|| title_from_path(&path));
@@ -218,20 +222,60 @@ pub fn sort_tracks(tracks: &mut [Track]) {
     });
 }
 
-/// Parses `path` with lofty. Any failure — including a panic inside the parser
-/// on a malformed file — is treated as "no metadata".
-fn read_tagged(path: &Path) -> Option<TaggedFile> {
+/// The raw lyrics stored in the tags of the file at `path`: from the first tag
+/// (primary tag first) that has any, its `ItemKey::Lyrics` text, else its
+/// `ItemKey::UnsyncLyrics` text (`ID3v2` `USLT`, Vorbis `UNSYNCEDLYRICS`). `None` if the file has
+/// none or cannot be parsed.
+///
+/// The text is **not** sanitised, so its line breaks survive; it is untrusted
+/// and every line must go through [`crate::lyrics::parse`] (which sanitises)
+/// before it is shown. Lofty caps each allocation (16 MiB by default).
+#[must_use]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the lyrics pane from task group 3")
+)]
+pub fn lyrics_tag(path: &Path) -> Option<String> {
+    // Only the tags are needed: no cover art, no audio properties.
+    let options = ParseOptions::new()
+        .read_cover_art(false)
+        .read_properties(false);
+    let tagged = read_tagged(path, options)?;
+    ordered_tags(&tagged)
+        .into_iter()
+        .find_map(|tag| {
+            [ItemKey::Lyrics, ItemKey::UnsyncLyrics]
+                .into_iter()
+                .find_map(|key| tag.get_string(key).filter(|s| !s.trim().is_empty()))
+        })
+        .map(str::to_owned)
+}
+
+/// Options for reading a track's metadata during the scan.
+fn scan_options() -> ParseOptions {
     // Cover art is never displayed; skipping it avoids large allocations.
     // Lofty additionally caps every allocation (16 MiB by default).
-    let options = ParseOptions::new().read_cover_art(false);
+    ParseOptions::new().read_cover_art(false)
+}
+
+/// Parses `path` with lofty using `options`. Any failure — including a panic
+/// inside the parser on a malformed file — is treated as "no metadata".
+///
+/// The file is opened with [`open_regular`] and must be a regular file, so a
+/// track replaced by a FIFO or a device after the scan never blocks the
+/// caller. The type is guessed from the content, else from the extension (as
+/// `Probe::open` does).
+fn read_tagged(path: &Path, options: ParseOptions) -> Option<TaggedFile> {
     let parse = || {
-        Probe::open(path)
-            .ok()?
-            .options(options)
-            .guess_file_type()
-            .ok()?
-            .read()
-            .ok()
+        let file = open_regular(path).ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut probe = Probe::new(BufReader::new(file)).options(options);
+        if let Some(file_type) = FileType::from_path(path) {
+            probe = probe.set_file_type(file_type);
+        }
+        probe.guess_file_type().ok()?.read().ok()
     };
     // The closure only touches `path` and owned locals, so no broken invariant
     // can be observed after an unwind. Requires `panic = "unwind"` (Cargo.toml).
@@ -525,6 +569,125 @@ mod tests {
         assert_eq!(t.artist, "Ba [31mnd");
         assert_eq!(t.album, "LP");
         assert_eq!(t.number, Some(7));
+        Ok(())
+    }
+
+    /// Writes `tag` into a fresh temp file holding `bytes`, named `name`.
+    fn tagged_copy(
+        tmp: &tempfile::TempDir,
+        name: &str,
+        bytes: &[u8],
+        tag: &Tag,
+    ) -> Result<PathBuf> {
+        use lofty::config::WriteOptions;
+        use lofty::tag::TagExt;
+
+        let path = tmp.path().join(name);
+        fs::write(&path, bytes)?;
+        tag.save_to_path(&path, WriteOptions::default())?;
+        Ok(path)
+    }
+
+    #[test]
+    fn vorbis_lyrics_round_trip_with_newlines() -> Result<()> {
+        use crate::test_support::flac_bytes;
+        use lofty::tag::TagType;
+
+        let tmp = tempfile::tempdir()?;
+        let text = "[00:01.00]One\n[00:02.00]Two\r\nThree";
+        let mut tag = Tag::new(TagType::VorbisComments);
+        tag.insert_text(ItemKey::Lyrics, text.to_owned());
+        let path = tagged_copy(&tmp, "song.flac", &flac_bytes(), &tag)?;
+        assert_eq!(lyrics_tag(&path).as_deref(), Some(text));
+        Ok(())
+    }
+
+    #[test]
+    fn id3v2_uslt_round_trips() -> Result<()> {
+        use lofty::tag::TagType;
+
+        let tmp = tempfile::tempdir()?;
+        let text = "First line\nSecond line";
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_text(ItemKey::UnsyncLyrics, text.to_owned());
+        let path = tagged_copy(&tmp, "song.wav", &wav_bytes(), &tag)?;
+        assert_eq!(lyrics_tag(&path).as_deref(), Some(text));
+        Ok(())
+    }
+
+    #[test]
+    fn lyrics_prefer_the_lyrics_key_over_unsynced() -> Result<()> {
+        use crate::test_support::flac_bytes;
+        use lofty::tag::TagType;
+
+        let tmp = tempfile::tempdir()?;
+        let mut tag = Tag::new(TagType::VorbisComments);
+        tag.insert_text(ItemKey::UnsyncLyrics, "unsynced".to_owned());
+        tag.insert_text(ItemKey::Lyrics, "[00:01.00]synced".to_owned());
+        let path = tagged_copy(&tmp, "song.flac", &flac_bytes(), &tag)?;
+        assert_eq!(lyrics_tag(&path).as_deref(), Some("[00:01.00]synced"));
+        Ok(())
+    }
+
+    #[test]
+    fn primary_tag_wins_over_a_later_tags_lyrics_key() -> Result<()> {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{TagExt, TagType};
+
+        // An MP3's primary tag is ID3v2, which only has `UnsyncLyrics`; its
+        // APE tag is secondary and holds `Lyrics`. The primary tag wins.
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("song.mp3");
+        fs::write(&path, crate::test_support::mp3_bytes())?;
+        let mut ape = Tag::new(TagType::Ape);
+        ape.insert_text(ItemKey::Lyrics, "secondary".to_owned());
+        ape.save_to_path(&path, WriteOptions::default())?;
+        let mut id3 = Tag::new(TagType::Id3v2);
+        id3.insert_text(ItemKey::UnsyncLyrics, "primary".to_owned());
+        id3.save_to_path(&path, WriteOptions::default())?;
+        assert_eq!(lyrics_tag(&path).as_deref(), Some("primary"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_track_is_not_opened() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("pipe.flac");
+        if !crate::test_support::make_fifo(&path) {
+            return Ok(()); // mkfifo unavailable
+        }
+        assert_eq!(lyrics_tag(&path), None);
+        assert_eq!(read_track(path).title, "pipe");
+        Ok(())
+    }
+
+    #[test]
+    fn file_without_lyrics_has_no_lyrics_tag() -> Result<()> {
+        use lofty::tag::TagType;
+
+        let tmp = tempfile::tempdir()?;
+        let plain = tmp.path().join("plain.wav");
+        fs::write(&plain, wav_bytes())?;
+        assert_eq!(lyrics_tag(&plain), None);
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("Song".to_owned());
+        let titled = tagged_copy(&tmp, "titled.wav", &wav_bytes(), &tag)?;
+        assert_eq!(lyrics_tag(&titled), None);
+        Ok(())
+    }
+
+    #[test]
+    fn garbage_or_missing_file_has_no_lyrics_tag() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        for ext in SUPPORTED_EXTENSIONS {
+            let path = tmp.path().join(format!("junk.{ext}"));
+            fs::write(&path, b"\xff\xfb\x00ID3\x04garbage")?;
+            assert_eq!(lyrics_tag(&path), None, "{ext}");
+        }
+        assert_eq!(lyrics_tag(&tmp.path().join("missing.flac")), None);
+        assert_eq!(lyrics_tag(tmp.path()), None);
         Ok(())
     }
 

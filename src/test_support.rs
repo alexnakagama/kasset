@@ -211,3 +211,40 @@ pub fn no_store() -> Box<dyn crate::playlist::PlaylistStore> {
         "/nonexistent/kasset-test-library",
     )))
 }
+
+/// Creates a named pipe at `path` with the `mkfifo` tool. Returns `false` if
+/// the tool is unavailable, so the calling test can skip itself.
+#[cfg(unix)]
+pub fn make_fifo(path: &std::path::Path) -> bool {
+    std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A minimal FLAC file: the `fLaC` marker and a lone STREAMINFO block (mono,
+/// 44.1 kHz, 16-bit, no audio frames). Enough for lofty to read and write
+/// Vorbis comments.
+pub fn flac_bytes() -> Vec<u8> {
+    let mut v = b"fLaC".to_vec();
+    // Metadata block header: last block, type 0 (STREAMINFO), 34 bytes.
+    v.extend_from_slice(&[0x80, 0x00, 0x00, 34]);
+    v.extend_from_slice(&4096u16.to_be_bytes()); // min block size
+    v.extend_from_slice(&4096u16.to_be_bytes()); // max block size
+    v.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // min / max frame size: unknown
+    // 20 bits sample rate (44 100), 3 bits channels - 1 (0), 5 bits bits per
+    // sample - 1 (15), 36 bits total samples (0).
+    let packed: u64 = (44_100 << 44) | (15 << 36);
+    v.extend_from_slice(&packed.to_be_bytes());
+    v.extend_from_slice(&[0; 16]); // MD5 of the audio: unknown
+    v
+}
+
+/// A minimal MP3 file: a few silent MPEG-1 Layer III frames (128 kbit/s,
+/// 44.1 kHz, mono), enough for lofty to read and write `ID3v2` and APE tags.
+pub fn mp3_bytes() -> Vec<u8> {
+    // Frame length = 144 * 128 000 / 44 100 = 417 bytes (no padding).
+    let mut frame = vec![0xFF, 0xFB, 0x90, 0xC4];
+    frame.resize(417, 0);
+    frame.repeat(4)
+}

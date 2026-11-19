@@ -3,7 +3,9 @@
 //! Pure logic with no I/O: [`parse`] turns the text of an `.lrc` file (or of a
 //! lyrics tag) into [`Lyrics`], and [`Lyrics::current`] / [`Lyrics::next_change`]
 //! answer "which line is sung at this position" and "when does that change".
-//! All of them are pure functions of their inputs.
+//! All of them are pure functions of their inputs. Finding and reading a
+//! track's lyrics (a `.lrc` sidecar, else its tags) is the I/O-doing
+//! [`source`] submodule.
 //!
 //! Format, as read here:
 //! - a line starts with zero or more `[...]` groups. `[mm:ss]`, `[mm:ss.x]`,
@@ -35,6 +37,8 @@
 //! - [`Lyrics::current`] returns the last of several lines with the same time;
 //! - all time arithmetic is checked or saturating, and scanning is linear in
 //!   the input length, so crafted input can never panic, wrap or stall.
+
+pub mod source;
 
 use std::time::Duration;
 

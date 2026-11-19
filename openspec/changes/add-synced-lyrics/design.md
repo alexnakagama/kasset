@@ -150,7 +150,7 @@ The highlight then moves within one input poll of the line's time. That is well 
 
 ## Risks / Trade-offs
 
-- [Lyrics are read on the UI thread; a slow or stalled network mount can freeze the screen while a track starts] → The same mount already freezes the scan and the decoder open. The FIFO-safe open removes the pipe case, and reads are capped at 1 MiB. A background loader is a possible later change if this shows up in practice.
+- [Lyrics are read on the UI thread, the sidecar *and* the tag fallback (lofty parses the track's tags synchronously, each allocation capped at 16 MiB); a slow or stalled network mount can freeze the screen while a track starts] → The same mount already freezes the scan and the decoder open. Both reads use the FIFO-safe, regular-file-only open (`bounded_read::open_regular`, also used by `library::read_tagged`), which removes the pipe and device cases; sidecar reads are capped at 1 MiB and tag text is cut to the same size. A background loader is a possible later change if this shows up in practice.
 - [lofty's generic `Tag` may not expose ID3v2 `USLT` with a language or description as `UnsyncLyrics` in every case] → Task 2 writes real tagged files with lofty in tests (FLAC Vorbis comment, MP4, ID3v2 USLT). If a format does not round-trip, it is documented as unsupported rather than worked around.
 - [Lyrics timing is offset by the audio device's buffer (tens of ms)] → Accepted, as for the visualizer. Users can fix files with `[offset:]`.
 - [A directory listing per track change in huge flat folders] → It happens only when both direct probes miss, and it stops at 10 000 entries.
