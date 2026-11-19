@@ -14,7 +14,7 @@ kasset 0.2.0 has a two-pane layout, but on a wide terminal the track list stretc
   - They fall to zero when playback is paused, stopped or between tracks.
   - Volume changes do not shrink them: the visualizer shows the music, not the output level.
 - **Smooth refresh.** While the pane is shown and a track is playing, the screen redraws about 30 times a second instead of 4. In every other state it keeps today's 250 ms refresh, so an idle kasset uses no more CPU than 0.2.0.
-- **`v` key.** The pane is on by default; `v` hides or shows it. Pressing `v` to show it on a terminal too narrow for it shows a status message saying so, and the pane appears once the terminal is wide enough. The setting lasts until kasset quits. `v` is listed in `kasset --help`, the `?` overlay and the README keys table.
+- **`v` key.** The pane is on by default; `v` hides or shows it. On a terminal too narrow for the pane, where the toggle cannot be seen, `v` shows a status message saying the visualizer is now off, or on but in need of a wider terminal. The pane appears once the terminal is wide enough. The setting lasts until kasset quits. `v` is listed in `kasset --help`, the `?` overlay and the README keys table.
 - The pane never takes keyboard focus: `Tab` still moves only between the sidebar and the main pane.
 - No **BREAKING** changes: no existing key changes meaning, and narrow terminals look the same.
 

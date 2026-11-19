@@ -55,7 +55,7 @@ The bars SHALL fall to zero, with the same gradual motion, when playback is paus
 - **THEN** the bars reflect only the new track's audio once it has started
 
 ### Requirement: Toggle the visualizer
-The visualizer SHALL be on when kasset starts. In Normal mode, from either pane, `v` SHALL turn it off or on. Turning it on while the terminal is too narrow for three panes SHALL show a status message saying the visualizer needs a wider terminal, and the pane SHALL appear once the terminal is wide enough. The setting SHALL last until kasset quits.
+The visualizer SHALL be on when kasset starts. In Normal mode, from either pane, `v` SHALL turn it off or on. While the terminal is too narrow for three panes, `v` SHALL show a status message: that the visualizer is off, or that it is on and needs a wider terminal. The pane SHALL appear once the terminal is wide enough. The setting SHALL last until kasset quits.
 
 #### Scenario: Hide and show
 - **WHEN** the spectrum pane is shown and the user presses `v`
@@ -64,6 +64,10 @@ The visualizer SHALL be on when kasset starts. In Normal mode, from either pane,
 #### Scenario: Turned on while too narrow
 - **WHEN** the terminal is 90 columns wide, the visualizer is off, and the user presses `v`
 - **THEN** the status line says the visualizer needs a wider terminal, and after the terminal is resized to 120 columns the spectrum pane is shown
+
+#### Scenario: Turned off while too narrow
+- **WHEN** the terminal is 90 columns wide, the visualizer is on, and the user presses `v`
+- **THEN** the status line says the visualizer is off, and resizing the terminal to 120 columns shows no spectrum pane
 
 #### Scenario: Not while typing
 - **WHEN** a search is being typed and the user presses `v`
