@@ -607,10 +607,6 @@ impl<A: Audio> App<A> {
 
     /// Records whether the last frame was tall enough for the spectrum strip
     /// and how many bars it drew (0 if none), like [`App::set_page_size`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "fed by the event loop from task group 4")
-    )]
     pub const fn set_spectrum_layout(&mut self, fits: bool, bars: usize) {
         self.visualizer.fits = fits;
         self.visualizer.bars = bars;
@@ -618,10 +614,6 @@ impl<A: Audio> App<A> {
 
     /// Whether the visualizer is on (`v`), whether or not the strip fits.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "drawn by the UI from task group 4")
-    )]
     pub const fn visualizer_on(&self) -> bool {
         self.visualizer.on
     }
@@ -630,10 +622,6 @@ impl<A: Audio> App<A> {
     /// length is the bar count of the last update and may differ from the
     /// bars that fit now (right after a resize).
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "drawn by the UI from task group 4")
-    )]
     pub fn spectrum_levels(&self) -> &[f32] {
         self.visualizer.spectrum.levels()
     }
@@ -641,10 +629,6 @@ impl<A: Audio> App<A> {
     /// Whether the strip is shown and its bars move: a track is playing or a
     /// bar is still falling. The event loop redraws faster while it is.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "sets the frame rate from task group 4")
-    )]
     pub fn visualizer_animating(&self) -> bool {
         let vis = &self.visualizer;
         vis.shown() && (self.playback.state() == PlayState::Playing || !vis.spectrum.is_idle())

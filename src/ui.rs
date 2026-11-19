@@ -11,7 +11,15 @@
 //! only the focused pane is drawn, at full width. The focused pane has the
 //! focused border and the strong selection style ([`theme`]); each pane
 //! keeps its own scroll offset, and the page size fed back to the app is the
-//! focused pane's. Popups are centred over the body.
+//! focused pane's. With the visualizer on and the terminal at least
+//! [`SPECTRUM_MIN_HEIGHT`] rows tall, the bottom [`SPECTRUM_HEIGHT`] rows of
+//! the body are the spectrum strip, across the full width below the panes:
+//! one bar per level, 1 column wide with a 1-column gap, filled from the
+//! bottom in eighths of a row. It never has focus, so it always has the
+//! unfocused border. It draws at most as many bars as fit, so levels
+//! measured for an older width never reach outside it. Whether the strip
+//! fits and how many bars it has are fed back to the app through [`View`].
+//! Popups are centred over the whole body, panes and strip together.
 //!
 //! The key bar and the help overlay are drawn from [`keys`], the single key
 //! table. The bar is cut at whole labels; in Normal mode `? help` keeps its
@@ -58,6 +66,19 @@ pub const TWO_PANE_MIN_WIDTH: u16 = 70;
 /// Shortest terminal, in rows, that shows the spectrum strip (with the
 /// visualizer on). The app also names it in the `v` notice.
 pub const SPECTRUM_MIN_HEIGHT: u16 = 24;
+
+/// Height of the spectrum strip: its border and 4 rows of bars.
+const SPECTRUM_HEIGHT: u16 = 6;
+
+/// The spectrum strip's title.
+const SPECTRUM_TITLE: &str = " Spectrum ";
+
+/// The top cell of a bar, by how many eighths of the cell it fills (1–7);
+/// 8 eighths is [`BAR_FULL`].
+const BAR_EIGHTHS: [&str; 7] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇"];
+
+/// A cell of a bar that is filled completely.
+const BAR_FULL: &str = "█";
 
 /// Narrowest and widest sidebar in the two-pane layout, borders included.
 const SIDEBAR_WIDTH: (u16, u16) = (22, 32);
@@ -198,6 +219,12 @@ pub struct View {
     page_size: usize,
     /// Help lines the overlay showed when last drawn (0 until it is drawn).
     help_rows: usize,
+    /// Whether the last frame was tall enough for the spectrum strip,
+    /// whether or not the visualizer is on.
+    spectrum_fits: bool,
+    /// Bars the spectrum strip had room for in the last frame (0 when it was
+    /// not drawn).
+    spectrum_bars: usize,
 }
 
 impl View {
@@ -219,6 +246,19 @@ impl View {
         } else {
             self.help_rows
         }
+    }
+
+    /// Whether the last frame was tall enough for the spectrum strip.
+    #[must_use]
+    pub const fn spectrum_fits(&self) -> bool {
+        self.spectrum_fits
+    }
+
+    /// Bars the spectrum strip had room for in the last frame (0 when it was
+    /// not drawn).
+    #[must_use]
+    pub const fn spectrum_bars(&self) -> usize {
+        self.spectrum_bars
     }
 }
 
@@ -251,7 +291,18 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
     ])
     .areas(frame.area());
 
-    render_body(frame, app, view, body);
+    view.spectrum_fits = frame.area().height >= SPECTRUM_MIN_HEIGHT;
+    let panes = if app.visualizer_on() && view.spectrum_fits {
+        let [panes, strip] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(SPECTRUM_HEIGHT)])
+                .areas(body);
+        view.spectrum_bars = render_spectrum(frame, app.spectrum_levels(), strip);
+        panes
+    } else {
+        view.spectrum_bars = 0;
+        body
+    };
+    render_body(frame, app, view, panes);
     render_now_playing(frame, app, playing);
     render_status(frame, app, status, now);
     render_key_bar(frame, bar_context(app), keys);
@@ -324,6 +375,58 @@ fn render_body<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, area:
             Focus::Main => render_main(frame, app, &mut view.main_offset, area, focus),
         }
     };
+}
+
+/// How many bars fit `columns` inner columns: 1 column each, with a
+/// 1-column gap between two bars.
+fn spectrum_bar_count(columns: u16) -> usize {
+    usize::from(columns).div_ceil(2)
+}
+
+/// How many eighths of a cell a bar `rows` rows tall fills at `level`
+/// (clamped to `0.0..=1.0`, so infinities draw an empty or a full bar; NaN
+/// draws nothing), rounded to the nearest eighth.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is a whole number in 0..=rows * 8 (at most 524 280), \
+              which every usize holds and an f32 represents exactly"
+)]
+fn bar_eighths(level: f32, rows: u16) -> usize {
+    if level.is_nan() {
+        return 0;
+    }
+    (level.clamp(0.0, 1.0) * f32::from(rows) * 8.0).round() as usize
+}
+
+/// Draws the spectrum strip in `area`: one bar per level, lowest band on
+/// the left, as many as fit. Returns how many bars fit.
+fn render_spectrum(frame: &mut Frame, levels: &[f32], area: Rect) -> usize {
+    let (border, title) = theme::border(false);
+    let block = Block::bordered()
+        .border_style(border)
+        .title(Span::styled(SPECTRUM_TITLE, title));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let bars = spectrum_bar_count(inner.width);
+    let rows = inner.height;
+    let buffer = frame.buffer_mut();
+    for (x, &level) in (inner.x..inner.right()).step_by(2).zip(levels) {
+        let mut eighths = bar_eighths(level, rows);
+        for y in (inner.y..inner.bottom()).rev() {
+            if eighths == 0 {
+                break;
+            }
+            let symbol = match eighths {
+                8.. => BAR_FULL,
+                // `1..=7` here, so the index is in `0..=6`.
+                partial => BAR_EIGHTHS[partial - 1],
+            };
+            buffer[(x, y)].set_symbol(symbol).set_style(theme::SPECTRUM);
+            eighths = eighths.saturating_sub(8);
+        }
+    }
+    bars
 }
 
 /// `" N <noun> "`, or how many of the `total` entries (`shown` of them
@@ -1084,7 +1187,7 @@ mod tests {
     use crate::playlist::{
         FsStore, Playlist, PlaylistInfo, PlaylistStore, Resolver, SaveOutcome, StoreError,
     };
-    use crate::test_support::{SilentAudio, no_store, track};
+    use crate::test_support::{SilentAudio, ToneAudio, no_store, track};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1092,7 +1195,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     /// Renders `app` at `width`×`height` and returns the screen's cells.
-    fn draw_buffer(app: &App<SilentAudio>, view: &mut View, width: u16, height: u16) -> Buffer {
+    fn draw_buffer<A: Audio>(app: &App<A>, view: &mut View, width: u16, height: u16) -> Buffer {
         let mut terminal =
             Terminal::new(TestBackend::new(width, height)).unwrap_or_else(|never| match never {});
         let now = Instant::now();
@@ -1114,7 +1217,7 @@ mod tests {
     }
 
     /// Renders `app` at `width`×`height` and returns the screen as lines.
-    fn draw(app: &App<SilentAudio>, view: &mut View, width: u16, height: u16) -> Vec<String> {
+    fn draw<A: Audio>(app: &App<A>, view: &mut View, width: u16, height: u16) -> Vec<String> {
         lines(&draw_buffer(app, view, width, height))
     }
 
@@ -1409,7 +1512,9 @@ mod tests {
 
     #[test]
     fn page_size_follows_the_terminal_height() {
-        let app = library(100);
+        let mut app = library(100);
+        // Without the spectrum strip, which takes 6 rows from 24 rows up.
+        press(&mut app, KeyCode::Char('v'));
         let mut view = View::default();
         draw(&app, &mut view, 60, 20);
         // 20 - 3 (now playing) - 2 (status, keys) - 2 (borders) - 1 (header)
@@ -2579,6 +2684,303 @@ mod tests {
             }
             assert!(screen_contains(&screen, "日 本 語"), "{screen:#?}");
             assert!(screen[0].contains(" Library · …"), "{screen:#?}");
+        }
+        Ok(())
+    }
+
+    /// Draws `app` like the event loop does, spectrum layout included.
+    fn draw_like_the_loop<A: Audio>(
+        app: &mut App<A>,
+        view: &mut View,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
+        let buffer = draw_buffer(app, view, width, height);
+        app.set_page_size(view.page_size());
+        app.set_help_rows(view.help_rows());
+        app.set_spectrum_layout(view.spectrum_fits(), view.spectrum_bars());
+        buffer
+    }
+
+    /// Row of the spectrum strip's top border at a height of `height` rows:
+    /// the strip is the bottom of the body, right above the now-playing area
+    /// and the status and key lines.
+    const fn strip_top(height: u16) -> u16 {
+        height - NOW_PLAYING_HEIGHT - 2 - SPECTRUM_HEIGHT
+    }
+
+    /// Whether `symbol` is part of a bar.
+    fn is_bar(symbol: &str) -> bool {
+        symbol == BAR_FULL || BAR_EIGHTHS.contains(&symbol)
+    }
+
+    /// Spec *Strip shown on a tall terminal*, *Spectrum strip visible*.
+    #[test]
+    fn strip_spans_the_full_width_below_both_panes() -> anyhow::Result<()> {
+        let (_tmp, app) = with_playlists()?;
+        for width in [80, 100] {
+            let mut view = View::default();
+            let screen = draw(&app, &mut view, width, 30);
+            let top = usize::from(strip_top(30));
+            assert!(screen[0].contains(" 2 playlists "), "sidebar: {screen:#?}");
+            assert!(screen[0].contains(" Library · /m "), "main: {screen:#?}");
+            assert!(screen[top - 1].starts_with('└'), "panes end: {screen:#?}");
+            assert!(screen[top - 1].ends_with('┘'), "{screen:#?}");
+            assert!(
+                screen[top].starts_with(&format!("┌{SPECTRUM_TITLE}─")),
+                "{screen:#?}"
+            );
+            assert!(screen[top].ends_with('┐'), "full width: {screen:#?}");
+            let bottom = top + usize::from(SPECTRUM_HEIGHT) - 1;
+            assert!(screen[bottom].starts_with('└'), "{screen:#?}");
+            assert!(screen[bottom].ends_with('┘'), "{screen:#?}");
+            // The now-playing area follows.
+            assert!(screen[bottom + 1].contains("Now playing"), "{screen:#?}");
+            assert!(view.spectrum_fits());
+            assert_eq!(view.spectrum_bars(), usize::from(width - 2).div_ceil(2));
+        }
+        Ok(())
+    }
+
+    /// Spec *Too short for the strip*.
+    #[test]
+    fn short_terminal_has_no_strip() -> anyhow::Result<()> {
+        let (_tmp, app) = with_playlists()?;
+        for height in [20, SPECTRUM_MIN_HEIGHT - 1] {
+            let mut view = View::default();
+            let screen = draw(&app, &mut view, 80, height);
+            assert!(!screen_contains(&screen, "Spectrum"), "{screen:#?}");
+            assert!(!view.spectrum_fits());
+            assert_eq!(view.spectrum_bars(), 0);
+        }
+        let mut view = View::default();
+        let screen = draw(&app, &mut view, 80, SPECTRUM_MIN_HEIGHT);
+        assert!(screen_contains(&screen, "Spectrum"), "{screen:#?}");
+        // The panes keep 13 rows, 11 of them inside the borders.
+        assert_eq!(view.page_size(), 10, "11 rows less the table header");
+        Ok(())
+    }
+
+    /// Spec *Shown in the one-pane layout*.
+    #[test]
+    fn strip_is_shown_below_the_single_pane() -> anyhow::Result<()> {
+        let (_tmp, app) = with_playlists()?;
+        let screen = draw(&app, &mut View::default(), 60, 30);
+        assert!(screen[0].starts_with("┌ Library · /m "), "{screen:#?}");
+        assert!(!screen_contains(&screen, "kasset"), "{screen:#?}");
+        let top = usize::from(strip_top(30));
+        assert!(screen[top].starts_with(&format!("┌{SPECTRUM_TITLE}")));
+        assert!(screen[top].ends_with('┐'), "{screen:#?}");
+        Ok(())
+    }
+
+    /// Spec *Hide and show*.
+    #[test]
+    fn v_hides_the_strip_and_the_panes_take_its_rows() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        let mut view = View::default();
+        draw_like_the_loop(&mut app, &mut view, 80, 30);
+        let page = view.page_size();
+        press(&mut app, KeyCode::Char('v'));
+        let screen = lines(&draw_like_the_loop(&mut app, &mut view, 80, 30));
+        assert!(!screen_contains(&screen, "Spectrum"), "{screen:#?}");
+        assert_eq!(view.page_size(), page + usize::from(SPECTRUM_HEIGHT));
+        assert!(view.spectrum_fits(), "still tall enough");
+        assert_eq!(view.spectrum_bars(), 0);
+        assert_eq!(app.status(Instant::now()), None, "the change shows itself");
+        press(&mut app, KeyCode::Char('v'));
+        let screen = lines(&draw_like_the_loop(&mut app, &mut view, 80, 30));
+        assert!(screen_contains(&screen, "Spectrum"), "{screen:#?}");
+        assert_eq!(view.page_size(), page);
+        Ok(())
+    }
+
+    /// Spec *Shortening the terminal*.
+    #[test]
+    fn resizing_hides_and_restores_the_strip() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        let mut view = View::default();
+        for (height, shown) in [(30, true), (20, false), (30, true)] {
+            let screen = lines(&draw_like_the_loop(&mut app, &mut view, 80, height));
+            assert_eq!(screen_contains(&screen, "Spectrum"), shown, "{screen:#?}");
+            assert!(app.visualizer_on());
+        }
+        Ok(())
+    }
+
+    /// Draws `levels` in a strip `width` columns wide (4 bar rows).
+    fn strip(levels: &[f32], width: u16) -> (Buffer, usize) {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, SPECTRUM_HEIGHT)).unwrap_or_else(|n| match n {});
+        let mut bars = 0;
+        terminal
+            .draw(|f| bars = render_spectrum(f, levels, f.area()))
+            .unwrap_or_else(|never| match never {});
+        (terminal.backend().buffer().clone(), bars)
+    }
+
+    /// The column at `x` of a strip's bar rows, top to bottom.
+    fn bar_column(buffer: &Buffer, x: u16) -> Vec<&str> {
+        (1..SPECTRUM_HEIGHT - 1)
+            .map(|y| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn levels_fill_bars_from_the_bottom_in_eighths() {
+        let levels = [
+            0.0,
+            0.5,
+            1.0,
+            0.3,
+            0.05,
+            2.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let (buffer, bars) = strip(&levels, 20);
+        assert_eq!(bars, 9);
+        let columns: Vec<Vec<&str>> = (0..9).map(|i| bar_column(&buffer, 1 + 2 * i)).collect();
+        assert_eq!(columns[0], [" ", " ", " ", " "], "empty");
+        assert_eq!(columns[1], [" ", " ", "█", "█"], "half: 2 of 4 rows");
+        assert_eq!(columns[2], ["█", "█", "█", "█"], "full");
+        // 0.3 of 32 eighths is 9.6, so 10: a full cell and 2 eighths.
+        assert_eq!(columns[3], [" ", " ", "▂", "█"], "partial top");
+        // 0.05 of 32 eighths is 1.6, so 2.
+        assert_eq!(columns[4], [" ", " ", " ", "▂"], "partial only");
+        assert_eq!(columns[5], ["█", "█", "█", "█"], "clamped to full");
+        assert_eq!(columns[6], [" ", " ", " ", " "], "not a number");
+        assert_eq!(columns[7], ["█", "█", "█", "█"], "infinity is full");
+        assert_eq!(columns[8], [" ", " ", " ", " "], "minus infinity is empty");
+        for i in 0..9 {
+            assert_eq!(bar_column(&buffer, 2 + 2 * i), [" "; 4], "gap {i}");
+        }
+        assert_eq!(buffer[(5, 4)].fg, Color::Magenta);
+        assert_eq!(buffer[(5, 0)].fg, Color::Reset, "unfocused border");
+    }
+
+    #[test]
+    fn bar_count_is_half_the_inner_width_rounded_up() {
+        for (width, bars) in [(2, 0), (3, 1), (4, 1), (5, 2), (80, 39), (81, 40)] {
+            let (buffer, drawn) = strip(&[1.0; 100], width);
+            assert_eq!(drawn, bars, "width {width}");
+            assert_eq!(drawn, spectrum_bar_count(width.saturating_sub(2)));
+            let glyphs = (0..width)
+                .filter(|&x| is_bar(buffer[(x, SPECTRUM_HEIGHT - 2)].symbol()))
+                .count();
+            assert_eq!(glyphs, bars, "width {width}");
+            assert_eq!(buffer[(width - 1, 2)].symbol(), "│", "border kept");
+        }
+    }
+
+    /// A playing tone with its bars up, measured for a strip `width` wide.
+    fn tone_playing(width: u16) -> (App<ToneAudio>, View) {
+        let mut app = App::new(
+            vec![track("A", "Band", "LP")],
+            ToneAudio::new(1_000.0, 1.0),
+            no_store(),
+            "/m".to_owned(),
+            None,
+        );
+        let mut view = View::default();
+        draw_like_the_loop(&mut app, &mut view, width, 30);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let start = Instant::now();
+        for i in 0..4 {
+            app.tick(start + Duration::from_millis(33) * i);
+        }
+        assert_eq!(app.spectrum_levels().len(), view.spectrum_bars());
+        assert!(app.spectrum_levels().iter().any(|&level| level > 0.5));
+        (app, view)
+    }
+
+    #[test]
+    fn widening_or_narrowing_before_a_tick_draws_no_stray_bars() {
+        let (app, mut view) = tone_playing(100);
+        let levels = app.spectrum_levels().len();
+        let top = strip_top(30);
+        for width in [140_u16, 60, 3] {
+            let buffer = draw_buffer(&app, &mut view, width, 30);
+            let bars = spectrum_bar_count(width - 2);
+            assert_eq!(view.spectrum_bars(), bars);
+            // Every level that fits and fills at least an eighth is drawn.
+            let expected: Vec<u16> = app.spectrum_levels()[..levels.min(bars)]
+                .iter()
+                .zip((1_u16..).step_by(2))
+                .filter(|&(&level, _)| bar_eighths(level, SPECTRUM_HEIGHT - 2) > 0)
+                .map(|(_, x)| x)
+                .collect();
+            let mut drawn = Vec::new();
+            for y in 0..30 {
+                for x in 0..width {
+                    if !is_bar(buffer[(x, y)].symbol()) {
+                        continue;
+                    }
+                    let inside = y > top && y < top + SPECTRUM_HEIGHT - 1;
+                    assert!(inside && x >= 1 && x < width - 1, "({x}, {y}) at {width}");
+                    assert_eq!(x % 2, 1, "bars sit on odd columns");
+                    assert!(
+                        usize::from(x / 2) < levels.min(bars),
+                        "({x}, {y}) at {width}"
+                    );
+                    if !drawn.contains(&x) {
+                        drawn.push(x);
+                    }
+                }
+            }
+            drawn.sort_unstable();
+            assert_eq!(drawn, expected, "at {width}");
+            if width == 140 {
+                assert!(!drawn.is_empty(), "the tone's bars are drawn");
+            }
+        }
+    }
+
+    #[test]
+    fn popups_are_centred_over_the_panes_and_the_strip() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let screen = draw(&app, &mut View::default(), 100, 30);
+        assert!(screen_contains(&screen, "Spectrum"), "{screen:#?}");
+        let top = screen
+            .iter()
+            .position(|l| l.contains(" Add 1 track to "))
+            .unwrap_or_default();
+        let left = screen[top]
+            .chars()
+            .position(|c| c == '┌')
+            .unwrap_or_default();
+        let bottom = screen
+            .iter()
+            .enumerate()
+            .skip(top + 1)
+            .find(|(_, l)| l.chars().nth(left) == Some('└'))
+            .map_or(0, |(y, _)| y);
+        let height = bottom + 1 - top;
+        let body = 30 - usize::from(NOW_PLAYING_HEIGHT) - 2;
+        assert!(top > 0 && height > 2, "{screen:#?}");
+        assert_eq!(top, (body - height) / 2, "{screen:#?}");
+        Ok(())
+    }
+
+    /// Spec *Tab skips the strip*.
+    #[test]
+    fn tab_never_focuses_the_strip() -> anyhow::Result<()> {
+        let (_tmp, mut app) = with_playlists()?;
+        let top = strip_top(30);
+        let main_x = sidebar_width(80);
+        for expected in [Focus::Main, Focus::Sidebar, Focus::Main] {
+            assert_eq!(app.focus(), expected);
+            let buffer = draw_buffer(&app, &mut View::default(), 80, 30);
+            for x in 0..80 {
+                assert_eq!(buffer[(x, top)].fg, Color::Reset, "unfocused border");
+            }
+            // Exactly one pane has the focused border: the expected one.
+            let focused = |x: u16| buffer[(x, 1)].fg == Color::Cyan;
+            assert_eq!(focused(0), expected == Focus::Sidebar, "{expected:?}");
+            assert_eq!(focused(main_x), expected == Focus::Main, "{expected:?}");
+            press(&mut app, KeyCode::Tab);
         }
         Ok(())
     }

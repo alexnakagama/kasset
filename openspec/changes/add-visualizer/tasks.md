@@ -78,8 +78,8 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 4. Spectrum strip and frame rate (`src/ui.rs`, `src/theme.rs`, `src/terminal.rs`, `README.md`)
 
-- [ ] 4.1 Add `theme::SPECTRUM` (magenta) with a doc comment, and update the `theme.rs` `//!` doc's list of roles. Verify that `cargo test` covers the theme invariants already there, and that no `Color` appears in `ui.rs` outside tests.
-- [ ] 4.2 Implement the spectrum strip (D5): `SPECTRUM_HEIGHT` = 6 and `SPECTRUM_MIN_HEIGHT` = 24. Split the body into `[panes, strip]` when the visualizer is on and the terminal is at least 24 rows tall; draw the panes into `panes` with the existing width rules; keep popups centred over the whole body. The strip spans the full width, with the unfocused border, title " Spectrum ", 1-column bars with 1-column gaps (`bars = (inner_width + 1) / 2`, drawing `min(levels.len(), bars)`), `█` fill and `▁…▇` tops in `theme::SPECTRUM`. Add `spectrum_fits` / `spectrum_bars` to `ui::View`, and feed them back with `app.set_spectrum_layout` in `terminal::event_loop`, next to `set_page_size`. Update the `ui.rs` `//!` doc and its line in `CLAUDE.md`. Verify with `TestBackend` tests:
+- [x] 4.1 Add `theme::SPECTRUM` (magenta) with a doc comment, and update the `theme.rs` `//!` doc's list of roles. Verify that `cargo test` covers the theme invariants already there, and that no `Color` appears in `ui.rs` outside tests.
+- [x] 4.2 Implement the spectrum strip (D5): `SPECTRUM_HEIGHT` = 6 and `SPECTRUM_MIN_HEIGHT` = 24. Split the body into `[panes, strip]` when the visualizer is on and the terminal is at least 24 rows tall; draw the panes into `panes` with the existing width rules; keep popups centred over the whole body. The strip spans the full width, with the unfocused border, title " Spectrum ", 1-column bars with 1-column gaps (`bars = (inner_width + 1) / 2`, drawing `min(levels.len(), bars)`), `█` fill and `▁…▇` tops in `theme::SPECTRUM`. Add `spectrum_fits` / `spectrum_bars` to `ui::View`, and feed them back with `app.set_spectrum_layout` in `terminal::event_loop`, next to `set_page_size`. Update the `ui.rs` `//!` doc and its line in `CLAUDE.md`. Verify with `TestBackend` tests:
   - at 80×30, two panes with the strip below them spanning the full width, above the now-playing area (spec *Strip shown on a tall terminal*, *Spectrum strip visible*);
   - at 80×20, no strip and `spectrum_fits` false (spec *Too short for the strip*);
   - at 60×30, one pane with the strip below it (spec *Shown in the one-pane layout*);
@@ -91,8 +91,8 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - a popup (the picker) is centred over the panes and the strip together;
   - `Tab` twice never focuses the spectrum strip (spec *Tab skips the strip*);
   - every existing `ui.rs` test passes unchanged, including those drawn at 24 rows or more (picker 60×24, help overlay 100×50, 120×50, 40×60, 80×30). If one depends on the panes' height, stop and raise it.
-- [ ] 4.3 Add `ANIMATION_FRAME` (33 ms) and a pure `next_deadline(frame_start, animating) -> Instant` to `terminal.rs`. In `event_loop`, poll for input until that deadline instead of a fixed `FRAME`, using `app.visualizer_animating()` (D6). Update the `terminal.rs` `//!` doc. Verify with unit tests: the deadline is 33 ms after the frame start while animating and `FRAME` after it otherwise, and a deadline already passed polls with zero (spec *Animating*, *Idle*).
-- [ ] 4.4 Describe the spectrum strip in the README's description of the screen, next to the two-pane layout: when it appears, `v`, and what the bars show. Verify by reading it against the specs.
+- [x] 4.3 Add `ANIMATION_FRAME` (33 ms) and a pure `next_deadline(frame_start, animating) -> Instant` to `terminal.rs`. In `event_loop`, poll for input until that deadline instead of a fixed `FRAME`, using `app.visualizer_animating()` (D6). Update the `terminal.rs` `//!` doc. Verify with unit tests: the deadline is 33 ms after the frame start while animating and `FRAME` after it otherwise, and a deadline already passed polls with zero (spec *Animating*, *Idle*).
+- [x] 4.4 Describe the spectrum strip in the README's description of the screen, next to the two-pane layout: when it appears, `v`, and what the bars show. Verify by reading it against the specs.
 
 ## 5. Integration checks
 

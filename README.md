@@ -127,6 +127,17 @@ the status bar says how many entries were left out.
 - On terminals narrower than 70 columns only the focused pane is shown, at
   full width; keys work the same, and widening the terminal brings the
   other pane back.
+- **Spectrum strip**: on terminals at least 24 rows tall, a 6-row strip
+  across the full width, between the panes and the now-playing area, shows
+  the frequency spectrum of the track that is playing: one bar per band,
+  from the bass (about 40 Hz) on the left to the treble (16 kHz) on the
+  right, each from silence (about −60 dB) to full height (0 dB). The bars
+  are measured before the volume, so turning it down does not shrink
+  them; they jump up at once and fall back over about a second, and fall to
+  nothing when playback is paused or stopped. `v` hides or shows the strip
+  (it is on at start); on a shorter terminal it is not drawn, and it comes
+  back when the terminal is tall enough. The screen redraws about 30 times
+  a second only while the bars move.
 - Below the panes: the now-playing area, a status line for messages, and a
   bar with the main keys for what has the focus. The now-playing area is
   two lines: the play state, title, artist and album, with shuffle, repeat
