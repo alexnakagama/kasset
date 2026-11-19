@@ -26,7 +26,9 @@
 //!
 //! Invariants:
 //! - every text has gone through [`text::sanitize`]: no control character or
-//!   escape sequence survives, and a blank line is an empty string;
+//!   escape sequence survives, whitespace runs are collapsed, each text is
+//!   cut to [`text::MAX_TEXT_CHARS`] characters, and a blank line is an empty
+//!   string;
 //! - [`Lyrics::Synced`] lines are sorted by time, lines with equal times in
 //!   file order; untimed lines are dropped as soon as one timestamp exists, and
 //!   no synced line is trimmed (a blank timed line ends the previous line);

@@ -136,7 +136,7 @@ fn lyric_rows(lyrics: &Lyrics, current: Option<usize>, width: usize) -> (Vec<Row
 
 ### D7. Waking up for the next line
 
-`App::lyrics_deadline(now) -> Option<Instant>` returns `now + (next_change(position) - position)` when the pane is shown, playback is `Playing`, and the lyrics are synced. The wait is at least `LYRICS_MIN_WAIT` (10 ms), so a position that has not quite reached the line's time can never cause a busy loop. `terminal::next_deadline` gains the extra argument and returns the earlier of the regular frame deadline and this one.
+`App::lyrics_deadline(now) -> Option<Instant>` returns `now + (next_change(position) - position)` when the pane is shown, playback is `Playing`, and the lyrics are synced. The wait is at least `LYRICS_MIN_WAIT` (10 ms), so a position that has not quite reached the line's time can never cause a busy loop. While the pane is shown and the current track's lyrics are not looked up yet (track changed, pane shown or widened), it returns `now` instead, so the next tick reads them at once rather than leaving the pane blank for a whole `FRAME`; the read marks them looked up, so this fires once per track (added after review). `terminal::next_deadline` gains the extra argument and returns the earlier of the regular frame deadline and this one.
 
 The highlight then moves within one input poll of the line's time. That is well inside the spec's 0.1 s, and when nothing is due there is no extra redraw. Plain lyrics need no deadline; their scroll moves by whole rows over minutes, and the 250 ms frame is enough.
 

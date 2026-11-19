@@ -46,7 +46,9 @@
 //! file never reads again); while it is not shown nothing is read and the
 //! cache is dropped, so showing it again always reads afresh.
 //! [`App::lyrics_deadline`] tells the event loop when the highlighted synced
-//! line changes next.
+//! line changes next, or asks for an immediate frame while a read is due
+//! (track changed, pane shown or widened), so the pane is never left blank
+//! for a whole frame.
 //!
 //! Status messages raised during one key press go through [`App::notify`]:
 //! an error is never hidden by an info message raised after it, and two
@@ -513,13 +515,23 @@ impl<A: Audio> App<A> {
         self.lyrics.generation
     }
 
-    /// When the highlighted synced line changes next, as seen at `now`: the
-    /// time until the next line's start, at least [`LYRICS_MIN_WAIT`].
-    /// `None` unless the pane is shown, a track is playing, and its lyrics
-    /// are synced with a line still to come.
+    /// When the lyrics pane needs the next frame, as seen at `now`. While the
+    /// pane is shown and the current track's lyrics are not looked up yet
+    /// (the track just changed, or the pane was just shown or widened), that
+    /// is `now`, so the next tick reads them instead of leaving the pane
+    /// blank for a whole frame; the read marks them looked up, so this
+    /// happens once per track. Otherwise it is the time until the next
+    /// synced line starts, at least [`LYRICS_MIN_WAIT`], and `None` unless a
+    /// track is playing and its lyrics are synced with a line still to come.
     #[must_use]
     pub fn lyrics_deadline(&self, now: Instant) -> Option<Instant> {
-        if !self.lyrics_shown() || self.playback.state() != PlayState::Playing {
+        if !self.lyrics_shown() {
+            return None;
+        }
+        if self.playback.current_track().is_some() && !self.lyrics_ready() {
+            return Some(now);
+        }
+        if self.playback.state() != PlayState::Playing {
             return None;
         }
         let position = self.playback.position();
@@ -5415,7 +5427,7 @@ mod lyrics_tests {
         let mut f = Folder::shown()?;
         let now = Instant::now();
         f.press(&[key(KeyCode::Enter)]);
-        assert_eq!(f.app.lyrics_deadline(now), None, "not looked up yet");
+        assert_eq!(f.app.lyrics_deadline(now), Some(now), "load due");
         f.app.tick(now);
 
         f.set_position(Duration::ZERO);
@@ -5484,6 +5496,37 @@ mod lyrics_tests {
         assert_eq!(file_name(&f.app), Some("three.wav"));
         assert_eq!(f.app.playback().state(), PlayState::Playing);
         assert_eq!(f.app.lyrics_deadline(now), None, "plain");
+        Ok(())
+    }
+
+    /// Widening (or showing the pane) asks for an immediate frame so the
+    /// lyrics load at once, even while paused; once read, it asks no more,
+    /// including for a track without lyrics.
+    #[test]
+    fn a_due_load_asks_for_an_immediate_frame() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.play(now);
+        f.press(&[ch(' ')]);
+        assert_eq!(f.app.playback().state(), PlayState::Paused);
+        f.app.set_lyrics_layout(false);
+        assert_eq!(f.app.lyrics_deadline(now), None, "too narrow");
+        f.app.set_lyrics_layout(true);
+        assert_eq!(f.app.lyrics_deadline(now), Some(now), "widened");
+        f.app.tick(now);
+        assert!(f.app.lyrics_ready());
+        assert_eq!(f.app.lyrics_deadline(now), None, "paused, loaded");
+
+        f.press(&[ch('l'), ch('l')]);
+        assert_eq!(f.app.lyrics_deadline(now), Some(now), "shown again");
+
+        // A track without lyrics: one immediate frame, then none.
+        f.press(&[ch('n')]);
+        assert_eq!(file_name(&f.app), Some("two.wav"));
+        assert_eq!(f.app.lyrics_deadline(now), Some(now), "track changed");
+        f.app.tick(now);
+        assert!(f.app.lyrics().is_none());
+        assert_eq!(f.app.lyrics_deadline(now), None, "no lyrics");
         Ok(())
     }
 

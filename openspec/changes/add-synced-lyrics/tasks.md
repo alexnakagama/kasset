@@ -93,7 +93,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 5. Integration checks
 
-- [ ] 5.1 Run kasset against a real folder with:
+- [x] 5.1 Run kasset against a real folder with:
   - a FLAC with a sidecar `.lrc`;
   - a FLAC with `LYRICS` in its tags only;
   - an MP3 with `USLT`;
@@ -101,7 +101,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - a `.lrc` with `[offset:]` and word timings.
 
   Check by eye that lines change in time with the vocals, seeking follows, `l` and `v` combine at 100, 120 and 200 columns, and resizing below 100 and back works. Record anything off as a fix task or a design note.
-- [ ] 5.2 Run `cargo clippy --all-targets -- -D warnings`, `cargo test` and `cargo +1.89 build`; all must be clean. Confirm `Cargo.toml` and `Cargo.lock` are unchanged (no new dependencies), so the MSRV is unaffected.
+- [x] 5.2 Run `cargo clippy --all-targets -- -D warnings`, `cargo test` and `cargo +1.89 build`; all must be clean. Confirm `Cargo.toml` and `Cargo.lock` are unchanged (no new dependencies), so the MSRV is unaffected.
 
 ## Workflow follow-up
 
