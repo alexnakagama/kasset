@@ -37,6 +37,17 @@
 //! paused, stopped or stalled track lets the bars fall. While the strip is
 //! not shown, no FFT runs and the levels are reset.
 //!
+//! The lyrics pane ([`LyricsPane`]) is on at start; `l` (Normal mode, either
+//! pane) turns it off or on, with a status message when the terminal is too
+//! narrow for it, like `v`. Whether it fits is fed back by the event loop
+//! ([`App::set_lyrics_layout`]). It never takes focus. While it is shown,
+//! [`App::tick`] reads the current track's lyrics once each time the
+//! current track's *path* changes (so seeking, pausing or replaying the same
+//! file never reads again); while it is not shown nothing is read and the
+//! cache is dropped, so showing it again always reads afresh.
+//! [`App::lyrics_deadline`] tells the event loop when the highlighted synced
+//! line changes next.
+//!
 //! Status messages raised during one key press go through [`App::notify`]:
 //! an error is never hidden by an info message raised after it, and two
 //! messages of the same level are joined.
@@ -47,12 +58,14 @@
 //! Changes to the playlist that is playing are forwarded to the play order.
 
 use std::cell::OnceCell;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::keys;
 use crate::library::Track;
+use crate::lyrics::{self, Lyrics};
 use crate::playback::{Edit, Level, Notice, PlayState, Playback, Source};
 use crate::player::Audio;
 use crate::playlist::{
@@ -60,7 +73,7 @@ use crate::playlist::{
     validate_name,
 };
 use crate::text::{is_invisible_format, sanitize};
-use crate::ui::SPECTRUM_MIN_HEIGHT;
+use crate::ui::{LYRICS_MIN_WIDTH, SPECTRUM_MIN_HEIGHT};
 use crate::visualizer::{FFT_SIZE, Spectrum};
 
 /// How long a transient status message stays on screen.
@@ -350,6 +363,7 @@ pub struct App<A: Audio> {
     /// between openings.
     help_rows: usize,
     visualizer: Visualizer,
+    lyrics: LyricsPane,
     quit: bool,
 }
 
@@ -397,6 +411,129 @@ impl Visualizer {
     }
 }
 
+/// Shortest wait [`App::lyrics_deadline`] asks for, so a position just short
+/// of a line's time can never make the event loop spin.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the lyric deadline from task group 4")
+)]
+pub const LYRICS_MIN_WAIT: Duration = Duration::from_millis(10);
+
+/// The lyrics pane's state. Lyrics are read only by [`App::tick`], only while
+/// the pane is shown, and once per current track path: seeking, pausing,
+/// stopping and replaying the same file reuse the cache; only another path,
+/// or showing the pane again, reads afresh.
+#[derive(Debug)]
+struct LyricsPane {
+    /// Whether the user wants it (`l`); on at start, kept until quit.
+    on: bool,
+    /// Whether the last frame was wide enough for the pane (fed back by the
+    /// event loop, recorded even while `on` is false).
+    fits: bool,
+    /// The track path `lyrics` were read for; `None` when nothing was read
+    /// since the pane was last shown.
+    loaded_for: Option<PathBuf>,
+    /// The lyrics of `loaded_for`; `None` when it has none.
+    lyrics: Option<Lyrics>,
+}
+
+impl LyricsPane {
+    const fn new() -> Self {
+        Self {
+            on: true,
+            fits: false,
+            loaded_for: None,
+            lyrics: None,
+        }
+    }
+
+    /// Whether the pane is drawn, so lyrics must be kept for the current track.
+    const fn shown(&self) -> bool {
+        self.on && self.fits
+    }
+
+    /// Drops the cache while the pane is not shown, so showing it again
+    /// reads the lyrics afresh (picking up a `.lrc` edited meanwhile).
+    fn forget_if_hidden(&mut self) {
+        if !self.shown() {
+            self.loaded_for = None;
+            self.lyrics = None;
+        }
+    }
+}
+
+/// The lyrics pane's accessors, read by the UI and the event loop.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "drawn and timed by the UI from task group 4")
+)]
+impl<A: Audio> App<A> {
+    /// Records whether the last frame was wide enough for the lyrics pane,
+    /// like [`App::set_spectrum_layout`]. While it does not fit, the cached
+    /// lyrics are dropped.
+    pub fn set_lyrics_layout(&mut self, fits: bool) {
+        self.lyrics.fits = fits;
+        self.lyrics.forget_if_hidden();
+    }
+
+    /// Whether the lyrics pane is on (`l`), whether or not it fits.
+    #[must_use]
+    pub const fn lyrics_on(&self) -> bool {
+        self.lyrics.on
+    }
+
+    /// Whether the lyrics pane is on and the last frame was wide enough.
+    #[must_use]
+    pub const fn lyrics_shown(&self) -> bool {
+        self.lyrics.shown()
+    }
+
+    /// Whether the lyrics of the current track have been looked up: false
+    /// with no current track, and until the first tick after the track
+    /// changed or the pane was shown. Until then the pane shows nothing, so
+    /// "No lyrics" never flashes before lyrics that are about to load.
+    #[must_use]
+    pub fn lyrics_ready(&self) -> bool {
+        match (&self.lyrics.loaded_for, self.playback.current_track()) {
+            (Some(loaded), Some(track)) => *loaded == track.path,
+            _ => false,
+        }
+    }
+
+    /// The current track's lyrics, once looked up ([`App::lyrics_ready`]);
+    /// `None` when it has none or they are not looked up yet.
+    #[must_use]
+    pub fn lyrics(&self) -> Option<&Lyrics> {
+        if self.lyrics_ready() {
+            self.lyrics.lyrics.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// When the highlighted synced line changes next, as seen at `now`: the
+    /// time until the next line's start, at least [`LYRICS_MIN_WAIT`].
+    /// `None` unless the pane is shown, a track is playing, and its lyrics
+    /// are synced with a line still to come.
+    #[must_use]
+    pub fn lyrics_deadline(&self, now: Instant) -> Option<Instant> {
+        if !self.lyrics.shown() || self.playback.state() != PlayState::Playing {
+            return None;
+        }
+        let position = self.playback.position();
+        let next = self.lyrics()?.next_change(position)?;
+        let wait = next.saturating_sub(position).max(LYRICS_MIN_WAIT);
+        now.checked_add(wait)
+    }
+
+    /// Sets whether the lyrics pane is on, without a notice (test fixtures).
+    #[cfg(test)]
+    pub fn set_lyrics_on(&mut self, on: bool) {
+        self.lyrics.on = on;
+        self.lyrics.forget_if_hidden();
+    }
+}
+
 impl<A: Audio> App<A> {
     /// The app over `tracks` (already sorted), playing through `audio`, with
     /// playlists kept in `store`. `root` is the library folder as shown to
@@ -433,6 +570,7 @@ impl<A: Audio> App<A> {
             page_size: 1,
             help_rows: 1,
             visualizer: Visualizer::new(),
+            lyrics: LyricsPane::new(),
             quit: false,
         };
         app.refresh_playlists(None);
@@ -679,6 +817,25 @@ impl<A: Audio> App<A> {
             self.status = None;
         }
         self.update_visualizer(now);
+        self.update_lyrics();
+    }
+
+    /// Reads the current track's lyrics when the pane is shown and the
+    /// current track's path is not the one last read. Keyed on the path, so
+    /// seeking (a reload of the same file) or pausing never reads again.
+    fn update_lyrics(&mut self) {
+        let pane = &mut self.lyrics;
+        if !pane.shown() {
+            return;
+        }
+        let Some(track) = self.playback.current_track() else {
+            return;
+        };
+        if pane.loaded_for.as_ref() == Some(&track.path) {
+            return;
+        }
+        pane.lyrics = lyrics::source::load(&track.path);
+        pane.loaded_for = Some(track.path.clone());
     }
 
     /// Moves the spectrum on to `now`, after playback has been driven. While
@@ -804,6 +961,7 @@ impl<A: Audio> App<A> {
                 self.notify(Notice::info(format!("Repeat {}", repeat.label())));
             }
             KeyCode::Char('v') => self.toggle_visualizer(),
+            KeyCode::Char('l') => self.toggle_lyrics(),
             KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
             KeyCode::Esc => {
@@ -828,6 +986,21 @@ impl<A: Audio> App<A> {
                 format!("Visualizer on: needs a terminal at least {SPECTRUM_MIN_HEIGHT} rows tall")
             } else {
                 "Visualizer off".to_owned()
+            }));
+        }
+    }
+
+    /// `l`: turns the lyrics pane off or on. When the terminal is too narrow
+    /// for the pane the change cannot be seen, so it is announced.
+    fn toggle_lyrics(&mut self) {
+        let pane = &mut self.lyrics;
+        pane.on = !pane.on;
+        pane.forget_if_hidden();
+        if !pane.fits {
+            self.notify(Notice::info(if self.lyrics.on {
+                format!("Lyrics on: needs a terminal at least {LYRICS_MIN_WIDTH} columns wide")
+            } else {
+                "Lyrics off".to_owned()
             }));
         }
     }
@@ -4941,6 +5114,506 @@ mod visualizer_tests {
         };
         assert_eq!(input.text(), "v");
         assert!(a.visualizer_on());
+        Ok(())
+    }
+}
+
+/// The lyrics pane's state, `l`, and the lyric deadline.
+#[cfg(test)]
+mod lyrics_tests {
+    use super::*;
+    use crate::lyrics::Line;
+    use crate::test_support::{SilentAudio, no_store, wav_bytes};
+    use anyhow::{Result, bail};
+    use std::fs;
+    use std::path::Path;
+
+    const SYNCED: &str = "[ar:Band]\n[00:01.00]First\n[00:03.00]Second\n";
+    const PLAIN: &str = "Just words\nNo timing\n";
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    /// A folder with three tracks in library order: `one.wav` with a synced
+    /// sidecar, `two.wav` with no lyrics at all, and `three.wav` with a
+    /// plain sidecar. The pane is on, but no frame has been drawn yet.
+    struct Folder {
+        tmp: tempfile::TempDir,
+        app: App<SilentAudio>,
+    }
+
+    impl Folder {
+        fn new() -> Result<Self> {
+            let tmp = tempfile::tempdir()?;
+            let mut tracks = Vec::new();
+            for (name, lyrics) in [("one", Some(SYNCED)), ("two", None), ("three", Some(PLAIN))] {
+                let path = tmp.path().join(format!("{name}.wav"));
+                fs::write(&path, wav_bytes())?;
+                if let Some(text) = lyrics {
+                    fs::write(path.with_extension("lrc"), text)?;
+                }
+                tracks.push(Track {
+                    path,
+                    title: name.to_owned(),
+                    artist: "Band".to_owned(),
+                    album: "LP".to_owned(),
+                    number: None,
+                    duration: Some(Duration::from_secs(200)),
+                });
+            }
+            let app = App::new(
+                tracks,
+                SilentAudio::default(),
+                no_store(),
+                "/music".to_owned(),
+                None,
+            );
+            Ok(Self { tmp, app })
+        }
+
+        /// As [`Folder::new`], with the pane drawn (wide enough).
+        fn shown() -> Result<Self> {
+            let mut f = Self::new()?;
+            f.app.set_lyrics_layout(true);
+            Ok(f)
+        }
+
+        fn sidecar(&self, name: &str) -> std::path::PathBuf {
+            self.tmp.path().join(format!("{name}.lrc"))
+        }
+
+        fn press(&mut self, keys: &[KeyEvent]) {
+            for &k in keys {
+                self.app.handle_key(k);
+            }
+        }
+
+        /// Plays the selected track and ticks once.
+        fn play(&mut self, now: Instant) {
+            self.press(&[key(KeyCode::Enter)]);
+            self.app.tick(now);
+        }
+
+        fn set_position(&mut self, position: Duration) {
+            self.app.playback_mut().audio_mut().position = position;
+        }
+
+        /// The status text after a tick at `now`.
+        fn status(&mut self, now: Instant) -> Option<String> {
+            self.app.tick(now);
+            self.app.status(now).map(|n| n.text.clone())
+        }
+    }
+
+    /// The text of every line, synced or plain.
+    fn texts(lyrics: Option<&Lyrics>) -> Option<Vec<String>> {
+        lyrics.map(|lyrics| match lyrics {
+            Lyrics::Synced(lines) => lines.iter().map(|l| l.text.clone()).collect(),
+            Lyrics::Plain(lines) => lines.clone(),
+        })
+    }
+
+    fn first_text(app: &App<SilentAudio>) -> Option<String> {
+        texts(app.lyrics()).and_then(|t| t.into_iter().next())
+    }
+
+    fn file_name(app: &App<SilentAudio>) -> Option<&str> {
+        app.playback()
+            .current_track()
+            .and_then(|t| t.path.file_name())
+            .and_then(|n| n.to_str())
+    }
+
+    #[test]
+    fn on_at_start_with_nothing_loaded() -> Result<()> {
+        let mut f = Folder::new()?;
+        assert!(f.app.lyrics_on());
+        assert!(!f.app.lyrics_shown(), "no frame yet");
+        f.app.tick(Instant::now());
+        assert!(!f.app.lyrics_ready(), "nothing playing");
+        assert_eq!(f.app.lyrics(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn lyrics_load_when_a_track_starts() -> Result<()> {
+        let mut f = Folder::shown()?;
+        assert!(f.app.lyrics_shown());
+        f.press(&[key(KeyCode::Enter)]);
+        assert_eq!(file_name(&f.app), Some("one.wav"));
+        assert!(!f.app.lyrics_ready(), "not looked up before the tick");
+        assert_eq!(f.app.lyrics(), None);
+
+        f.app.tick(Instant::now());
+        assert!(f.app.lyrics_ready());
+        assert_eq!(
+            f.app.lyrics(),
+            Some(&Lyrics::Synced(vec![
+                Line {
+                    at: Duration::from_secs(1),
+                    text: "First".to_owned()
+                },
+                Line {
+                    at: Duration::from_secs(3),
+                    text: "Second".to_owned()
+                },
+            ]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn seeking_does_not_read_again() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.play(now);
+        assert_eq!(first_text(&f.app).as_deref(), Some("First"));
+
+        // Gone from disk: a re-read would find no lyrics.
+        fs::remove_file(f.sidecar("one"))?;
+        f.set_position(Duration::from_secs(10));
+        f.press(&[key(KeyCode::Right)]);
+        assert_eq!(
+            f.app.playback().position(),
+            Duration::from_secs(15),
+            "reloaded at the new position"
+        );
+        f.app.tick(now);
+        f.press(&[key(KeyCode::Left)]);
+        assert_eq!(f.app.playback().position(), Duration::from_secs(10));
+        f.app.tick(now);
+        f.press(&[ch(' ')]);
+        f.app.tick(now);
+        f.press(&[ch(' ')]);
+        f.app.tick(now);
+        assert_eq!(f.app.playback().state(), PlayState::Playing);
+        assert_eq!(file_name(&f.app), Some("one.wav"));
+        assert_eq!(first_text(&f.app).as_deref(), Some("First"), "kept");
+        Ok(())
+    }
+
+    #[test]
+    fn replaying_the_same_track_after_stop_does_not_read_again() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.play(now);
+        f.press(&[ch('s')]);
+        f.app.tick(now);
+        assert_eq!(f.app.playback().state(), PlayState::Stopped);
+        assert_eq!(
+            first_text(&f.app).as_deref(),
+            Some("First"),
+            "still the last played track"
+        );
+
+        fs::remove_file(f.sidecar("one"))?;
+        f.play(now);
+        assert_eq!(file_name(&f.app), Some("one.wav"));
+        assert_eq!(first_text(&f.app).as_deref(), Some("First"), "kept");
+        Ok(())
+    }
+
+    #[test]
+    fn auto_advance_reads_the_next_tracks_lyrics_in_the_same_tick() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.press(&[ch('j'), key(KeyCode::Enter)]);
+        f.app.tick(now);
+        assert_eq!(file_name(&f.app), Some("two.wav"));
+        assert!(f.app.lyrics_ready());
+        assert_eq!(f.app.lyrics(), None);
+
+        // The track plays out: one tick advances and reads.
+        f.app.playback_mut().audio_mut().ended = true;
+        f.app.tick(now);
+        assert_eq!(file_name(&f.app), Some("three.wav"));
+        assert!(f.app.lyrics_ready());
+        assert_eq!(first_text(&f.app).as_deref(), Some("Just words"));
+        Ok(())
+    }
+
+    #[test]
+    fn next_track_without_lyrics_has_none() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.play(now);
+        assert!(f.app.lyrics().is_some());
+
+        f.press(&[ch('n')]);
+        assert_eq!(file_name(&f.app), Some("two.wav"));
+        assert!(
+            !f.app.lyrics_ready(),
+            "old lyrics not shown as the new ones"
+        );
+        assert_eq!(f.app.lyrics(), None);
+        f.app.tick(now);
+        assert!(f.app.lyrics_ready());
+        assert_eq!(f.app.lyrics(), None);
+
+        f.press(&[ch('n')]);
+        f.app.tick(now);
+        assert_eq!(file_name(&f.app), Some("three.wav"));
+        assert!(matches!(f.app.lyrics(), Some(Lyrics::Plain(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_is_read_while_the_pane_does_not_fit() -> Result<()> {
+        let mut f = Folder::new()?;
+        f.app.set_lyrics_layout(false);
+        let now = Instant::now();
+        f.play(now);
+        assert!(!f.app.lyrics_ready());
+        assert!(f.app.lyrics.loaded_for.is_none(), "nothing read");
+
+        // Widened: ready only after the next tick.
+        f.app.set_lyrics_layout(true);
+        assert!(!f.app.lyrics_ready());
+        assert_eq!(f.app.lyrics(), None);
+        f.app.tick(now);
+        assert!(f.app.lyrics_ready());
+        assert_eq!(first_text(&f.app).as_deref(), Some("First"));
+
+        // Narrowed again: the cache is dropped at once.
+        f.app.set_lyrics_layout(false);
+        assert!(!f.app.lyrics_ready());
+        assert!(f.app.lyrics.loaded_for.is_none());
+        assert!(f.app.lyrics.lyrics.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn showing_again_reads_a_sidecar_edited_while_hidden() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.play(now);
+        assert_eq!(first_text(&f.app).as_deref(), Some("First"));
+
+        f.press(&[ch('l')]);
+        assert!(!f.app.lyrics_on());
+        assert!(!f.app.lyrics_ready());
+        fs::write(f.sidecar("one"), "[00:01.00]Edited\n")?;
+        f.app.tick(now);
+        assert!(f.app.lyrics.loaded_for.is_none(), "nothing read while off");
+
+        f.press(&[ch('l')]);
+        f.app.tick(now);
+        assert_eq!(first_text(&f.app).as_deref(), Some("Edited"));
+        Ok(())
+    }
+
+    #[test]
+    fn deadline_is_the_time_until_the_next_line() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.press(&[key(KeyCode::Enter)]);
+        assert_eq!(f.app.lyrics_deadline(now), None, "not looked up yet");
+        f.app.tick(now);
+
+        f.set_position(Duration::ZERO);
+        assert_eq!(
+            f.app.lyrics_deadline(now),
+            Some(now + Duration::from_secs(1))
+        );
+        f.set_position(Duration::from_millis(1_500));
+        assert_eq!(
+            f.app.lyrics_deadline(now),
+            Some(now + Duration::from_millis(1_500))
+        );
+        // Exactly on a line: the next one.
+        f.set_position(Duration::from_secs(1));
+        assert_eq!(
+            f.app.lyrics_deadline(now),
+            Some(now + Duration::from_secs(2))
+        );
+        // Just short of a line: never less than the minimum wait.
+        f.set_position(Duration::from_millis(2_995));
+        assert_eq!(f.app.lyrics_deadline(now), Some(now + LYRICS_MIN_WAIT));
+        f.set_position(Duration::from_secs(3) - Duration::from_nanos(1));
+        assert_eq!(f.app.lyrics_deadline(now), Some(now + LYRICS_MIN_WAIT));
+        // After the last line nothing is due.
+        f.set_position(Duration::from_secs(3));
+        assert_eq!(f.app.lyrics_deadline(now), None);
+        Ok(())
+    }
+
+    #[test]
+    fn no_deadline_unless_playing_shown_and_synced() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.play(now);
+        assert!(f.app.lyrics_deadline(now).is_some());
+
+        f.press(&[ch(' ')]);
+        assert_eq!(f.app.playback().state(), PlayState::Paused);
+        assert_eq!(f.app.lyrics_deadline(now), None, "paused");
+        f.press(&[ch(' ')]);
+        assert!(f.app.lyrics_deadline(now).is_some());
+
+        f.press(&[ch('l')]);
+        assert_eq!(f.app.lyrics_deadline(now), None, "hidden");
+        f.press(&[ch('l')]);
+        f.app.tick(now);
+        assert!(f.app.lyrics_deadline(now).is_some());
+
+        f.app.set_lyrics_layout(false);
+        assert_eq!(f.app.lyrics_deadline(now), None, "too narrow");
+        f.app.set_lyrics_layout(true);
+        f.app.tick(now);
+        assert!(f.app.lyrics_deadline(now).is_some());
+
+        f.press(&[ch('s')]);
+        assert_eq!(f.app.playback().state(), PlayState::Stopped);
+        assert_eq!(f.app.lyrics_deadline(now), None, "stopped");
+
+        // No lyrics, then plain lyrics.
+        f.press(&[ch('j'), key(KeyCode::Enter)]);
+        f.app.tick(now);
+        assert_eq!(file_name(&f.app), Some("two.wav"));
+        assert_eq!(f.app.lyrics_deadline(now), None, "no lyrics");
+        f.press(&[ch('n')]);
+        f.app.tick(now);
+        assert_eq!(file_name(&f.app), Some("three.wav"));
+        assert_eq!(f.app.playback().state(), PlayState::Playing);
+        assert_eq!(f.app.lyrics_deadline(now), None, "plain");
+        Ok(())
+    }
+
+    #[test]
+    fn l_toggles_without_a_notice_while_the_pane_fits() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.press(&[ch('l')]);
+        assert!(!f.app.lyrics_on());
+        assert!(!f.app.lyrics_shown());
+        assert_eq!(f.status(now), None);
+        f.press(&[ch('l')]);
+        assert!(f.app.lyrics_on());
+        assert!(f.app.lyrics_shown());
+        assert_eq!(f.status(now), None);
+        Ok(())
+    }
+
+    #[test]
+    fn l_announces_the_change_while_the_terminal_is_too_narrow() -> Result<()> {
+        let mut f = Folder::new()?;
+        f.app.set_lyrics_layout(false);
+        let now = Instant::now();
+        f.press(&[ch('l')]);
+        assert!(!f.app.lyrics_on());
+        assert_eq!(f.status(now).as_deref(), Some("Lyrics off"));
+
+        f.press(&[ch('l')]);
+        assert!(f.app.lyrics_on(), "on, waiting for room");
+        assert_eq!(
+            f.status(now).as_deref(),
+            Some("Lyrics on: needs a terminal at least 100 columns wide")
+        );
+
+        f.app.set_lyrics_layout(true);
+        assert!(f.app.lyrics_shown());
+        Ok(())
+    }
+
+    #[test]
+    fn set_lyrics_on_raises_no_notice_and_drops_the_cache() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.play(now);
+        assert!(f.app.lyrics_ready());
+        f.app.set_lyrics_layout(true);
+        f.app.set_lyrics_on(false);
+        assert!(!f.app.lyrics_on());
+        assert!(!f.app.lyrics_ready());
+        assert_eq!(f.status(now), None);
+
+        f.app.set_lyrics_layout(false);
+        f.app.set_lyrics_on(true);
+        assert!(f.app.lyrics_on());
+        assert_eq!(f.status(now), None, "no notice even while too narrow");
+        Ok(())
+    }
+
+    #[test]
+    fn l_works_from_the_sidebar_too() -> Result<()> {
+        let mut f = Folder::shown()?;
+        f.press(&[key(KeyCode::Tab)]);
+        assert_eq!(f.app.focus(), Focus::Sidebar);
+        f.press(&[ch('l')]);
+        assert!(!f.app.lyrics_on());
+        Ok(())
+    }
+
+    #[test]
+    fn l_with_ctrl_or_alt_does_nothing() -> Result<()> {
+        let mut f = Folder::shown()?;
+        f.press(&[
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        ]);
+        assert!(f.app.lyrics_on());
+        Ok(())
+    }
+
+    #[test]
+    fn l_is_typed_into_a_search() -> Result<()> {
+        let mut f = Folder::shown()?;
+        f.press(&[ch('/'), ch('l')]);
+        assert_eq!(f.app.query(), "l");
+        assert!(f.app.lyrics_on());
+        Ok(())
+    }
+
+    #[test]
+    fn l_closes_the_help_overlay_and_does_nothing_else() -> Result<()> {
+        let mut f = Folder::shown()?;
+        f.press(&[ch('?'), ch('l')]);
+        assert_eq!(*f.app.mode(), Mode::Normal);
+        assert!(f.app.lyrics_on());
+        Ok(())
+    }
+
+    #[test]
+    fn l_in_the_picker_and_name_prompt_keeps_their_meaning() -> Result<()> {
+        let mut f = Folder::shown()?;
+        f.press(&[ch('a')]);
+        assert!(matches!(f.app.mode(), Mode::Picker(_)));
+        f.press(&[ch('l')]);
+        assert!(matches!(f.app.mode(), Mode::Picker(_)), "not a picker key");
+        f.press(&[key(KeyCode::Enter), ch('l')]);
+        let Mode::NameInput(input) = f.app.mode() else {
+            bail!("not naming a playlist: {:?}", f.app.mode());
+        };
+        assert_eq!(input.text(), "l");
+        assert!(f.app.lyrics_on());
+        Ok(())
+    }
+
+    #[test]
+    fn l_cancels_a_delete_confirmation_and_does_nothing_else() -> Result<()> {
+        let mut f = Folder::shown()?;
+        f.app.mode = Mode::ConfirmDelete("Gym".to_owned());
+        f.press(&[ch('l')]);
+        assert_eq!(*f.app.mode(), Mode::Normal);
+        assert!(f.app.lyrics_on());
+        Ok(())
+    }
+
+    #[test]
+    fn a_track_path_that_vanished_reads_as_no_lyrics() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let dir: &Path = f.tmp.path();
+        for name in ["one.wav", "one.lrc"] {
+            fs::remove_file(dir.join(name))?;
+        }
+        f.play(Instant::now());
+        assert!(f.app.lyrics_ready());
+        assert_eq!(f.app.lyrics(), None);
         Ok(())
     }
 }

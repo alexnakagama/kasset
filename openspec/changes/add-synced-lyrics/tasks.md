@@ -45,21 +45,21 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 3. App state and the `l` key (`src/app.rs`, `src/keys.rs`, `README.md`)
 
-- [ ] 3.1 Add `LyricsPane` to `App` (D4) with `on` (initially `true`), `fits`, `loaded_for` and `lyrics`. Add `set_lyrics_layout`, `lyrics_on`, `lyrics_shown`, `lyrics()`, `lyrics_ready()` and a `#[cfg(test)] set_lyrics_on(bool)` that raises no notice. In `tick`, load lyrics for the current track's path when the pane is shown and the path changed. Clear `loaded_for` and `lyrics` whenever `on` or `fits` becomes false. Add `lyrics_deadline(now)` (D7, minimum wait `LYRICS_MIN_WAIT` = 10 ms). Update the `app.rs` `//!` doc and its `CLAUDE.md` line (`LyricsPane`, `l`). Verify with key-sequence tests, using `tempfile` tracks with sidecars and fake audio:
+- [x] 3.1 Add `LyricsPane` to `App` (D4) with `on` (initially `true`), `fits`, `loaded_for` and `lyrics`. Add `set_lyrics_layout`, `lyrics_on`, `lyrics_shown`, `lyrics()`, `lyrics_ready()` and a `#[cfg(test)] set_lyrics_on(bool)` that raises no notice. In `tick`, load lyrics for the current track's path when the pane is shown and the path changed. Clear `loaded_for` and `lyrics` whenever `on` or `fits` becomes false. Add `lyrics_deadline(now)` (D7, minimum wait `LYRICS_MIN_WAIT` = 10 ms). Update the `app.rs` `//!` doc and its `CLAUDE.md` line (`LyricsPane`, `l`). Verify with key-sequence tests, using `tempfile` tracks with sidecars and fake audio:
   - lyrics load when a track starts;
   - seeking with Left/Right does not reload; check this by deleting the sidecar after the first load and seeing the lyrics stay;
   - `n` to a track without lyrics gives `None` (spec *Next track*);
   - nothing is loaded while `fits` is false, and the lyrics load on the first tick after `fits` becomes true; `lyrics_ready()` is false until then;
   - hiding the pane, rewriting the sidecar, then showing the pane loads the new text (spec *Edited while hidden*);
   - `lyrics_deadline` is `None` while paused, stopped, hidden or plain, equals the time until the next line while playing, and is never under 10 ms.
-- [ ] 3.2 Handle `l` in Normal mode from either pane: toggle `on`, and while `!fits` raise `Notice::info` with "Lyrics on: needs a terminal at least 100 columns wide" or "Lyrics off". Verify:
+- [x] 3.2 Handle `l` in Normal mode from either pane: toggle `on`, and while `!fits` raise `Notice::info` with "Lyrics on: needs a terminal at least 100 columns wide" or "Lyrics off". Verify:
   - `l` `l` toggles off and on (spec *Hide and show*, state level);
   - from off, `l` with `fits` false gives the "on" notice (spec *Turned on while too narrow*);
   - from on, it gives the "off" notice (spec *Turned off while too narrow*);
   - with `fits` true there is no notice;
   - `/` then `l` adds `l` to the query (spec *Not while typing*);
   - `l` in the help overlay, the picker, the name input and the delete confirmation keeps those modes' existing behaviour.
-- [ ] 3.3 Add the `l` entry ("show / hide the lyrics", `bar: &[]`) to the "Display" group in `keys::GROUPS`, after `v` (D8). Add the same row to the README keys table, plus a short "Lyrics" section in the README: where `.lrc` files go, tag fallback, the empty-sidecar rule, and the 100-column minimum. Verify:
+- [x] 3.3 Add the `l` entry ("show / hide the lyrics", `bar: &[]`) to the "Display" group in `keys::GROUPS`, after `v` (D8). Add the same row to the README keys table, plus a short "Lyrics" section in the README: where `.lrc` files go, tag fallback, the empty-sidecar rule, and the 100-column minimum. Verify:
   - the existing `keys.rs` tests pass, and every bar is unchanged;
   - a new test shows `help_text()` and `help_lines()` contain `l` and "show / hide the lyrics" (spec *Listed in the help*);
   - `cargo run -- --help` lists it.

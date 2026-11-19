@@ -12,6 +12,8 @@ leaving the terminal.
 - Live search with `/` over title, artist and album
 - Playlists saved as `.m3u8` files inside your music folder, playable on
   their own and readable by other players
+- Lyrics of the current track beside the track list, following the song
+  line by line when they are timed (`.lrc` files or lyrics tags)
 
 ## Install
 
@@ -147,6 +149,39 @@ the status bar says how many entries were left out.
 - The key bar ends with `? help` whenever no prompt or search is open; `?`
   opens the list of every key, which scrolls when it does not fit.
 
+## Lyrics
+
+On terminals at least 100 columns wide, a **Lyrics** pane to the right of the
+main pane shows the lyrics of the current track. It is on at start; `l` hides
+or shows it. On a narrower terminal it is not drawn (`l` then says so in the
+status line), and it comes back when the terminal is wide enough. It never
+takes the keyboard focus.
+
+Lyrics are looked up when a track becomes current, in this order:
+
+1. A `.lrc` file next to the audio file with the same name, the extension in
+   any case: `Band/Album/01 Song.flac` uses `Band/Album/01 Song.lrc` (or
+   `.LRC`, `.Lrc`, …).
+2. Otherwise, lyrics stored in the file's tags: a Vorbis comment `LYRICS` or
+   `UNSYNCEDLYRICS` (FLAC, Ogg), MP4 `©lyr` (M4A), or ID3v2 `USLT` (MP3).
+
+A `.lrc` file that can be read always wins, even if it holds no lyrics: an
+**empty `.lrc` file hides the lyrics in the tags**. One that cannot be read
+(no permission, a directory, a named pipe) is ignored and the tags are used.
+
+Timed lyrics (`[mm:ss.xx]` stamps, as in LRC files) highlight the line being
+sung, keep it in the middle of the pane and follow seeking; an `[offset:±ms]`
+header shifts every line (a positive offset shows lines earlier), and
+word-level `<mm:ss.xx>` timings are ignored. Lyrics without timestamps are
+shown as plain text that scrolls with the track's progress. Lyrics are read
+again only when the track changes or the pane is shown again, so a `.lrc`
+edited while its track plays is picked up the next time.
+
+Lyrics are treated as untrusted: files are read up to 1 MiB, control
+characters and escape sequences are removed, and kasset never creates,
+changes or deletes `.lrc` files or tags. Synced lyrics in ID3v2 `SYLT` frames
+are not read.
+
 ## Keys
 
 | Key                    | Action                                   |
@@ -165,6 +200,7 @@ the status bar says how many entries were left out.
 | `PgUp` / `PgDn`        | move the selection by a page             |
 | `g` / `Home`, `G` / `End` | first / last row                      |
 | `v`                    | show / hide the visualizer               |
+| `l`                    | show / hide the lyrics                   |
 | `?`                    | show every key; `↑`/`↓`, `k`/`j`, `PgUp`/`PgDn`, `g`/`Home`, `G`/`End` scroll it, any other key closes it |
 | `q`, `Ctrl+C`          | quit                                     |
 

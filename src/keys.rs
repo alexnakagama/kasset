@@ -246,11 +246,18 @@ pub const GROUPS: &[Group] = &[
     },
     Group {
         title: "Display",
-        entries: &[Entry {
-            keys: "v",
-            action: "show / hide the visualizer",
-            bar: &[],
-        }],
+        entries: &[
+            Entry {
+                keys: "v",
+                action: "show / hide the visualizer",
+                bar: &[],
+            },
+            Entry {
+                keys: "l",
+                action: "show / hide the lyrics",
+                bar: &[],
+            },
+        ],
     },
     Group {
         title: "Help & quit",
@@ -480,6 +487,38 @@ mod tests {
         assert_eq!(titles[titles.len() - 2..], ["Display", "Help & quit"]);
         for context in BarContext::ALL {
             assert!(!bar(context).iter().any(|label| label.starts_with("v ")));
+        }
+    }
+
+    #[test]
+    fn the_lyrics_key_is_in_the_help_after_v_but_not_the_bars() {
+        let action = "show / hide the lyrics";
+        let text = help_text();
+        let Some(text_line) = text.lines().find(|l| l.ends_with(action)) else {
+            panic!("--help does not list the lyrics key");
+        };
+        assert_eq!(text_line.split_whitespace().next(), Some("l"));
+        let keys: Vec<&str> = help_lines()
+            .filter_map(|line| match line {
+                HelpLine::Key(entry) => Some(entry.keys),
+                HelpLine::Title(_) | HelpLine::Blank => None,
+            })
+            .collect();
+        let Some(v) = keys.iter().position(|&k| k == "v") else {
+            panic!("no `v` entry");
+        };
+        assert_eq!(keys.get(v + 1), Some(&"l"), "right after `v`");
+        assert!(help_lines().any(|line| matches!(
+            line,
+            HelpLine::Key(Entry { keys: "l", action: a, .. }) if *a == action
+        )));
+        let display = GROUPS.iter().find(|group| group.title == "Display");
+        assert_eq!(
+            display.map(|group| group.entries.iter().map(|e| e.keys).collect::<Vec<_>>()),
+            Some(vec!["v", "l"])
+        );
+        for context in BarContext::ALL {
+            assert!(!bar(context).iter().any(|label| label.starts_with("l ")));
         }
     }
 

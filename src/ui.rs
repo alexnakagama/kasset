@@ -63,6 +63,10 @@ const NOW_PLAYING_HEIGHT: u16 = 3;
 /// side by side.
 pub const TWO_PANE_MIN_WIDTH: u16 = 70;
 
+/// Narrowest terminal, in columns, that shows the lyrics pane (with the
+/// lyrics pane on). The app also names it in the `l` notice.
+pub const LYRICS_MIN_WIDTH: u16 = 100;
+
 /// Shortest terminal, in rows, that shows the spectrum strip (with the
 /// visualizer on). The app also names it in the `v` notice.
 pub const SPECTRUM_MIN_HEIGHT: u16 = 24;
