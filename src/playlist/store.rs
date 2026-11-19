@@ -20,7 +20,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use super::name::{NameError, check_new_name};
@@ -28,6 +28,7 @@ use super::{
     EXTENSION, FileStamp, MAX_FILE_BYTES, Matching, PLAYLISTS_DIR, Playlist, ReadOnlyReason,
     Resolver,
 };
+use crate::bounded_read::read_limited;
 use crate::text::{display_path, is_invisible_format};
 
 /// At most this many playlists are listed, so a folder flooded with files
@@ -385,7 +386,7 @@ impl PlaylistStore for FsStore {
 
     fn load(&self, name: &str, resolver: &Resolver) -> Result<Playlist, StoreError> {
         let path = self.path_for(name)?;
-        let (content, truncated, stamp) =
+        let (content, truncated, meta) =
             read_limited(&path, MAX_FILE_BYTES).map_err(StoreError::io(Action::Read))?;
         let mut playlist = Playlist::parse(
             name.to_owned(),
@@ -398,7 +399,7 @@ impl PlaylistStore for FsStore {
         if self.links_outside(&playlist.path) {
             playlist.editable = Err(ReadOnlyReason::LinksOutside);
         }
-        playlist.stamp = Some(stamp);
+        playlist.stamp = Some(FileStamp::of(&meta));
         Ok(playlist)
     }
 
@@ -561,46 +562,6 @@ fn is_listable(name: &str) -> bool {
         && !name
             .chars()
             .any(|c| separator(c) || c.is_control() || is_invisible_format(c))
-}
-
-/// Reads at most `limit` bytes of a regular file. Returns the bytes, whether
-/// the file was longer, and the stamp of the file that was read.
-fn read_limited(path: &Path, limit: u64) -> io::Result<(Vec<u8>, bool, FileStamp)> {
-    let file = open_regular(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(not_a_file());
-    }
-    let cap = usize::try_from(meta.len().min(limit)).unwrap_or(0);
-    let mut content = Vec::with_capacity(cap);
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut content)?;
-    let truncated = content.len() as u64 > limit;
-    if truncated {
-        content.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    }
-    Ok((content, truncated, FileStamp::of(&meta)))
-}
-
-/// Opens `path` for reading without blocking if it is a FIFO or a device (the
-/// caller rejects anything that is not a regular file).
-#[cfg(unix)]
-fn open_regular(path: &Path) -> io::Result<File> {
-    use rustix::fs::{Mode, OFlags};
-    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
-    Ok(File::from(rustix::fs::open(path, flags, Mode::empty())?))
-}
-
-#[cfg(not(unix))]
-fn open_regular(path: &Path) -> io::Result<File> {
-    if !fs::metadata(path)?.is_file() {
-        return Err(not_a_file());
-    }
-    File::open(path)
-}
-
-fn not_a_file() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, "not a regular file")
 }
 
 /// `.<file name>.<kind>-<pid>` next to `path`.

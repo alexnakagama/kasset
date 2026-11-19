@@ -1,6 +1,7 @@
 //! `kasset` — a keyboard-driven terminal music player for a local music folder.
 
 mod app;
+mod bounded_read;
 mod cli;
 mod keys;
 mod library;
@@ -8,7 +9,7 @@ mod library;
     not(test),
     expect(
         dead_code,
-        reason = "loaded and shown by the app and UI from task groups 2 to 4"
+        reason = "loaded and shown by the app and UI from task groups 3 and 4"
     )
 )]
 mod lyrics;
