@@ -413,10 +413,6 @@ impl Visualizer {
 
 /// Shortest wait [`App::lyrics_deadline`] asks for, so a position just short
 /// of a line's time can never make the event loop spin.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the lyric deadline from task group 4")
-)]
 pub const LYRICS_MIN_WAIT: Duration = Duration::from_millis(10);
 
 /// The lyrics pane's state. Lyrics are read only by [`App::tick`], only while
@@ -435,6 +431,8 @@ struct LyricsPane {
     loaded_for: Option<PathBuf>,
     /// The lyrics of `loaded_for`; `None` when it has none.
     lyrics: Option<Lyrics>,
+    /// Counts lyrics loads, so the UI can tell when `lyrics` was replaced.
+    generation: u64,
 }
 
 impl LyricsPane {
@@ -444,6 +442,7 @@ impl LyricsPane {
             fits: false,
             loaded_for: None,
             lyrics: None,
+            generation: 0,
         }
     }
 
@@ -463,10 +462,6 @@ impl LyricsPane {
 }
 
 /// The lyrics pane's accessors, read by the UI and the event loop.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "drawn and timed by the UI from task group 4")
-)]
 impl<A: Audio> App<A> {
     /// Records whether the last frame was wide enough for the lyrics pane,
     /// like [`App::set_spectrum_layout`]. While it does not fit, the cached
@@ -511,13 +506,20 @@ impl<A: Audio> App<A> {
         }
     }
 
+    /// Changes each time lyrics are read, so the UI can keep their wrapped
+    /// rows until the next read.
+    #[must_use]
+    pub const fn lyrics_generation(&self) -> u64 {
+        self.lyrics.generation
+    }
+
     /// When the highlighted synced line changes next, as seen at `now`: the
     /// time until the next line's start, at least [`LYRICS_MIN_WAIT`].
     /// `None` unless the pane is shown, a track is playing, and its lyrics
     /// are synced with a line still to come.
     #[must_use]
     pub fn lyrics_deadline(&self, now: Instant) -> Option<Instant> {
-        if !self.lyrics.shown() || self.playback.state() != PlayState::Playing {
+        if !self.lyrics_shown() || self.playback.state() != PlayState::Playing {
             return None;
         }
         let position = self.playback.position();
@@ -836,6 +838,7 @@ impl<A: Audio> App<A> {
         }
         pane.lyrics = lyrics::source::load(&track.path);
         pane.loaded_for = Some(track.path.clone());
+        pane.generation = pane.generation.wrapping_add(1);
     }
 
     /// Moves the spectrum on to `now`, after playback has been driven. While

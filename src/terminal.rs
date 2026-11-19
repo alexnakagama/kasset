@@ -9,11 +9,14 @@
 //! UI is up, the process's standard error is pointed at `/dev/null` so that C
 //! libraries (ALSA in particular) cannot print over the screen.
 //!
-//! The loop ticks the app, draws, feeds the drawn layout back to the app,
+//! The loop ticks the app, draws, feeds the drawn layout back to the app
+//! (page size, help rows, the spectrum strip's and the lyrics pane's fit),
 //! then waits for input until the next frame's deadline: [`FRAME`] after the
 //! frame started, or [`ANIMATION_FRAME`] while the spectrum strip is
-//! animating ([`App::visualizer_animating`]). The deadline is counted from
-//! the start of the frame, so drawing time does not slow the frame rate.
+//! animating ([`App::visualizer_animating`]), or earlier when the
+//! highlighted synced lyric line changes before that
+//! ([`App::lyrics_deadline`]). The frame deadline is counted from the start
+//! of the frame, so drawing time does not slow the frame rate.
 
 use std::io::{self, IsTerminal, Stdout};
 use std::panic::{self, PanicHookInfo};
@@ -203,9 +206,12 @@ pub fn run<A: Audio>(app: &mut App<A>) -> Result<Exit> {
     }
 }
 
-/// When the frame that started at `frame_start` ends and the next one starts.
-fn next_deadline(frame_start: Instant, animating: bool) -> Instant {
-    frame_start + if animating { ANIMATION_FRAME } else { FRAME }
+/// When the frame that started at `frame_start` ends and the next one
+/// starts: the regular frame deadline, or `lyric` (when the highlighted
+/// lyric line changes next) if that is earlier.
+fn next_deadline(frame_start: Instant, animating: bool, lyric: Option<Instant>) -> Instant {
+    let frame = frame_start + if animating { ANIMATION_FRAME } else { FRAME };
+    lyric.map_or(frame, |lyric| lyric.min(frame))
 }
 
 /// How long to wait for input at `now` before `deadline`: zero once it has
@@ -240,10 +246,15 @@ fn event_loop<A: Audio>(
         app.set_page_size(view.page_size());
         app.set_help_rows(view.help_rows());
         app.set_spectrum_layout(view.spectrum_fits(), view.spectrum_bars());
+        app.set_lyrics_layout(view.lyrics_fits());
 
         // A resize needs no handling here: `draw` adapts to the new size on
         // the next frame, which follows immediately.
-        let deadline = next_deadline(frame_start, app.visualizer_animating());
+        let deadline = next_deadline(
+            frame_start,
+            app.visualizer_animating(),
+            app.lyrics_deadline(Instant::now()),
+        );
         let wait = wait_until(deadline, Instant::now());
         if event::poll(wait).context("cannot read terminal input")? {
             for _ in 0..MAX_EVENTS_PER_FRAME {
@@ -377,7 +388,7 @@ mod tests {
     #[test]
     fn animating_frames_are_frequent_enough() {
         let start = Instant::now();
-        assert_eq!(next_deadline(start, true) - start, ANIMATION_FRAME);
+        assert_eq!(next_deadline(start, true, None) - start, ANIMATION_FRAME);
         assert!(ANIMATION_FRAME < Duration::from_secs(1) / 25);
     }
 
@@ -385,18 +396,36 @@ mod tests {
     #[test]
     fn idle_frames_are_no_more_than_four_a_second() {
         let start = Instant::now();
-        assert_eq!(next_deadline(start, false) - start, FRAME);
+        assert_eq!(next_deadline(start, false, None) - start, FRAME);
         assert!(FRAME >= Duration::from_secs(1) / 4);
     }
 
     #[test]
     fn wait_counts_down_to_the_deadline_and_never_below_zero() {
         let start = Instant::now();
-        let deadline = next_deadline(start, true);
+        let deadline = next_deadline(start, true, None);
         assert_eq!(wait_until(deadline, start), ANIMATION_FRAME);
         let later = start + Duration::from_millis(10);
         assert_eq!(wait_until(deadline, later), Duration::from_millis(23));
         let late = start + Duration::from_millis(500);
         assert_eq!(wait_until(deadline, late), Duration::ZERO, "already passed");
+    }
+
+    /// The highlighted lyric line moves on time: a lyric deadline earlier
+    /// than the frame's wins, a later one does not.
+    #[test]
+    fn earlier_lyric_deadline_wins() {
+        let start = Instant::now();
+        let soon = start + Duration::from_millis(40);
+        assert_eq!(next_deadline(start, false, Some(soon)), soon);
+        let later = start + FRAME + Duration::from_millis(1);
+        assert_eq!(next_deadline(start, false, Some(later)) - start, FRAME);
+        assert_eq!(
+            next_deadline(start, true, Some(soon)) - start,
+            ANIMATION_FRAME,
+            "the animation frame is earlier still"
+        );
+        let past = start.checked_sub(Duration::from_millis(5)).unwrap_or(start);
+        assert_eq!(next_deadline(start, false, Some(past)), past);
     }
 }
