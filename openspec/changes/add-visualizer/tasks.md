@@ -96,7 +96,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 5. Integration checks
 
-- [ ] 5.1 Run kasset in a real terminal at 120 columns or more. Play a track with clear bass and treble and check that:
+- [x] 5.1 Run kasset in a real terminal at 120 columns or more. Play a track with clear bass and treble and check that:
   - the bars move smoothly;
   - Space makes them fall to zero within about a second;
   - `n` and seeking do not show the old track's spectrum;
@@ -106,7 +106,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - the bars do not flicker while playing, which would mean `STALE_AFTER` is too short for this device's buffer.
 
   Check CPU use with `top`: while paused with the bars idle, it should be the same as 0.2.0; while playing, record the figure in the PR description.
-- [ ] 5.2 Run the full checks from `CLAUDE.md`: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo +1.89 build`. Confirm `openspec validate add-visualizer --strict` passes. Verify that all of them pass.
+- [x] 5.2 Run the full checks from `CLAUDE.md`: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo +1.89 build`. Confirm `openspec validate add-visualizer --strict` passes. Verify that all of them pass.
 
 ## Workflow follow-up
 

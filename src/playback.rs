@@ -1543,7 +1543,8 @@ mod tests {
             recent,
             Some(Recent {
                 sample_rate: 44_100,
-                written: 2 * ToneAudio::STEP
+                written: 2 * ToneAudio::STEP,
+                generation: 1,
             })
         );
         assert_eq!(out.len(), FFT_SIZE);
@@ -1552,7 +1553,11 @@ mod tests {
 
         p.toggle_pause();
         let paused = p.recent_samples(&mut out).map(|r| r.written);
-        assert_eq!(paused, Some(2 * ToneAudio::STEP), "no new audio while paused");
+        assert_eq!(
+            paused,
+            Some(2 * ToneAudio::STEP),
+            "no new audio while paused"
+        );
 
         p.stop();
         assert_eq!(p.recent_samples(&mut out), None);

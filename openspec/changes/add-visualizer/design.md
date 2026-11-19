@@ -73,6 +73,9 @@ pub struct Recent {
     /// Total samples ever decoded into the tap; unchanged between two calls
     /// means no new audio arrived.
     pub written: u64,
+    /// Identifies the load (each load gets a fresh tap whose `written`
+    /// restarts at 0), so counts are only compared within one load.
+    pub generation: u64,
 }
 
 /// Clears `out`, then appends the newest decoded mono samples (at most
@@ -125,7 +128,7 @@ pub fn update(&mut self, input: Option<(&[f32], u32)>, bars: usize, now: Instant
 
 `App::tick(now)` updates the spectrum only when `on && fits && bars > 0`. It passes the samples only while `playback.state()` is `Playing` and new audio is arriving, and `None` otherwise. Paused, stopped, idle and stalled tracks therefore all fall to zero (spec: *Bars follow playback state*).
 
-`Visualizer` keeps the last `written` value and the `Instant` it last changed. If `written` has not advanced for `STALE_AFTER` (250 ms), the tap is stale and `None` is passed. `Guarded::next` runs inside the device callback, so `written` advances in bursts of one callback's worth of audio. 250 ms (the idle frame) leaves room for large ALSA, CoreAudio or WASAPI buffers, and the 1 s fall makes the extra delay harmless. It is a single constant, tuned in the 5.1 check if bars flicker. This covers a decoder that has ended before `Playback::tick` notices, and an output device that stopped pulling. Without it, the bars would freeze on the last window instead of falling. When the strip is not shown, the spectrum is not updated at all: no FFT runs. Its levels are reset, so the bars do not show a stale frame when the strip comes back.
+`Visualizer` keeps the last `(generation, written)` pair and the `Instant` it last changed. The generation is needed because a new load's `written` can match the old tap's count. If `written` has not advanced for `STALE_AFTER` (250 ms), the tap is stale and `None` is passed. `Guarded::next` runs inside the device callback, so `written` advances in bursts of one callback's worth of audio. 250 ms (the idle frame) leaves room for large ALSA, CoreAudio or WASAPI buffers, and the 1 s fall makes the extra delay harmless. It is a single constant, tuned in the 5.1 check if bars flicker. This covers a decoder that has ended before `Playback::tick` notices, and an output device that stopped pulling. Without it, the bars would freeze on the last window instead of falling. When the strip is not shown, the spectrum is not updated at all: no FFT runs. Its levels are reset, so the bars do not show a stale frame when the strip comes back.
 
 `v` in Normal mode, from either pane, flips `on`. While `!fits`, the change cannot be seen, so `v` also calls `notify` with an `Info` notice:
 - turning it on: "Visualizer on: needs a terminal at least 24 rows tall";

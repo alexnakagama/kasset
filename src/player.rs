@@ -20,7 +20,9 @@
 //! - the ring only ever holds samples at one sample rate: a rate change clears
 //!   it, and a channel-count change never mixes samples of two frame layouts;
 //! - every `load` gets fresh [`SourceFlags`], so a seek or track change starts
-//!   with an empty tap.
+//!   with an empty tap, numbered by the load's [`Recent::generation`];
+//! - a successful seek inside a source restarts the frame and batch in
+//!   progress; a failed one keeps them, so frames stay aligned.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -112,8 +114,12 @@ pub struct Recent {
     /// Sample rate of the samples copied, in Hz.
     pub sample_rate: u32,
     /// Total samples ever decoded into the tap; unchanged between two calls
-    /// means no new audio arrived.
+    /// with the same `generation` means no new audio arrived.
     pub written: u64,
+    /// Identifies the load the samples came from: every load (new track,
+    /// seek, replay) gets a new tap, whose `written` starts again at 0, so
+    /// `written` is only comparable within one generation.
+    pub generation: u64,
 }
 
 /// The operations playback logic needs from an audio output.
@@ -236,6 +242,8 @@ impl TapBuffer {
         Some(Recent {
             sample_rate: rate.get(),
             written: self.written,
+            // Filled in by the owner, which knows which load this tap is.
+            generation: 0,
         })
     }
 }
@@ -249,6 +257,8 @@ struct SourceFlags {
     panicked: AtomicBool,
     /// The newest decoded samples, for the visualizer.
     tap: Mutex<TapBuffer>,
+    /// Which load this is (see [`Recent::generation`]).
+    generation: u64,
 }
 
 /// The span format `Guarded` reads from its decoder after a sample.
@@ -376,8 +386,13 @@ impl<S: Source> Iterator for Guarded<S> {
         // to its next buffer.
         let read = quietly(AssertUnwindSafe(|| {
             let sample = inner.next();
-            let format = (new_span && sample.is_some())
-                .then(|| (inner.current_span_len(), inner.channels(), inner.sample_rate()));
+            let format = (new_span && sample.is_some()).then(|| {
+                (
+                    inner.current_span_len(),
+                    inner.channels(),
+                    inner.sample_rate(),
+                )
+            });
             (sample, format)
         }));
         match read {
@@ -429,16 +444,20 @@ impl<S: Source> Source for Guarded<S> {
     }
 
     fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
-        // Samples after the seek must not share a frame or a batch with
-        // samples before it.
-        self.restart_tap();
         let Some(inner) = self.inner.as_mut() else {
             return Err(SeekError::Other(Arc::new(DecoderCrashed)));
         };
-        quietly(AssertUnwindSafe(|| inner.try_seek(pos))).unwrap_or_else(|_| {
+        let result = quietly(AssertUnwindSafe(|| inner.try_seek(pos))).unwrap_or_else(|_| {
             self.poison();
             Err(SeekError::Other(Arc::new(DecoderCrashed)))
-        })
+        });
+        // Samples after a seek must not share a frame or a batch with samples
+        // before it. A failed seek leaves the source where it was, so the
+        // frame in progress stays aligned and is kept.
+        if result.is_ok() {
+            self.restart_tap();
+        }
+        result
     }
 }
 
@@ -551,6 +570,8 @@ pub struct Player {
     device: MixerDeviceSink,
     volume: Volume,
     device_error: DeviceErrorSlot,
+    /// Loads made so far; numbers each load's [`Recent::generation`].
+    loads: u64,
 }
 
 impl std::fmt::Debug for Player {
@@ -582,6 +603,7 @@ impl Player {
             device,
             volume: Volume::default(),
             device_error,
+            loads: 0,
         })
     }
 }
@@ -662,7 +684,11 @@ fn open_source(
 
 impl Audio for Player {
     fn load(&mut self, path: &Path, start: Duration, paused: bool) -> Result<()> {
-        let flags = Arc::new(SourceFlags::default());
+        self.loads = self.loads.wrapping_add(1);
+        let flags = Arc::new(SourceFlags {
+            generation: self.loads,
+            ..SourceFlags::default()
+        });
         let source = open_source(path, start, &flags)?;
         let duration = source.total_duration();
 
@@ -749,8 +775,15 @@ impl Audio for Player {
         // Reserve before locking, so the audio thread is never kept waiting
         // on an allocation.
         out.reserve(FFT_SIZE);
-        let tap = loaded.flags.tap.lock().unwrap_or_else(PoisonError::into_inner);
-        tap.copy_to(out)
+        let tap = loaded
+            .flags
+            .tap
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        tap.copy_to(out).map(|recent| Recent {
+            generation: loaded.flags.generation,
+            ..recent
+        })
     }
 }
 
@@ -993,6 +1026,88 @@ mod tests {
         frame.repeat(frames)
     }
 
+    #[test]
+    fn a_failed_seek_keeps_the_frame_in_progress_aligned() {
+        // Stereo frames alternating (0, 0) and (1, 1): mixed in step they
+        // give 0 and 1; mixed one sample off they would all give 0.5.
+        let data: Vec<Sample> = (0..2048)
+            .flat_map(|k| if k % 2 == 0 { [0.0, 0.0] } else { [1.0, 1.0] })
+            .collect();
+        let flags = Arc::new(SourceFlags::default());
+        let mut src = Guarded::new(
+            Spans::new(vec![Span::new(2, 44_100, data)]),
+            Arc::clone(&flags),
+        );
+        assert_eq!(src.next(), Some(0.0), "half of the first frame");
+        assert!(src.try_seek(Duration::from_secs(1)).is_err());
+        assert_eq!(src.by_ref().count(), 4095);
+        let (samples, _) = tap_of(&flags);
+        assert_eq!(samples.len(), 2048);
+        assert!(
+            samples
+                .iter()
+                .all(|&s| s.abs() < 1e-6 || (s - 1.0).abs() < 1e-6),
+            "frames stayed aligned: {:?}",
+            &samples[..8]
+        );
+    }
+
+    /// A 16-bit PCM WAV at 44.1 kHz with `frames` frames of `frame`
+    /// (one value per channel).
+    fn wav_of(frame: &[i16], frames: usize) -> Vec<u8> {
+        let channels = u16::try_from(frame.len()).unwrap_or(u16::MAX);
+        let data: Vec<u8> = frame
+            .repeat(frames)
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data_len).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&44_100u32.to_le_bytes());
+        v.extend_from_slice(&(44_100 * 2 * u32::from(channels)).to_le_bytes());
+        v.extend_from_slice(&(2 * channels).to_le_bytes()); // block align
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_len.to_le_bytes());
+        v.extend_from_slice(&data);
+        v
+    }
+
+    #[test]
+    fn real_decoder_output_is_mixed_to_mono_in_the_tap() {
+        // Through rodio's own decoder, so a rodio upgrade that changes when
+        // the span format is reported is caught here, not only by `Spans`.
+        for (frame, mono) in [
+            (&[16_384_i16, 0][..], 0.25_f32),
+            (
+                &[16_384, -16_384, 16_384, 0, 0, 16_384][..],
+                32_768.0 / 6.0 / 32_768.0,
+            ),
+        ] {
+            let bytes = wav_of(frame, 4096);
+            let decoder = Decoder::new(std::io::Cursor::new(bytes))
+                .unwrap_or_else(|err| panic!("decodes: {err}"));
+            let flags = Arc::new(SourceFlags::default());
+            let src = Guarded::new(decoder, Arc::clone(&flags));
+            assert_eq!(src.count(), 4096 * frame.len());
+            let (samples, recent) = tap_of(&flags);
+            assert_eq!(samples.len(), FFT_SIZE);
+            assert!(
+                samples.iter().all(|s| (s - mono).abs() < 1e-3),
+                "{} channels: {:?}",
+                frame.len(),
+                &samples[..4]
+            );
+            assert_eq!(recent.map(|r| r.sample_rate), Some(44_100));
+        }
+    }
+
     #[expect(
         clippy::cast_precision_loss,
         reason = "test indices are far below 2^24"
@@ -1013,7 +1128,8 @@ mod tests {
             recent,
             Some(Recent {
                 sample_rate: 44_100,
-                written: 1024
+                written: 1024,
+                generation: 0,
             })
         );
     }
@@ -1035,12 +1151,20 @@ mod tests {
     #[test]
     fn tap_is_empty_until_a_batch_is_handed_over() {
         let flags = Arc::new(SourceFlags::default());
-        assert_eq!(tap_of(&flags), (Vec::new(), None), "a new load's tap is empty");
+        assert_eq!(
+            tap_of(&flags),
+            (Vec::new(), None),
+            "a new load's tap is empty"
+        );
 
         let buffer = SamplesBuffer::new(channels(1), rate(8_000), vec![0.25; TAP_BATCH - 1]);
         let src = Guarded::new(buffer, Arc::clone(&flags));
         assert_eq!(src.count(), TAP_BATCH - 1);
-        assert_eq!(tap_of(&flags), (Vec::new(), None), "a partial batch is not flushed");
+        assert_eq!(
+            tap_of(&flags),
+            (Vec::new(), None),
+            "a partial batch is not flushed"
+        );
     }
 
     #[test]
@@ -1053,7 +1177,11 @@ mod tests {
             // `try_lock` on the thread holding the lock fails instead of blocking.
             assert_eq!(src.by_ref().take(2 * TAP_BATCH).count(), 2 * TAP_BATCH);
         }
-        assert_eq!(tap_of(&flags), (Vec::new(), None), "both batches were dropped");
+        assert_eq!(
+            tap_of(&flags),
+            (Vec::new(), None),
+            "both batches were dropped"
+        );
         assert_eq!(src.count(), 2 * TAP_BATCH);
         let (samples, recent) = tap_of(&flags);
         assert_eq!(samples.len(), 2 * TAP_BATCH);
@@ -1098,7 +1226,10 @@ mod tests {
             Span::new(1, 44_100, vec![0.25; 512]),
             Span::new(3, 44_100, frames(&[0.0, 0.0, 0.3], 512)),
         ]);
-        assert_eq!(Guarded::new(src, Arc::clone(&flags)).count(), 2048 + 512 + 1536);
+        assert_eq!(
+            Guarded::new(src, Arc::clone(&flags)).count(),
+            2048 + 512 + 1536
+        );
         let (samples, recent) = tap_of(&flags);
         let mut expected = vec![0.5; 1024];
         expected.extend([0.25; 512]);
@@ -1128,7 +1259,8 @@ mod tests {
             recent,
             Some(Recent {
                 sample_rate: 48_000,
-                written: 1024
+                written: 1024,
+                generation: 0,
             })
         );
     }
@@ -1152,7 +1284,11 @@ mod tests {
                 Some(5) => 3 * 2048 / 5 + 1,
                 _ => 3 * 2048 / UNKNOWN_SPAN + 1,
             };
-            assert!(reads.get() <= max_reads, "{reported:?}: {} reads", reads.get());
+            assert!(
+                reads.get() <= max_reads,
+                "{reported:?}: {} reads",
+                reads.get()
+            );
         }
     }
 
@@ -1190,7 +1326,10 @@ mod tests {
             assert_eq!(written, Some(batch * TAP_BATCH as u64));
         }
         assert_eq!(src.count(), 100);
-        assert_eq!(tap_of(&flags).1.map(|r| r.written), Some(3 * TAP_BATCH as u64));
+        assert_eq!(
+            tap_of(&flags).1.map(|r| r.written),
+            Some(3 * TAP_BATCH as u64)
+        );
     }
 
     #[test]
