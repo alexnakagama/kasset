@@ -245,6 +245,14 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        title: "Display",
+        entries: &[Entry {
+            keys: "v",
+            action: "show / hide the visualizer",
+            bar: &[],
+        }],
+    },
+    Group {
         title: "Help & quit",
         entries: &[
             Entry {
@@ -454,6 +462,25 @@ mod tests {
             Some(HelpLine::Title("Library"))
         ));
         assert!(matches!(help_lines().last(), Some(HelpLine::Key(_))));
+    }
+
+    #[test]
+    fn the_visualizer_key_is_in_the_help_but_not_the_bars() {
+        let action = "show / hide the visualizer";
+        let text = help_text();
+        let Some(text_line) = text.lines().find(|l| l.ends_with(action)) else {
+            panic!("--help does not list the visualizer key");
+        };
+        assert_eq!(text_line.split_whitespace().next(), Some("v"));
+        assert!(help_lines().any(|line| matches!(
+            line,
+            HelpLine::Key(Entry { keys: "v", action: a, .. }) if *a == action
+        )));
+        let titles: Vec<&str> = GROUPS.iter().map(|group| group.title).collect();
+        assert_eq!(titles[titles.len() - 2..], ["Display", "Help & quit"]);
+        for context in BarContext::ALL {
+            assert!(!bar(context).iter().any(|label| label.starts_with("v ")));
+        }
     }
 
     #[test]

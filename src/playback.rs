@@ -190,10 +190,6 @@ impl<A: Audio> Playback<A> {
 
     /// The newest decoded mono samples of the loaded track, for the
     /// visualizer; see [`Audio::recent_samples`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the visualizer from task group 3")
-    )]
     pub fn recent_samples(&self, out: &mut Vec<f32>) -> Option<Recent> {
         self.audio.recent_samples(out)
     }

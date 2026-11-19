@@ -128,8 +128,8 @@ pub fn update(&mut self, input: Option<(&[f32], u32)>, bars: usize, now: Instant
 `Visualizer` keeps the last `written` value and the `Instant` it last changed. If `written` has not advanced for `STALE_AFTER` (250 ms), the tap is stale and `None` is passed. `Guarded::next` runs inside the device callback, so `written` advances in bursts of one callback's worth of audio. 250 ms (the idle frame) leaves room for large ALSA, CoreAudio or WASAPI buffers, and the 1 s fall makes the extra delay harmless. It is a single constant, tuned in the 5.1 check if bars flicker. This covers a decoder that has ended before `Playback::tick` notices, and an output device that stopped pulling. Without it, the bars would freeze on the last window instead of falling. When the strip is not shown, the spectrum is not updated at all: no FFT runs. Its levels are reset, so the bars do not show a stale frame when the strip comes back.
 
 `v` in Normal mode, from either pane, flips `on`. While `!fits`, the change cannot be seen, so `v` also calls `notify` with an `Info` notice:
-- turning it on: "visualizer on: needs a terminal at least 24 rows tall";
-- turning it off: "visualizer off".
+- turning it on: "Visualizer on: needs a terminal at least 24 rows tall";
+- turning it off: "Visualizer off".
 
 When the strip is visible, the change speaks for itself and no notice is shown. In Search and in the prompts, `v` keeps its current meaning (typed text, or "any other key"), because those modes handle keys before Normal-mode dispatch.
 
