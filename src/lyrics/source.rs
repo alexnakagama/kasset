@@ -66,7 +66,8 @@ fn load_unguarded(track: &Path) -> Option<Lyrics> {
 /// may be cut inside a character.
 fn decode_sidecar(bytes: &[u8], truncated: bool) -> String {
     let mut text = decode(bytes);
-    if truncated && let Some(end) = text.rfind('\n') {
+    // `\r` too, for files with classic Mac (lone CR) line endings.
+    if truncated && let Some(end) = text.rfind(['\n', '\r']) {
         text.truncate(end);
     }
     text
@@ -391,6 +392,16 @@ mod tests {
         assert_eq!(
             decode_sidecar(bytes, false),
             "[00:01.00]One\n[00:02.00]Tw\u{FFFD}"
+        );
+        // Lone CR (classic Mac) and CRLF endings.
+        assert_eq!(
+            decode_sidecar(b"[00:01.00]One\r[00:02.00]Tw", true),
+            "[00:01.00]One"
+        );
+        assert_eq!(
+            decode_sidecar(b"[00:01.00]One\r\n[00:02.00]Tw", true),
+            "[00:01.00]One\r",
+            "the parser drops the CR of a CRLF ending"
         );
         // A single cut line is kept as it is.
         assert_eq!(decode_sidecar(b"abc", true), "abc");

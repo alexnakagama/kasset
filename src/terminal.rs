@@ -14,8 +14,8 @@
 //! then waits for input until the next frame's deadline: [`FRAME`] after the
 //! frame started, or [`ANIMATION_FRAME`] while the spectrum strip is
 //! animating ([`App::visualizer_animating`]), or earlier when the
-//! highlighted synced lyric line changes before that
-//! ([`App::lyrics_deadline`]). The frame deadline is counted from the start
+//! highlighted synced lyric line changes before that, or at once while the
+//! lyrics pane has a read due ([`App::lyrics_deadline`]). The frame deadline is counted from the start
 //! of the frame, so drawing time does not slow the frame rate.
 
 use std::io::{self, IsTerminal, Stdout};
