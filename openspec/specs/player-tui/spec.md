@@ -29,7 +29,7 @@ The system SHALL restore the terminal to its original state (cursor, raw mode, a
 - **THEN** the program quits the same way as `q`
 
 ### Requirement: Screen layout
-The system SHALL show a sidebar (a "Library" entry followed by the saved playlists) and a main pane with the tracks of the entry chosen in it, above a now-playing area of at most three rows. On terminals tall enough for the spectrum strip, with the visualizer on, a spectrum strip SHALL be shown across the full width between the panes and the now-playing area. The now-playing area SHALL show the state, title, artist, album, the volume, shuffle and repeat indicators, and a progress bar with elapsed and total time. Below it SHALL be a status line and a bottom bar with the main keys for the current focus and mode; in Normal mode the bar SHALL end with `? help`.
+The system SHALL show a sidebar (a "Library" entry followed by the saved playlists) and a main pane with the tracks of the entry chosen in it, above a now-playing area of at most three rows. On terminals wide enough for the lyrics pane, with the lyrics pane on, a lyrics pane SHALL be shown as a third column to the right of the main pane. On terminals tall enough for the spectrum strip, with the visualizer on, a spectrum strip SHALL be shown across the full width between the panes and the now-playing area. The now-playing area SHALL show the state, title, artist, album, the volume, shuffle and repeat indicators, and a progress bar with elapsed and total time. Below it SHALL be a status line and a bottom bar with the main keys for the current focus and mode; in Normal mode the bar SHALL end with `? help`.
 
 #### Scenario: Track playing
 - **WHEN** "Song" by "Band" is playing at 1:05 of 3:30
@@ -37,7 +37,11 @@ The system SHALL show a sidebar (a "Library" entry followed by the saved playlis
 
 #### Scenario: Both panes visible
 - **WHEN** the terminal is 100 columns wide and the main pane shows the library
-- **THEN** the sidebar on the left lists "Library" and every saved playlist with its track count, and the main pane on the right lists the library's tracks
+- **THEN** the sidebar on the left lists "Library" and every saved playlist with its track count, and the main pane to its right lists the library's tracks
+
+#### Scenario: Lyrics pane visible
+- **WHEN** the terminal is 120 columns wide and the lyrics pane is on
+- **THEN** the sidebar, the main pane and the lyrics pane are shown side by side, left to right
 
 #### Scenario: Spectrum strip visible
 - **WHEN** the terminal is 100 columns wide and 30 rows tall and the visualizer is on
