@@ -18,7 +18,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   Keep casts in small helpers with scoped `#[allow]`s and a comment on why each is in range. Register the module in `main.rs`. Verify with unit tests:
   - a 100 Hz sine peaks in the left third, and a 5 kHz sine in the right half, at 44.1, 48 and 96 kHz (spec *Low tone*, *High tone*);
   - a full-scale sine centred on a bin reaches at least 0.95, and a sine at −70 dB gives zero;
-  - `format!("{spectrum:?}")` works.
+  - `format!("{spectrum:?}")` works;
   - `None`, silence and fewer than `FFT_SIZE` samples give zero targets;
   - after a full-height frame and then `None`, the level is about 0.5 at 0.5 s and 0 at 1 s, and `is_idle()` is true (spec *Sudden silence*);
   - band edges increase monotonically and the top edge is capped at Nyquist at 22.05 kHz;
@@ -28,7 +28,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 - [ ] 2.1 Add `TapBuffer` (a ring of the newest `FFT_SIZE` mono samples, the sample rate, and `written: u64`, deriving `Debug` and `Default`) as `tap: Mutex<TapBuffer>` in `SourceFlags` (D1). In `Guarded`:
   - mix each frame of `rodio::Sample`s to mono `f32` and fill a 512-sample batch allocated in `Guarded::new`;
-  - re-read `channels` and `sample_rate` only at span boundaries; discard the partial frame on a channel-count change, and discard the batch and clear the ring on a rate change;
+  - track the span with `span_left`. After `inner.next()`, when `span_left == 0` and no frame is half-built, read `current_span_len()`, `channels()` and `sample_rate()`. That function returns the total span size, not the remainder. Treat `None` or `Some(0)` as 4096 samples. On a channel-count change, discard the partial frame; on a rate change, discard the batch and clear the ring (D1);
   - flush the batch with `try_lock`: drop it on `WouldBlock`, recover from poison with `into_inner`, and add the flushed length to `written`.
 
    Update the `player.rs` `//!` doc with the tap's invariants: it never blocks or allocates on the audio thread, and it is taken before the volume. Verify with unit tests driving `Guarded` over a rodio `SamplesBuffer`, with no device:
@@ -37,6 +37,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - with the tap lock held by the test, `next()` keeps returning samples and the batch is dropped;
   - the tap equals the decoded samples whatever the volume, since the tap is upstream of rodio's amplify stage (spec *Volume does not matter*);
   - a two-span source whose channel count changes is mixed correctly per span, and a rate change clears the ring;
+  - a span whose length is not a multiple of the old frame size, and a source reporting `current_span_len() == Some(0)` or `None`, keep frames aligned without re-reading on every sample;
   - `written` grows by each flushed batch.
 - [ ] 2.2 Add `Recent { sample_rate: u32, written: u64 }` and `Audio::recent_samples(&self, out: &mut Vec<f32>) -> Option<Recent>` with a default returning `None` (D2). It clears `out` and appends the whole ring. Implement it for `Player` by copying the loaded track's tap, converting the rate with `.get()`. Add a `Playback::recent_samples` pass-through. Add `ToneAudio` to `src/test_support.rs`: it behaves like `SilentAudio`, returns a sine of configurable frequency and amplitude, and can be told to stop advancing `written`. Verify:
   - every existing test passes unchanged, since `SilentAudio` and `FakeAudio` are not edited;
@@ -47,7 +48,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 - [ ] 3.1 Add the `Visualizer` state to `App` (D4): `on` (initially `true`), `spectrum`, the fed-back `fits` and `bars`, and a reusable sample buffer.
   - Add `set_spectrum_layout(fits, bars)`, `visualizer_on()`, `spectrum_levels()` and `visualizer_animating()`.
-  - In `tick`, update the spectrum only when `on && fits && bars > 0`. Pass samples only while `PlayState::Playing` and `written` has advanced within `STALE_AFTER` (100 ms); otherwise pass `None`. When the pane is not shown, reset the levels instead.
+  - In `tick`, update the spectrum only when `on && fits && bars > 0`. Pass samples only while `PlayState::Playing` and `written` has advanced within `STALE_AFTER` (250 ms); otherwise pass `None`. When the pane is not shown, reset the levels instead.
   - Update the `app.rs` `//!` doc.
 
   Verify with tests using `ToneAudio` and an injected `Instant`:
@@ -100,7 +101,8 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - `n` and seeking do not show the old track's spectrum;
   - lowering the volume does not shrink them;
   - narrowing the window below 110 columns hides the pane and widening restores it;
-  - `v` hides and shows it.
+  - `v` hides and shows it;
+  - the bars do not flicker while playing, which would mean `STALE_AFTER` is too short for this device's buffer.
 
   Check CPU use with `top`: while paused with the bars idle, it should be the same as 0.2.0; while playing, record the figure in the PR description.
 - [ ] 5.2 Run the full checks from `CLAUDE.md`: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo +1.89 build`. Confirm `openspec validate add-visualizer --strict` passes. Verify that all of them pass.

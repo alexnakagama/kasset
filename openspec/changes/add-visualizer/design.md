@@ -35,7 +35,12 @@ The parts of the current code that shape the approach:
 
 `FFT_SIZE` is defined once, as `pub const` in `visualizer.rs`, and `player.rs` imports it. `TapBuffer` derives `Debug` and `Default`, so `SourceFlags` keeps both derives.
 
-**Mixing to mono.** `Guarded` caches `channels` and `sample_rate`, which it already stores. It re-reads them from the inner source only at a span boundary: when `current_span_len()` counts down to zero, or every 4096 samples when the span length is unknown. That keeps the per-sample path to an add and a counter.
+**Mixing to mono.** `Guarded` caches `channels` and `sample_rate`, which it already stores, and tracks the span itself. In rodio 0.23, `current_span_len()` returns the **total** size of the current span, not the samples left (rodio `source/mod.rs:181`). The Symphonia decoder reports its current packet buffer's length, and replaces that buffer only inside `next()` (`decoder/symphonia.rs:163`). So:
+- `Guarded` keeps `span_left: usize`. It calls `inner.next()` first. If `span_left == 0` and no frame is half-built (`frame_count == 0`), it then reads `current_span_len()`, `channels()` and `sample_rate()`. It sets `span_left` to the reported length, and counts the sample just read in the new format. Reading after `next()` sees the new buffer, not the old one.
+- `span_left` goes down by one per sample. A reported length of `None` or `Some(0)` means "unknown": `span_left` is set to 4096 samples, so the values are not re-read on every sample.
+- Re-reads happen only on a frame boundary. A span ends on one by rodio's contract, and the 4096 fallback is not a multiple of 3 or 6 channels, so it could otherwise split a frame.
+
+The per-sample path stays an add and two counters.
 - Each sample (`rodio::Sample`) is added to a running frame sum.
 - When a frame has `channels` samples, their mean is pushed as `f32` onto a local batch: a `Vec<f32>` with capacity 512, allocated once in `Guarded::new`.
 - If the channel count changes, the partial frame is discarded.
@@ -120,7 +125,7 @@ pub fn update(&mut self, input: Option<(&[f32], u32)>, bars: usize, now: Instant
 
 `App::tick(now)` updates the spectrum only when `on && fits && bars > 0`. It passes the samples only while `playback.state()` is `Playing` and new audio is arriving, and `None` otherwise. Paused, stopped, idle and stalled tracks therefore all fall to zero (spec: *Bars follow playback state*).
 
-`Visualizer` keeps the last `written` value and the `Instant` it last changed. If `written` has not advanced for `STALE_AFTER` (100 ms), the tap is stale and `None` is passed. This covers a decoder that has ended before `Playback::tick` notices, and an output device that stopped pulling. Without it, the bars would freeze on the last window instead of falling. When the pane is not shown, the spectrum is not updated at all: no FFT runs. Its levels are reset, so the bars do not show a stale frame when the pane comes back.
+`Visualizer` keeps the last `written` value and the `Instant` it last changed. If `written` has not advanced for `STALE_AFTER` (250 ms), the tap is stale and `None` is passed. `Guarded::next` runs inside the device callback, so `written` advances in bursts of one callback's worth of audio. 250 ms (the idle frame) leaves room for large ALSA, CoreAudio or WASAPI buffers, and the 1 s fall makes the extra delay harmless. It is a single constant, tuned in the 5.1 check if bars flicker. This covers a decoder that has ended before `Playback::tick` notices, and an output device that stopped pulling. Without it, the bars would freeze on the last window instead of falling. When the pane is not shown, the spectrum is not updated at all: no FFT runs. Its levels are reset, so the bars do not show a stale frame when the pane comes back.
 
 `v` in Normal mode, from either pane, flips `on`. While `!fits`, the change cannot be seen, so `v` also calls `notify` with an `Info` notice:
 - turning it on: "visualizer on: needs a terminal at least 110 columns wide";
