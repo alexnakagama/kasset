@@ -3,13 +3,31 @@
 //! [`Audio`] is the small interface the rest of the program drives; [`Player`]
 //! implements it with `rodio`, and tests implement it with a fake so playback
 //! logic can be checked without sound hardware.
+//!
+//! Every decoder is wrapped in [`Guarded`], which runs on rodio's audio thread.
+//! Besides turning decoder panics into the end of the track, it is the audio
+//! tap for the visualizer: it mixes each decoded frame to mono and hands the
+//! samples over in batches to the track's [`TapBuffer`], which keeps the newest
+//! [`FFT_SIZE`] of them for [`Audio::recent_samples`]. Tap invariants:
+//! - the audio thread never blocks or allocates for it: the batch is allocated
+//!   in [`Guarded::new`] and the ring with the track's [`SourceFlags`] (both
+//!   on the UI thread), and a batch is handed over with `try_lock`, so it is
+//!   dropped when the UI holds the lock. A dropped batch leaves a small jump
+//!   in the ring's audio, which only blurs one spectrum frame; it is rare,
+//!   since the UI holds the lock just long enough to copy the ring;
+//! - it is taken before the volume (rodio applies the volume downstream of
+//!   `Guarded`), so the samples do not depend on it;
+//! - the ring only ever holds samples at one sample rate: a rate change clears
+//!   it, and a channel-count change never mixes samples of two frame layouts;
+//! - every `load` gets fresh [`SourceFlags`], so a seek or track change starts
+//!   with an empty tap.
 
 use std::fs::File;
 use std::io::BufReader;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,6 +38,7 @@ use rodio::{Sample, SampleRate, Source};
 
 use crate::panic_guard::quietly;
 use crate::text::sanitize;
+use crate::visualizer::FFT_SIZE;
 
 /// How far one seek step moves.
 pub const SEEK_STEP: Duration = Duration::from_secs(5);
@@ -87,6 +106,16 @@ pub enum Status {
     Failed(String),
 }
 
+/// What [`Audio::recent_samples`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recent {
+    /// Sample rate of the samples copied, in Hz.
+    pub sample_rate: u32,
+    /// Total samples ever decoded into the tap; unchanged between two calls
+    /// means no new audio arrived.
+    pub written: u64,
+}
+
 /// The operations playback logic needs from an audio output.
 pub trait Audio {
     /// Opens `path`, positions it at `start` and starts it (or leaves it paused),
@@ -119,28 +148,139 @@ pub trait Audio {
 
     /// The most recent output-device error since the last call, if any.
     fn take_device_error(&mut self) -> Option<String>;
+
+    /// Clears `out`, then appends the newest decoded mono samples (at most
+    /// [`FFT_SIZE`], oldest first). Returns `None` when no track is loaded or
+    /// no samples have reached the tap yet (they arrive in batches, so the
+    /// last few milliseconds of a track may never show). The default has no
+    /// samples.
+    fn recent_samples(&self, out: &mut Vec<f32>) -> Option<Recent> {
+        out.clear();
+        None
+    }
 }
 
-/// Flags shared between a playing source (audio thread) and the [`Player`].
+/// Mono samples `Guarded` collects before handing them to the tap.
+const TAP_BATCH: usize = 512;
+
+/// Span length assumed when a source does not report one, so the format is
+/// not re-read on every sample.
+const UNKNOWN_SPAN: usize = 4096;
+
+/// The newest decoded mono samples of a track, shared between its [`Guarded`]
+/// source (audio thread, writer) and the [`Player`] (UI thread, reader).
+#[derive(Debug)]
+struct TapBuffer {
+    /// Circular storage, always [`FFT_SIZE`] long, allocated up front so the
+    /// audio thread never allocates.
+    ring: Box<[f32]>,
+    /// Where the next sample goes; the oldest sample once the ring is full.
+    head: usize,
+    /// How many samples of `ring` are valid, at most [`FFT_SIZE`].
+    len: usize,
+    /// Rate of the samples in `ring`; `None` until the first batch arrives.
+    sample_rate: Option<SampleRate>,
+    /// Total samples ever appended, across rate changes.
+    written: u64,
+}
+
+impl Default for TapBuffer {
+    fn default() -> Self {
+        Self {
+            ring: vec![0.0; FFT_SIZE].into_boxed_slice(),
+            head: 0,
+            len: 0,
+            sample_rate: None,
+            written: 0,
+        }
+    }
+}
+
+impl TapBuffer {
+    /// Appends `samples` decoded at `rate`, dropping the oldest ones. Samples
+    /// at a different rate than those held replace them instead.
+    fn push(&mut self, samples: &[f32], rate: SampleRate) {
+        if self.sample_rate != Some(rate) {
+            self.sample_rate = Some(rate);
+            self.head = 0;
+            self.len = 0;
+        }
+        let capacity = self.ring.len();
+        // Only the newest `capacity` samples can survive.
+        let keep = &samples[samples.len().saturating_sub(capacity)..];
+        for &sample in keep {
+            if let Some(slot) = self.ring.get_mut(self.head) {
+                *slot = sample;
+            }
+            self.head = (self.head + 1) % capacity;
+        }
+        self.len = (self.len + keep.len()).min(capacity);
+        // A `usize` always fits in a `u64` on supported targets; saturate anyway.
+        let added = u64::try_from(samples.len()).unwrap_or(u64::MAX);
+        self.written = self.written.saturating_add(added);
+    }
+
+    /// Clears `out` and appends the held samples, oldest first.
+    fn copy_to(&self, out: &mut Vec<f32>) -> Option<Recent> {
+        out.clear();
+        let rate = self.sample_rate?;
+        let capacity = self.ring.len();
+        let start = (self.head + capacity - self.len) % capacity;
+        let end = start + self.len;
+        if end <= capacity {
+            out.extend_from_slice(self.ring.get(start..end).unwrap_or_default());
+        } else {
+            out.extend_from_slice(self.ring.get(start..).unwrap_or_default());
+            out.extend_from_slice(self.ring.get(..end - capacity).unwrap_or_default());
+        }
+        Some(Recent {
+            sample_rate: rate.get(),
+            written: self.written,
+        })
+    }
+}
+
+/// State shared between a playing source (audio thread) and the [`Player`].
 #[derive(Debug, Default)]
 struct SourceFlags {
     /// At least one sample was decoded.
     produced: AtomicBool,
     /// The decoder panicked; the source ended early.
     panicked: AtomicBool,
+    /// The newest decoded samples, for the visualizer.
+    tap: Mutex<TapBuffer>,
 }
 
-/// A source wrapper that turns a decoder panic into the end of the track.
+/// The span format `Guarded` reads from its decoder after a sample.
+type SpanFormat = (Option<usize>, ChannelCount, SampleRate);
+
+/// A source wrapper that turns a decoder panic into the end of the track, and
+/// taps the decoded samples for the visualizer.
 ///
 /// Decoders parse untrusted files on the audio thread; a panic there would kill
 /// the output stream for the rest of the session. Instead the panic is caught,
 /// recorded in [`SourceFlags::panicked`] and the source reports exhaustion.
+///
+/// The tap tracks spans itself: rodio's `current_span_len()` is the total size
+/// of the current span, not what is left of it, so `span_left` counts down,
+/// and the format is re-read after the sample that starts a new span, and only
+/// on a frame boundary.
 struct Guarded<S> {
     inner: Option<S>,
     flags: Arc<SourceFlags>,
     produced: bool,
+    /// Channel count of the current span (the last one, once `inner` is gone).
     channels: ChannelCount,
+    /// Sample rate of the current span (the last one, once `inner` is gone).
     sample_rate: SampleRate,
+    /// Samples left in the current span; 0 means "read the format again".
+    span_left: usize,
+    /// Sum of the samples of the frame being built.
+    frame_sum: f32,
+    /// Samples in the frame being built, below `channels`.
+    frame_count: u16,
+    /// Mono samples not yet handed to the tap, at most [`TAP_BATCH`].
+    batch: Vec<f32>,
 }
 
 impl<S: Source> Guarded<S> {
@@ -151,6 +291,10 @@ impl<S: Source> Guarded<S> {
             inner: Some(inner),
             flags,
             produced: false,
+            span_left: 0,
+            frame_sum: 0.0,
+            frame_count: 0,
+            batch: Vec::with_capacity(TAP_BATCH),
         }
     }
 
@@ -160,6 +304,64 @@ impl<S: Source> Guarded<S> {
         let inner = self.inner.take();
         let _ignored = quietly(AssertUnwindSafe(move || drop(inner)));
     }
+
+    /// Forgets the span and the samples not yet handed over, so the next
+    /// sample starts a new span and a new frame.
+    fn restart_tap(&mut self) {
+        self.span_left = 0;
+        self.frame_sum = 0.0;
+        self.frame_count = 0;
+        self.batch.clear();
+    }
+
+    /// Starts a new span with the format read from the decoder.
+    fn start_span(&mut self, (len, channels, rate): SpanFormat) {
+        self.span_left = match len {
+            None | Some(0) => UNKNOWN_SPAN,
+            Some(len) => len,
+        };
+        if channels != self.channels {
+            self.channels = channels;
+            self.frame_sum = 0.0;
+            self.frame_count = 0;
+        }
+        if rate != self.sample_rate {
+            self.sample_rate = rate;
+            // The tap clears its ring when the next batch arrives at the new rate.
+            self.batch.clear();
+        }
+    }
+
+    /// Adds one decoded sample to the tap.
+    fn tap(&mut self, sample: Sample) {
+        self.span_left = self.span_left.saturating_sub(1);
+        self.frame_sum += sample;
+        self.frame_count += 1;
+        let channels = self.channels.get();
+        if self.frame_count < channels {
+            return;
+        }
+        let mono = self.frame_sum / f32::from(channels);
+        self.frame_sum = 0.0;
+        self.frame_count = 0;
+        // Never grows past the capacity reserved in `new`: it is flushed when full.
+        self.batch.push(mono);
+        if self.batch.len() >= TAP_BATCH {
+            self.flush();
+        }
+    }
+
+    /// Hands the batch to the tap if it is free, else drops it.
+    fn flush(&mut self) {
+        match self.flags.tap.try_lock() {
+            Ok(mut tap) => tap.push(&self.batch, self.sample_rate),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().push(&self.batch, self.sample_rate);
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+        self.batch.clear();
+    }
 }
 
 impl<S: Source> Iterator for Guarded<S> {
@@ -167,17 +369,30 @@ impl<S: Source> Iterator for Guarded<S> {
 
     fn next(&mut self) -> Option<Sample> {
         let inner = self.inner.as_mut()?;
+        let new_span = self.span_left == 0 && self.frame_count == 0;
         // The decoder is dropped on panic and never touched again, so no broken
         // invariant can be observed. Requires `panic = "unwind"` (Cargo.toml).
-        match quietly(AssertUnwindSafe(|| inner.next())) {
-            Ok(Some(sample)) => {
+        // The format is read after `next()`, which is when a decoder switches
+        // to its next buffer.
+        let read = quietly(AssertUnwindSafe(|| {
+            let sample = inner.next();
+            let format = (new_span && sample.is_some())
+                .then(|| (inner.current_span_len(), inner.channels(), inner.sample_rate()));
+            (sample, format)
+        }));
+        match read {
+            Ok((Some(sample), format)) => {
                 if !self.produced {
                     self.produced = true;
                     self.flags.produced.store(true, Ordering::Release);
                 }
+                if let Some(format) = format {
+                    self.start_span(format);
+                }
+                self.tap(sample);
                 Some(sample)
             }
-            Ok(None) => None,
+            Ok((None, _)) => None,
             Err(_) => {
                 self.poison();
                 None
@@ -214,6 +429,9 @@ impl<S: Source> Source for Guarded<S> {
     }
 
     fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        // Samples after the seek must not share a frame or a batch with
+        // samples before it.
+        self.restart_tap();
         let Some(inner) = self.inner.as_mut() else {
             return Err(SeekError::Other(Arc::new(DecoderCrashed)));
         };
@@ -524,6 +742,16 @@ impl Audio for Player {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
+
+    fn recent_samples(&self, out: &mut Vec<f32>) -> Option<Recent> {
+        out.clear();
+        let loaded = self.loaded.as_ref()?;
+        // Reserve before locking, so the audio thread is never kept waiting
+        // on an allocation.
+        out.reserve(FFT_SIZE);
+        let tap = loaded.flags.tap.lock().unwrap_or_else(PoisonError::into_inner);
+        tap.copy_to(out)
+    }
 }
 
 /// Where a seek by `step` (forward or back) from `pos` lands, clamped to the
@@ -546,6 +774,7 @@ pub fn seek_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rodio::buffer::SamplesBuffer;
     use std::num::NonZero;
 
     #[test]
@@ -647,6 +876,341 @@ mod tests {
         assert_eq!(src.current_span_len(), Some(0));
         assert_eq!(src.channels(), NonZero::<u16>::MIN);
         assert!(src.try_seek(Duration::ZERO).is_err());
+    }
+
+    /// One span of a [`Spans`] source.
+    struct Span {
+        channels: u16,
+        rate: u32,
+        /// What `current_span_len` reports while in this span.
+        reported: Option<usize>,
+        data: Vec<Sample>,
+    }
+
+    impl Span {
+        fn new(channels: u16, rate: u32, data: Vec<Sample>) -> Self {
+            Self {
+                channels,
+                rate,
+                reported: Some(data.len()),
+                data,
+            }
+        }
+    }
+
+    /// A decoder-like source made of spans. Like rodio's Symphonia decoder,
+    /// its format getters describe the span of the sample `next()` returned
+    /// last (the first span before any). Counts format reads.
+    struct Spans {
+        parts: Vec<Span>,
+        span: usize,
+        pos: usize,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Spans {
+        fn new(parts: Vec<Span>) -> Self {
+            Self {
+                parts,
+                span: 0,
+                pos: 0,
+                reads: std::rc::Rc::default(),
+            }
+        }
+
+        fn current(&self) -> Option<&Span> {
+            self.parts.get(self.span)
+        }
+    }
+
+    impl Iterator for Spans {
+        type Item = Sample;
+        fn next(&mut self) -> Option<Sample> {
+            loop {
+                let span = self.parts.get(self.span)?;
+                if let Some(&sample) = span.data.get(self.pos) {
+                    self.pos += 1;
+                    return Some(sample);
+                }
+                if self.span + 1 >= self.parts.len() {
+                    return None;
+                }
+                self.span += 1;
+                self.pos = 0;
+            }
+        }
+    }
+
+    impl Source for Spans {
+        fn current_span_len(&self) -> Option<usize> {
+            self.reads.set(self.reads.get() + 1);
+            self.current().and_then(|s| s.reported)
+        }
+        fn channels(&self) -> ChannelCount {
+            self.current()
+                .and_then(|s| NonZero::new(s.channels))
+                .unwrap_or(NonZero::<u16>::MIN)
+        }
+        fn sample_rate(&self) -> SampleRate {
+            self.current()
+                .and_then(|s| NonZero::new(s.rate))
+                .unwrap_or(NonZero::<u32>::MIN)
+        }
+        fn total_duration(&self) -> Option<Duration> {
+            None
+        }
+        /// Supports only seeking back to the start.
+        fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+            if !pos.is_zero() {
+                return Err(SeekError::NotSupported {
+                    underlying_source: "Spans",
+                });
+            }
+            self.span = 0;
+            self.pos = 0;
+            Ok(())
+        }
+    }
+
+    fn rate(hz: u32) -> SampleRate {
+        NonZero::new(hz).unwrap_or(NonZero::<u32>::MIN)
+    }
+
+    fn channels(n: u16) -> ChannelCount {
+        NonZero::new(n).unwrap_or(NonZero::<u16>::MIN)
+    }
+
+    /// The tap's samples and what `copy_to` reports.
+    fn tap_of(flags: &SourceFlags) -> (Vec<f32>, Option<Recent>) {
+        let mut out = vec![9.0; 3];
+        let tap = flags.tap.lock().unwrap_or_else(PoisonError::into_inner);
+        let recent = tap.copy_to(&mut out);
+        (out, recent)
+    }
+
+    /// `frames` interleaved frames, each a copy of `frame`.
+    fn frames(frame: &[Sample], frames: usize) -> Vec<Sample> {
+        frame.repeat(frames)
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test indices are far below 2^24"
+    )]
+    fn ramp(n: usize) -> Vec<Sample> {
+        (0..n).map(|i| i as Sample).collect()
+    }
+
+    #[test]
+    fn tap_mixes_stereo_to_mono() {
+        let flags = Arc::new(SourceFlags::default());
+        let buffer = SamplesBuffer::new(channels(2), rate(44_100), frames(&[1.0, 0.0], 1024));
+        let src = Guarded::new(buffer, Arc::clone(&flags));
+        assert_eq!(src.count(), 2048);
+        let (samples, recent) = tap_of(&flags);
+        assert_eq!(samples, vec![0.5; 1024]);
+        assert_eq!(
+            recent,
+            Some(Recent {
+                sample_rate: 44_100,
+                written: 1024
+            })
+        );
+    }
+
+    #[test]
+    fn tap_keeps_the_newest_samples_in_order() {
+        let flags = Arc::new(SourceFlags::default());
+        let n = FFT_SIZE + 3 * TAP_BATCH;
+        let data = ramp(n);
+        let buffer = SamplesBuffer::new(channels(1), rate(48_000), data.clone());
+        let src = Guarded::new(buffer, Arc::clone(&flags));
+        assert_eq!(src.count(), n);
+        let (samples, recent) = tap_of(&flags);
+        assert_eq!(samples, data.get(n - FFT_SIZE..).unwrap_or_default());
+        assert_eq!(recent.map(|r| r.sample_rate), Some(48_000));
+        assert_eq!(recent.map(|r| r.written), Some(n as u64));
+    }
+
+    #[test]
+    fn tap_is_empty_until_a_batch_is_handed_over() {
+        let flags = Arc::new(SourceFlags::default());
+        assert_eq!(tap_of(&flags), (Vec::new(), None), "a new load's tap is empty");
+
+        let buffer = SamplesBuffer::new(channels(1), rate(8_000), vec![0.25; TAP_BATCH - 1]);
+        let src = Guarded::new(buffer, Arc::clone(&flags));
+        assert_eq!(src.count(), TAP_BATCH - 1);
+        assert_eq!(tap_of(&flags), (Vec::new(), None), "a partial batch is not flushed");
+    }
+
+    #[test]
+    fn tap_never_waits_for_a_held_lock() {
+        let flags = Arc::new(SourceFlags::default());
+        let buffer = SamplesBuffer::new(channels(1), rate(44_100), vec![0.5; 4 * TAP_BATCH]);
+        let mut src = Guarded::new(buffer, Arc::clone(&flags));
+        {
+            let _held = flags.tap.lock().unwrap_or_else(PoisonError::into_inner);
+            // `try_lock` on the thread holding the lock fails instead of blocking.
+            assert_eq!(src.by_ref().take(2 * TAP_BATCH).count(), 2 * TAP_BATCH);
+        }
+        assert_eq!(tap_of(&flags), (Vec::new(), None), "both batches were dropped");
+        assert_eq!(src.count(), 2 * TAP_BATCH);
+        let (samples, recent) = tap_of(&flags);
+        assert_eq!(samples.len(), 2 * TAP_BATCH);
+        assert_eq!(recent.map(|r| r.written), Some(2 * TAP_BATCH as u64));
+    }
+
+    #[test]
+    fn tap_recovers_from_a_poisoned_lock() {
+        let flags = Arc::new(SourceFlags::default());
+        let poisoner = Arc::clone(&flags);
+        let _panicked = std::thread::spawn(move || {
+            let _held = poisoner.tap.lock();
+            // Unwinds without running the panic hook, so nothing is printed.
+            std::panic::resume_unwind(Box::new("poison the tap"));
+        })
+        .join();
+        assert!(flags.tap.is_poisoned());
+        let buffer = SamplesBuffer::new(channels(1), rate(44_100), vec![0.5; TAP_BATCH]);
+        assert_eq!(Guarded::new(buffer, Arc::clone(&flags)).count(), TAP_BATCH);
+        assert_eq!(tap_of(&flags).0, vec![0.5; TAP_BATCH]);
+    }
+
+    #[test]
+    fn tap_is_taken_before_the_volume() {
+        let flags = Arc::new(SourceFlags::default());
+        let data: Vec<Sample> = ramp(TAP_BATCH).iter().map(|x| x / 1000.0).collect();
+        let buffer = SamplesBuffer::new(channels(1), rate(44_100), data.clone());
+        // rodio applies the volume in an amplify stage downstream of `Guarded`.
+        let played: Vec<Sample> = Guarded::new(buffer, Arc::clone(&flags))
+            .amplify(0.2)
+            .collect();
+        let expected: Vec<Sample> = data.iter().map(|x| x * 0.2).collect();
+        assert_eq!(played, expected);
+        assert_eq!(tap_of(&flags).0, data, "the tap ignores the volume");
+    }
+
+    #[test]
+    fn tap_mixes_each_span_with_its_own_channel_count() {
+        let flags = Arc::new(SourceFlags::default());
+        let src = Spans::new(vec![
+            Span::new(2, 44_100, frames(&[1.0, 0.0], 1024)),
+            Span::new(1, 44_100, vec![0.25; 512]),
+            Span::new(3, 44_100, frames(&[0.0, 0.0, 0.3], 512)),
+        ]);
+        assert_eq!(Guarded::new(src, Arc::clone(&flags)).count(), 2048 + 512 + 1536);
+        let (samples, recent) = tap_of(&flags);
+        let mut expected = vec![0.5; 1024];
+        expected.extend([0.25; 512]);
+        expected.extend([0.1; 512]);
+        assert_eq!(samples.len(), expected.len());
+        for (got, want) in samples.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-6, "{got} != {want}");
+        }
+        assert_eq!(recent.map(|r| r.written), Some(2048));
+    }
+
+    #[test]
+    fn tap_clears_on_a_sample_rate_change() {
+        let flags = Arc::new(SourceFlags::default());
+        let src = Spans::new(vec![
+            // 512 samples are handed over; the other 488 are pending at the change.
+            Span::new(1, 44_100, vec![1.0; 1000]),
+            Span::new(1, 48_000, vec![0.5; 512]),
+        ]);
+        let mut src = Guarded::new(src, Arc::clone(&flags));
+        assert_eq!(src.by_ref().take(1000).count(), 1000);
+        assert_eq!(tap_of(&flags).0, vec![1.0; 512]);
+        assert_eq!(src.count(), 512);
+        let (samples, recent) = tap_of(&flags);
+        assert_eq!(samples, vec![0.5; 512], "no 44.1 kHz sample is kept");
+        assert_eq!(
+            recent,
+            Some(Recent {
+                sample_rate: 48_000,
+                written: 1024
+            })
+        );
+    }
+
+    #[test]
+    fn tap_keeps_frames_aligned_when_spans_are_odd_or_unknown() {
+        for reported in [None, Some(0), Some(5)] {
+            // Three channels whose mean is 0.5: a frame read one sample off
+            // would mix to 0.333 or 0.167 instead.
+            let mut span = Span::new(3, 44_100, frames(&[0.0, 0.5, 1.0], 2048));
+            span.reported = reported;
+            let src = Spans::new(vec![span]);
+            let reads = std::rc::Rc::clone(&src.reads);
+            let flags = Arc::new(SourceFlags::default());
+            assert_eq!(Guarded::new(src, Arc::clone(&flags)).count(), 3 * 2048);
+            let (samples, recent) = tap_of(&flags);
+            assert_eq!(samples, vec![0.5; 2048], "{reported:?}");
+            assert_eq!(recent.map(|r| r.written), Some(2048), "{reported:?}");
+            // A re-read needs the span to run out and a frame boundary.
+            let max_reads = match reported {
+                Some(5) => 3 * 2048 / 5 + 1,
+                _ => 3 * 2048 / UNKNOWN_SPAN + 1,
+            };
+            assert!(reads.get() <= max_reads, "{reported:?}: {} reads", reads.get());
+        }
+    }
+
+    #[test]
+    fn tap_reads_a_new_format_only_on_a_frame_boundary() {
+        // The first span claims 4 samples of 3 channels, so it ends one sample
+        // into a frame, and the 2-channel span starts there. The frame is
+        // completed from the new span's samples before the format is re-read;
+        // re-reading mid-frame would drop that frame and mix (0.9 + 0.0) / 2.
+        let mut first = Span::new(3, 44_100, vec![0.0, 0.5, 1.0, 0.3]);
+        first.reported = Some(4);
+        let mut second = vec![0.9, 0.0];
+        second.extend(frames(&[1.0, 0.0], 511));
+        let src = Spans::new(vec![first, Span::new(2, 44_100, second)]);
+        let flags = Arc::new(SourceFlags::default());
+        assert_eq!(Guarded::new(src, Arc::clone(&flags)).count(), 4 + 1024);
+        let (samples, _) = tap_of(&flags);
+        assert_eq!(samples.len(), TAP_BATCH);
+        let head = samples.get(..3).unwrap_or_default();
+        let want = [0.5, (0.3 + 0.9 + 0.0) / 3.0, 0.5];
+        for (got, want) in head.iter().zip(want) {
+            assert!((got - want).abs() < 1e-6, "{head:?}");
+        }
+        assert!(samples.iter().skip(2).all(|&x| (x - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn tap_counts_every_flushed_batch() {
+        let flags = Arc::new(SourceFlags::default());
+        let buffer = SamplesBuffer::new(channels(1), rate(44_100), vec![0.0; 3 * TAP_BATCH + 100]);
+        let mut src = Guarded::new(buffer, Arc::clone(&flags));
+        for batch in 1..=3_u64 {
+            assert_eq!(src.by_ref().take(TAP_BATCH).count(), TAP_BATCH);
+            let written = tap_of(&flags).1.map(|r| r.written);
+            assert_eq!(written, Some(batch * TAP_BATCH as u64));
+        }
+        assert_eq!(src.count(), 100);
+        assert_eq!(tap_of(&flags).1.map(|r| r.written), Some(3 * TAP_BATCH as u64));
+    }
+
+    #[test]
+    fn seeking_restarts_the_tap_frame() {
+        let flags = Arc::new(SourceFlags::default());
+        let spans = Spans::new(vec![Span::new(2, 44_100, frames(&[1.0, 0.0], 2048))]);
+        let mut src = Guarded::new(spans, Arc::clone(&flags));
+        // Stop in the middle of a frame and of a batch, then seek.
+        assert_eq!(src.by_ref().take(301).count(), 301);
+        assert!(src.try_seek(Duration::ZERO).is_ok());
+        assert_eq!(src.by_ref().take(2 * TAP_BATCH).count(), 2 * TAP_BATCH);
+        assert_eq!(tap_of(&flags).0, vec![0.5; TAP_BATCH]);
+    }
+
+    #[test]
+    fn default_recent_samples_reports_nothing() {
+        let audio = crate::test_support::SilentAudio::default();
+        let mut out = vec![1.0; 4];
+        assert_eq!(audio.recent_samples(&mut out), None);
+        assert_eq!(out, Vec::<f32>::new());
     }
 
     #[test]
@@ -779,6 +1343,36 @@ mod tests {
                 .is_some_and(|n| n.text.contains("corrupt.mp3")),
             "{notice:?}"
         );
+        Ok(())
+    }
+
+    /// The tap through the real output device: filled while playing, and
+    /// empty again after a new load. Needs sound hardware:
+    /// `cargo test -- --ignored real_device_tap`.
+    #[test]
+    #[ignore = "needs an audio output device"]
+    fn real_device_tap_follows_loads() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let song = tmp.path().join("song.wav");
+        std::fs::write(&song, crate::test_support::wav(16_000))?; // 2 s
+        let mut player = Player::open()?;
+        let mut out = Vec::new();
+        assert_eq!(player.recent_samples(&mut out), None, "nothing loaded");
+
+        player.load(&song, Duration::ZERO, false)?;
+        std::thread::sleep(Duration::from_millis(500));
+        let recent = player.recent_samples(&mut out);
+        assert_eq!(recent.map(|r| r.sample_rate), Some(8_000));
+        assert!(recent.is_some_and(|r| r.written > 0));
+        assert!(!out.is_empty() && out.len() <= FFT_SIZE);
+
+        // A paused source is not pulled, so the new tap stays empty.
+        player.load(&song, Duration::from_secs(1), true)?;
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(player.recent_samples(&mut out), None, "fresh tap per load");
+        assert_eq!(out, Vec::<f32>::new());
+        player.stop();
+        assert_eq!(player.recent_samples(&mut out), None);
         Ok(())
     }
 
