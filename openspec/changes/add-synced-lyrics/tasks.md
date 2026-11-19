@@ -4,7 +4,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 1. LRC parsing (new `src/lyrics.rs`)
 
-- [ ] 1.1 Add `src/lyrics.rs` with a `//!` doc stating its role and invariants: pure, no I/O, every text sanitised, synced lines sorted. Implement `Lyrics::{Synced, Plain}`, `Line`, `parse`, `current` and `next_change` as in D1, with `MAX_LINES` = 10 000. Register the module in `main.rs`. Verify with unit tests:
+- [x] 1.1 Add `src/lyrics.rs` with a `//!` doc stating its role and invariants: pure, no I/O, every text sanitised, synced lines sorted. Implement `Lyrics::{Synced, Plain}`, `Line`, `parse`, `current` and `next_change` as in D1, with `MAX_LINES` = 10 000. Register the module in `main.rs`. Verify with unit tests:
   - `[mm:ss]`, `[mm:ss.x]`, `[mm:ss.xx]` and `[mm:ss.xxx]` parse to the right durations, including minutes ≥ 100; `[01:75.00]` and other malformed stamps are not timestamps;
   - `[00:12.00][01:30.00]Chorus` gives two lines (spec *Several timestamps*);
   - out-of-order lines are sorted, and equal times keep file order (spec *Lines out of order*);
