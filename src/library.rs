@@ -231,10 +231,6 @@ pub fn sort_tracks(tracks: &mut [Track]) {
 /// and every line must go through [`crate::lyrics::parse`] (which sanitises)
 /// before it is shown. Lofty caps each allocation (16 MiB by default).
 #[must_use]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the lyrics pane from task group 3")
-)]
 pub fn lyrics_tag(path: &Path) -> Option<String> {
     // Only the tags are needed: no cover art, no audio properties.
     let options = ParseOptions::new()
