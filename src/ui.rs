@@ -386,7 +386,7 @@ fn spectrum_bar_count(columns: u16) -> usize {
 /// How many eighths of a cell a bar `rows` rows tall fills at `level`
 /// (clamped to `0.0..=1.0`, so infinities draw an empty or a full bar; NaN
 /// draws nothing), rounded to the nearest eighth.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "the value is a whole number in 0..=rows * 8 (at most 524 280), \

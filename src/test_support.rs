@@ -100,8 +100,10 @@ impl crate::player::Audio for SilentAudio {
 /// An audio output that behaves like [`SilentAudio`] and, while a track is
 /// loaded, reports a sine wave of `frequency` Hz and `amplitude` (1.0 is full
 /// scale) as its recent samples. Each call to `recent_samples` while the
-/// track plays advances `written` by [`ToneAudio::STEP`] samples, unless
-/// `advancing` is false (a stalled decoder or device).
+/// track plays advances `written` by `step` samples ([`ToneAudio::STEP`] by
+/// default), unless
+/// `advancing` is false (a stalled decoder or device). Each load starts a
+/// new generation with `written` back at 0, like [`crate::player::Player`].
 #[derive(Debug)]
 pub struct ToneAudio {
     pub silent: SilentAudio,
@@ -109,11 +111,14 @@ pub struct ToneAudio {
     pub amplitude: f32,
     pub sample_rate: u32,
     pub advancing: bool,
+    /// Samples `written` advances by per call while playing.
+    pub step: u64,
     written: std::cell::Cell<u64>,
+    loads: u64,
 }
 
 impl ToneAudio {
-    /// Samples `written` advances by per call while playing.
+    /// The default `step`.
     pub const STEP: u64 = 1024;
 
     /// A tone at `frequency` Hz and `amplitude`, sampled at 44.1 kHz.
@@ -124,7 +129,9 @@ impl ToneAudio {
             amplitude,
             sample_rate: 44_100,
             advancing: true,
+            step: Self::STEP,
             written: std::cell::Cell::new(0),
+            loads: 0,
         }
     }
 }
@@ -139,6 +146,7 @@ impl crate::player::Audio for ToneAudio {
         self.silent.load(path, start, paused)?;
         // A new load starts with an empty tap.
         self.written.set(0);
+        self.loads += 1;
         Ok(())
     }
     fn set_paused(&mut self, paused: bool) {
@@ -174,7 +182,7 @@ impl crate::player::Audio for ToneAudio {
         }
         let playing = !self.silent.paused && !self.silent.ended;
         if playing && self.advancing {
-            self.written.set(self.written.get() + Self::STEP);
+            self.written.set(self.written.get() + self.step);
         }
         let written = self.written.get();
         if written == 0 {
@@ -191,6 +199,7 @@ impl crate::player::Audio for ToneAudio {
         Some(crate::player::Recent {
             sample_rate: self.sample_rate,
             written,
+            generation: self.loads,
         })
     }
 }

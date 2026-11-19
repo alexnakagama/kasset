@@ -187,7 +187,7 @@ impl Default for Spectrum {
     }
 }
 
-// `rustfft::Fft` has no `Debug`, and `App` (which will own a `Spectrum`)
+// `rustfft::Fft` has no `Debug`, and `App` (which owns a `Spectrum`)
 // derives it.
 impl fmt::Debug for Spectrum {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -261,7 +261,7 @@ fn level_of(magnitude: f32) -> f32 {
 
 /// `n` as `f32`. Callers pass counts no larger than [`FFT_SIZE`] or
 /// [`MAX_BARS`], far below 2^24, so the conversion is exact.
-#[allow(clippy::cast_precision_loss, reason = "values are < 2^24, see doc")]
+#[expect(clippy::cast_precision_loss, reason = "values are < 2^24, see doc")]
 fn to_f32(n: usize) -> f32 {
     n as f32
 }
@@ -269,14 +269,14 @@ fn to_f32(n: usize) -> f32 {
 /// A sample rate as `f32`. Real rates (up to a few hundred kHz) are below
 /// 2^24 and convert exactly; an absurd rate only loses precision, and the
 /// bands are clamped to the FFT's range anyway.
-#[allow(clippy::cast_precision_loss, reason = "real rates are < 2^24, see doc")]
+#[expect(clippy::cast_precision_loss, reason = "real rates are < 2^24, see doc")]
 fn hz(rate: u32) -> f32 {
     rate as f32
 }
 
 /// A (rounded) bin position as an index, clamped to `0..=FFT_SIZE / 2` (the
 /// one-sided spectrum). NaN maps to 0.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "clamped to 0..=FFT_SIZE / 2 first; callers round"

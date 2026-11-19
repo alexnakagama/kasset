@@ -372,9 +372,11 @@ struct Visualizer {
     bars: usize,
     /// Reused for [`Playback::recent_samples`], so ticks do not allocate.
     samples: Vec<f32>,
-    /// The tap's last `written` count and when it was first seen, to notice
-    /// a tap that stopped filling while the state is still `Playing`.
-    last_written: Option<(u64, Instant)>,
+    /// The tap's last `(generation, written)` and when it was first seen, to
+    /// notice a tap that stopped filling while the state is still `Playing`.
+    /// The generation tells a new load's tap from the old one even when
+    /// their counts happen to match.
+    last_written: Option<((u64, u64), Instant)>,
 }
 
 impl Visualizer {
@@ -707,11 +709,11 @@ impl<A: Audio> App<A> {
                 }
                 false
             }
-            (Some(recent), Some((written, since))) if written == recent.written => {
+            (Some(recent), Some((seen, since))) if seen == (recent.generation, recent.written) => {
                 now.saturating_duration_since(since) < STALE_AFTER
             }
             (Some(recent), _) => {
-                vis.last_written = Some((recent.written, now));
+                vis.last_written = Some(((recent.generation, recent.written), now));
                 true
             }
         };
@@ -4747,7 +4749,11 @@ mod visualizer_tests {
         a.handle_key(ch(' '));
         assert_eq!(a.playback().state(), PlayState::Playing);
         run(&mut a, t + FALL_TIME * 2, 3);
-        assert!(idle(&a), "old window shown again: {:?}", a.spectrum_levels());
+        assert!(
+            idle(&a),
+            "old window shown again: {:?}",
+            a.spectrum_levels()
+        );
 
         a.playback_mut().audio_mut().advancing = true;
         run(&mut a, t + FALL_TIME * 3, 2);
@@ -4770,6 +4776,26 @@ mod visualizer_tests {
         playing(&mut a, Instant::now());
         assert_eq!(a.spectrum_levels(), [] as [f32; 0]);
         assert!(!a.visualizer_animating());
+    }
+
+    #[test]
+    fn a_new_load_is_fresh_even_when_its_count_matches_the_old_tap() {
+        let mut a = shown();
+        // One call fills a whole window, so the old and the new tap both
+        // report `written == FFT_SIZE` on their first tick.
+        a.playback_mut().audio_mut().step = FFT_SIZE as u64;
+        let t0 = Instant::now();
+        a.handle_key(key(KeyCode::Enter));
+        a.tick(t0);
+        let top = peak(&a);
+        assert!(top > 0.5, "{:?}", a.spectrum_levels());
+
+        // A new load (next track) long after the old count was first seen:
+        // its audio is new, so it is measured, not treated as stale.
+        a.handle_key(ch('n'));
+        assert_eq!(a.playback().state(), PlayState::Playing);
+        a.tick(t0 + STALE_AFTER * 2);
+        assert!((peak(&a) - top).abs() < 0.01, "measured: {}", peak(&a));
     }
 
     #[test]
