@@ -77,7 +77,7 @@ pub enum Saved {
 }
 
 /// Where the app's saved state lives.
-pub trait StateStore {
+pub trait StateStore: std::fmt::Debug {
     /// Reads the settings and this folder's entry. Never fails: a missing,
     /// unreadable or damaged file loads as empty.
     fn load(&mut self) -> Loaded;

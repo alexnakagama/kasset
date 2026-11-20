@@ -43,8 +43,8 @@ Test hermeticity, for every group: no test calls `dirs` or builds a store from t
 
 ## 4. Snapshot, restore and saving in the app (`src/app.rs`)
 
-- [ ] 4.1 Give `App` a `Box<dyn StateStore>` (`NoState` from `App::new`, so existing tests are unchanged), and add the following (D4–D6):
-  - `App::restore(store)`: settings first, then the shown playlist with main-pane focus (independent of the source), then the resume point, only through the scanned-track map and the playlist listing; `pending_resume` is kept until a track becomes current; a `Newer` load gives one `Info` notice and stops saving for the run;
+- [x] 4.1 Give `App` a `Box<dyn StateStore>` (`NoState` from `App::new`, so existing tests are unchanged), and add the following (D4–D6):
+  - `App::restore(store, root)` (`root`: the exact canonical root the tracks were scanned from): settings first, then the shown playlist with main-pane focus (independent of the source), then the resume point, only through the scanned-track map and the playlist listing; `pending_resume` is kept until a track becomes current; a `Newer` load gives one `Info` notice and stops saving for the run;
   - `App::session()`, with `Detached` saved as the library;
   - the periodic save from `App::tick`: `SAVE_INTERVAL` 30 s, only when the session changed, passing `keep`, with the first failure notified once until a save succeeds;
   - `App::shutdown()`, which takes the final session before stopping the audio and writes nothing;
@@ -67,7 +67,7 @@ Test hermeticity, for every group: no test calls `dirs` or builds a store from t
 
 ## 5. Command line, wiring and docs (`src/cli.rs`, `src/main.rs`, README, CLAUDE.md)
 
-- [ ] 5.1 Add `--no-state` to `Cli` (D8), and the pure `make_store(no_state, location, root)` in `main.rs`. `main` always calls `App::restore(make_store(…))` before `terminal::run`, then passes its result to `finish(app, result)` (D6). `finish` calls `App::save_final()` for every outcome, prints `kasset: cannot save state to <path>: <reason>` on failure, and returns the result unchanged. `terminal.rs` is unchanged. Verify with tests:
+- [ ] 5.1 Add `--no-state` to `Cli` (D8), and the pure `make_store(no_state, location, root)` in `main.rs`. `main` always calls `App::restore(make_store(…), &root)` (the root passed to `library::scan`) before `terminal::run`, then passes its result to `finish(app, result)` (D6). `finish` calls `App::save_final()` for every outcome, prints `kasset: cannot save state to <path>: <reason>` on failure, and returns the result unchanged. `terminal.rs` is unchanged. Verify with tests:
   - `finish` with a recording fake store saves exactly once for `Ok(Exit::Quit)`, `Ok(Exit::Signal(15))` and `Err(_)`, and returns each unchanged; with a failing store it still returns the same result;
   - `--no-state` parses and is listed in `--help` (spec *Listed in the help*);
   - `make_store(true, Some(path), root)` and `make_store(false, None, root)` give a store whose save creates no file. `make_store(false, Some(path), root)` gives one that writes `path` (spec *Private session*, *No state folder known*);

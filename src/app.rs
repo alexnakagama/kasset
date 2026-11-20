@@ -27,9 +27,9 @@
 //! last page. Any key other than a scroll key closes it and does nothing
 //! else.
 //!
-//! The spectrum visualizer is on at start; `v` (Normal mode, either pane)
-//! turns it off or on, with a status message when the terminal is too short
-//! for the strip, where the change cannot be seen. Whether the strip fits and
+//! The spectrum visualizer is on at start (or as saved); `v` (Normal mode,
+//! either pane) turns it off or on, with a status message when the terminal
+//! is too short for the strip, where the change cannot be seen. Whether the strip fits and
 //! how many bars it has are fed back by the event loop
 //! ([`App::set_spectrum_layout`]). [`App::tick`] measures the spectrum only
 //! while the strip is shown, and passes samples only while playing with
@@ -37,10 +37,10 @@
 //! paused, stopped or stalled track lets the bars fall. While the strip is
 //! not shown, no FFT runs and the levels are reset.
 //!
-//! The lyrics pane ([`LyricsPane`]) is on at start; `l` (Normal mode, either
-//! pane) turns it off or on, with a status message when the terminal is too
-//! narrow for it, like `v`. Whether it fits is fed back by the event loop
-//! ([`App::set_lyrics_layout`]). It never takes focus. While it is shown,
+//! The lyrics pane ([`LyricsPane`]) is on at start (or as saved); `l`
+//! (Normal mode, either pane) turns it off or on, with a status message
+//! when the terminal is too narrow for it, like `v`. Whether it fits is fed
+//! back by the event loop ([`App::set_lyrics_layout`]). It never takes focus. While it is shown,
 //! [`App::tick`] reads the current track's lyrics once each time the
 //! current track's *path* changes (so seeking, pausing or replaying the same
 //! file never reads again); while it is not shown nothing is read and the
@@ -58,9 +58,24 @@
 //! before the next key is handled. Edits are made on a copy and only shown
 //! once saved, so a failed or conflicting save leaves the screen as it was.
 //! Changes to the playlist that is playing are forwarded to the play order.
+//!
+//! The session (settings, the current track and position, its play source
+//! and the shown playlist) is saved through a [`StateStore`]. [`App::new`]
+//! uses [`NoState`], which saves nothing; [`App::restore`] installs the real
+//! store and continues the saved session once at start: the settings, the
+//! shown playlist (focused), then the track, loaded **paused**. The state
+//! file is untrusted: it only ever selects a track the scan found (matched by
+//! its path relative to the root) and playlists the listing found (by exact
+//! name). A resume point that could not be resumed is kept and saved again
+//! until a track becomes current. [`App::tick`] saves at most every
+//! [`SAVE_INTERVAL`], only when the session changed, and reports only the
+//! first of a run of failed saves. [`App::shutdown`] takes the final session
+//! before it stops the audio and writes nothing; [`App::save_final`] writes
+//! it after the terminal is restored. With a store that persists nothing, or
+//! after a newer state file was seen, no session is ever built or saved.
 
 use std::cell::OnceCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -74,6 +89,8 @@ use crate::playlist::{
     AddOutcome, Playlist, PlaylistInfo, PlaylistStore, Resolver, SaveOutcome, StoreError,
     validate_name,
 };
+use crate::state::store::{NoState, Saved, StateStore};
+use crate::state::{FolderEntry, MAX_POSITION, RelPath, Resume, SavedSource, Session, Settings};
 use crate::text::{is_invisible_format, sanitize};
 use crate::ui::{LYRICS_MIN_WIDTH, SPECTRUM_MIN_HEIGHT};
 use crate::visualizer::{FFT_SIZE, Spectrum};
@@ -367,6 +384,59 @@ pub struct App<A: Audio> {
     visualizer: Visualizer,
     lyrics: LyricsPane,
     quit: bool,
+    /// The saved session: where it is read from and written to.
+    saved: SavedState,
+}
+
+/// How often, at most, [`App::tick`] saves the session while it changes.
+pub const SAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Saving the session (D4–D6 of the `persist-session-state` design).
+#[derive(Debug)]
+struct SavedState {
+    /// [`NoState`] until [`App::restore`] installs the real store.
+    store: Box<dyn StateStore>,
+    /// The library root the tracks were scanned from (set by
+    /// [`App::restore`]); resume points are relative to it.
+    root: Option<PathBuf>,
+    /// Whether anything is ever saved this run: false with a store that
+    /// persists nothing and after a newer state file was seen.
+    enabled: bool,
+    /// The resume point loaded at start, kept while no track has been
+    /// current this run, so a track that could not be resumed (a drive not
+    /// mounted) is saved again rather than forgotten.
+    pending: Option<Resume>,
+    /// The session last saved, or as restored; a periodic save happens only
+    /// when the session differs from it.
+    last: Option<Session>,
+    /// When the next periodic check is due; set by the first tick.
+    next_check: Option<Instant>,
+    /// A save failed and was reported; later failures stay quiet until a
+    /// save succeeds.
+    failing: bool,
+    /// The session taken by [`App::shutdown`], written by [`App::save_final`].
+    last_words: Option<Session>,
+    /// Sessions built, so tests can confirm none is built when nothing is
+    /// saved.
+    #[cfg(test)]
+    built: std::cell::Cell<usize>,
+}
+
+impl SavedState {
+    fn none() -> Self {
+        Self {
+            store: Box::new(NoState),
+            root: None,
+            enabled: false,
+            pending: None,
+            last: None,
+            next_check: None,
+            failing: false,
+            last_words: None,
+            #[cfg(test)]
+            built: std::cell::Cell::new(0),
+        }
+    }
 }
 
 /// How long the tap may go without new audio while playing before the
@@ -378,7 +448,7 @@ const STALE_AFTER: Duration = Duration::from_millis(250);
 /// while the strip is shown, so a hidden strip costs no FFT.
 #[derive(Debug)]
 struct Visualizer {
-    /// Whether the user wants it (`v`); on at start, kept until quit.
+    /// Whether the user wants it (`v`); on at start unless restored off.
     on: bool,
     spectrum: Spectrum,
     /// Whether the last frame was tall enough for the strip (fed back by the
@@ -423,7 +493,7 @@ pub const LYRICS_MIN_WAIT: Duration = Duration::from_millis(10);
 /// or showing the pane again, reads afresh.
 #[derive(Debug)]
 struct LyricsPane {
-    /// Whether the user wants it (`l`); on at start, kept until quit.
+    /// Whether the user wants it (`l`); on at start unless restored off.
     on: bool,
     /// Whether the last frame was wide enough for the pane (fed back by the
     /// event loop, recorded even while `on` is false).
@@ -586,6 +656,7 @@ impl<A: Audio> App<A> {
             visualizer: Visualizer::new(),
             lyrics: LyricsPane::new(),
             quit: false,
+            saved: SavedState::none(),
         };
         app.refresh_playlists(None);
         app
@@ -816,15 +887,27 @@ impl<A: Audio> App<A> {
         self.pending_fresh = true;
     }
 
-    /// Periodic housekeeping: drives playback (auto-advance, skipping broken
+    /// Periodic housekeeping: saves the session when due (see
+    /// [`SAVE_INTERVAL`]), drives playback (auto-advance, skipping broken
     /// tracks) and collects status messages.
     pub fn tick(&mut self, now: Instant) {
-        if let Some(notice) = self.pending.take() {
-            self.status = Some((notice, now + STATUS_TTL));
-        }
+        self.settle_pending();
+        let save_failed = self.autosave(now);
+        let mut fresh = self.pending.take();
         self.playback.tick();
         // Playback messages win: they are usually errors.
         if let Some(notice) = self.playback.take_notice() {
+            fresh = Some(notice);
+        }
+        // A failed save is reported only once per run of failures, so it is
+        // joined with the other message rather than replaced by it.
+        if let Some(failure) = save_failed {
+            fresh = Some(match fresh {
+                Some(other) => join_error(&other, &failure),
+                None => failure,
+            });
+        }
+        if let Some(notice) = fresh {
             self.status = Some((notice, now + STATUS_TTL));
         }
         if self.status.as_ref().is_some_and(|(_, until)| now >= *until) {
@@ -895,8 +978,14 @@ impl<A: Audio> App<A> {
         vis.spectrum.update(input, vis.bars, now);
     }
 
-    /// Stops audio, before quitting.
+    /// Stops audio, before quitting. The session to save is taken first
+    /// (stopping resets the position) and kept for [`App::save_final`];
+    /// nothing is written here, so a slow disk cannot hold the screen.
     pub fn shutdown(&mut self) {
+        if self.saved.enabled {
+            self.settle_pending();
+            self.saved.last_words = Some(self.session());
+        }
         self.playback.stop();
     }
 
@@ -1719,6 +1808,266 @@ impl<A: Audio> App<A> {
             }
         }
     }
+}
+
+/// The saved session: restoring it at start and saving it while running and
+/// at quit (D4–D6 of the `persist-session-state` design).
+///
+/// The state file is untrusted: a resume point only ever selects a track the
+/// scan found (by its path relative to the root) and playlists the sidebar
+/// listing found (by exact name), and loads its track paused. Nothing is
+/// saved with a store that persists nothing ([`NoState`], so the tests that
+/// build an `App` directly never touch a real file) or after a newer state
+/// file was seen; then no session is even built.
+impl<A: Audio> App<A> {
+    /// Installs `store` and continues the session it holds for the library
+    /// scanned from `root` (the canonical root): first the settings, then
+    /// the playlist that was shown (focused, if it is still listed), then the
+    /// resume point, loaded paused (see [`Playback::resume`]). The play
+    /// source is the saved playlist if it is listed and still holds the
+    /// track, else the library. A resume point that cannot be resumed is
+    /// kept and saved again until a track becomes current. A newer state file
+    /// gives one notice and turns saving off for the run. Reopening the
+    /// shown playlist gives the same notices as opening it by hand (entries
+    /// not found, read-only). Called once, after [`App::new`] and before the
+    /// first tick, with the exact root the tracks were scanned from: a
+    /// differently spelled root matches no track, so nothing is resumed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called from `main` in group 5 of persist-session-state"
+        )
+    )]
+    pub fn restore(&mut self, store: Box<dyn StateStore>, root: &Path) {
+        let mut saved = SavedState::none();
+        saved.store = store;
+        saved.root = Some(root.to_path_buf());
+        self.saved = saved;
+        let loaded = self.saved.store.load();
+        self.saved.enabled = self.saved.store.persists() && !loaded.newer;
+        if loaded.newer {
+            self.notify(Notice::info(
+                "Saved state is from a newer kasset; it is not changed this run",
+            ));
+        }
+        if let Some(settings) = loaded.settings {
+            self.apply_settings(settings);
+        }
+        let FolderEntry { resume, open } = loaded.folder;
+        if let Some(name) = open {
+            self.restore_open(&name);
+        }
+        if let Some(resume) = resume
+            && !self.resume_point(&resume)
+        {
+            self.saved.pending = Some(resume);
+        }
+        if self.saved.enabled {
+            self.saved.last = Some(self.session());
+        }
+    }
+
+    /// Writes the session [`App::shutdown`] took. Does nothing (and returns
+    /// `None`) when `shutdown` did not run or nothing is saved this run.
+    /// Returns the error message, naming the state file, when the save failed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called from `main` in group 5 of persist-session-state"
+        )
+    )]
+    pub fn save_final(&mut self) -> Option<String> {
+        let session = self.saved.last_words.take()?;
+        self.saved
+            .store
+            .save(&session, self.saved.pending.as_ref())
+            .err()
+    }
+
+    /// Applies saved settings, without notices.
+    fn apply_settings(&mut self, settings: Settings) {
+        self.playback.set_volume(settings.volume);
+        self.playback.set_shuffle(settings.shuffle);
+        self.playback.set_repeat(settings.repeat);
+        self.visualizer.on = settings.visualizer;
+        self.lyrics.on = settings.lyrics;
+        self.lyrics.forget_if_hidden();
+    }
+
+    /// Shows saved playlist `name` in the main pane, focused and selected in
+    /// the sidebar, if the listing has it.
+    fn restore_open(&mut self, name: &str) {
+        if self.sidebar_value_of(name).is_none() {
+            return;
+        }
+        self.open_named(name);
+        if self.open.as_ref().is_some_and(|o| o.name() == name) {
+            self.focus = Focus::Main;
+            self.restore_sidebar(Some(SidebarPick::Playlist(name.to_owned())));
+        }
+    }
+
+    /// Loads the track of `resume` paused, if the scan found it. Returns
+    /// whether a track is now current.
+    fn resume_point(&mut self, resume: &Resume) -> bool {
+        let Some(root) = self.saved.root.as_deref() else {
+            return false;
+        };
+        let Some(track) = self
+            .playback
+            .tracks()
+            .iter()
+            .position(|t| relative(root, &t.path).as_ref() == Some(&resume.track))
+        else {
+            return false;
+        };
+        let (source, items, item) = self.resume_source(resume, track).unwrap_or_else(|| {
+            let all = (0..self.playback.tracks().len()).collect();
+            (Source::Library, all, track)
+        });
+        self.playback.resume(source, items, item, resume.position)
+    }
+
+    /// The saved source playlist of `resume` as the play order for library
+    /// track `track`: its items and the item to start at (the saved one if
+    /// it still is that track, else the first that is). `None` when the
+    /// source is the library, or the playlist is not listed, cannot be read
+    /// or no longer holds the track.
+    fn resume_source(&self, resume: &Resume, track: usize) -> Option<(Source, Vec<usize>, usize)> {
+        let SavedSource::Playlist(name) = &resume.source else {
+            return None;
+        };
+        self.sidebar_value_of(name)?;
+        let items = match &self.open {
+            Some(open) if open.name() == name => open.items.clone(),
+            // Read only for its items; the main pane is not changed.
+            _ => self.store.load(name, self.resolver()).ok()?.tracks(),
+        };
+        let item = resume
+            .item
+            .filter(|&i| items.get(i) == Some(&track))
+            .or_else(|| items.iter().position(|&t| t == track))?;
+        Some((Source::Playlist(name.clone()), items, item))
+    }
+
+    /// The session as it would be saved now. A detached play order is saved
+    /// as the library; the position is in whole milliseconds.
+    fn session(&self) -> Session {
+        #[cfg(test)]
+        self.saved.built.set(self.saved.built.get() + 1);
+        let playback = &self.playback;
+        let settings = Settings {
+            volume: playback.volume(),
+            shuffle: playback.shuffle(),
+            repeat: playback.repeat(),
+            visualizer: self.visualizer.on,
+            lyrics: self.lyrics.on,
+        };
+        let resume = self.saved.root.as_deref().and_then(|root| {
+            let index = playback.current()?;
+            let track = relative(root, &playback.tracks().get(index)?.path)?;
+            let (source, item) = match playback.source() {
+                Source::Playlist(name) => {
+                    (SavedSource::Playlist(name.clone()), playback.current_item())
+                }
+                // The library's items are its indices.
+                Source::Library | Source::Detached => (SavedSource::Library, Some(index)),
+            };
+            Some(Resume {
+                track,
+                item,
+                position: whole_millis(playback.position()),
+                source,
+            })
+        });
+        Session {
+            settings,
+            folder: FolderEntry {
+                resume,
+                open: self.open.as_ref().map(|o| o.name().to_owned()),
+            },
+        }
+    }
+
+    /// Drops the loaded resume point once a track is current: from then on
+    /// the session's own resume point replaces it.
+    fn settle_pending(&mut self) {
+        if self.playback.current().is_some() {
+            self.saved.pending = None;
+        }
+    }
+
+    /// The periodic save: at most every [`SAVE_INTERVAL`], and only when the
+    /// session changed since it was last saved (or restored). Returns the
+    /// notice for the first failure; later ones give none, until a save
+    /// succeeds.
+    fn autosave(&mut self, now: Instant) -> Option<Notice> {
+        if !self.saved.enabled {
+            return None;
+        }
+        match self.saved.next_check {
+            None => {
+                self.saved.next_check = now.checked_add(SAVE_INTERVAL);
+                return None;
+            }
+            Some(due) if now < due => return None,
+            Some(_) => self.saved.next_check = now.checked_add(SAVE_INTERVAL),
+        }
+        let session = self.session();
+        if self.saved.last.as_ref() == Some(&session) {
+            return None;
+        }
+        match self.saved.store.save(&session, self.saved.pending.as_ref()) {
+            Ok(Saved::Written) => {
+                self.saved.last = Some(session);
+                self.saved.failing = false;
+                None
+            }
+            // A newer file appeared during the run. Deliberately quiet (the
+            // spec announces a newer file only at start): it is kept, and
+            // nothing more is saved, not even at quit.
+            Ok(Saved::Skipped) => {
+                self.saved.enabled = false;
+                None
+            }
+            Err(message) => {
+                (!std::mem::replace(&mut self.saved.failing, true)).then(|| save_error(&message))
+            }
+        }
+    }
+}
+
+/// `path` relative to `root`, as saved in a resume point.
+fn relative(root: &Path, path: &Path) -> Option<RelPath> {
+    RelPath::new(path.strip_prefix(root).ok()?)
+}
+
+/// `d` cut to whole milliseconds and at most [`MAX_POSITION`], so a position
+/// read back from the state file compares equal.
+fn whole_millis(d: Duration) -> Duration {
+    Duration::from_millis(u64::try_from(d.min(MAX_POSITION).as_millis()).unwrap_or(u64::MAX))
+}
+
+/// `failure` (an error) shown with `other`: an error comes first, so it is
+/// never cut off by an info message.
+fn join_error(other: &Notice, failure: &Notice) -> Notice {
+    match other.level {
+        Level::Error => Notice::error(format!("{}; {}", other.text, failure.text)),
+        Level::Info => Notice::error(format!("{}; {}", failure.text, other.text)),
+    }
+}
+
+/// The status message for a failed save; `message` names the state file.
+fn save_error(message: &str) -> Notice {
+    let text = sanitize(message).unwrap_or_else(|| "cannot save state".to_owned());
+    let mut chars = text.chars();
+    let text: String = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default();
+    Notice::error(text)
 }
 
 /// Editing the open playlist: `d`, `J` and `K`.
@@ -5660,6 +6009,899 @@ mod lyrics_tests {
         f.play(Instant::now());
         assert!(f.app.lyrics_ready());
         assert_eq!(f.app.lyrics(), None);
+        Ok(())
+    }
+}
+
+/// Restoring and saving the session (`persist-session-state`, group 4).
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use crate::player::Volume;
+    use crate::playlist::FsStore;
+    use crate::queue::Repeat;
+    use crate::state::store::{FsStateStore, Loaded};
+    use crate::state::{Parsed, RootKey, StateFile, merge, parse, render};
+    use crate::test_support::SilentAudio;
+    use anyhow::{Context as _, Result};
+    use std::cell::{Cell, RefCell};
+    use std::fs;
+    use std::rc::Rc;
+
+    /// One state file in memory, shared by every store made from it, like
+    /// one file on disk shared by several kasset runs.
+    #[derive(Debug, Default, Clone)]
+    struct Disk(Rc<DiskInner>);
+
+    #[derive(Debug, Default)]
+    struct DiskInner {
+        bytes: RefCell<Vec<u8>>,
+        /// Calls to `save`, failed ones included.
+        saves: Cell<usize>,
+        /// Every `save` fails while set.
+        fail: Cell<bool>,
+    }
+
+    impl Disk {
+        fn with(bytes: &[u8]) -> Self {
+            let disk = Self::default();
+            disk.0.bytes.replace(bytes.to_vec());
+            disk
+        }
+
+        fn saves(&self) -> usize {
+            self.0.saves.get()
+        }
+
+        fn set_failing(&self, fail: bool) {
+            self.0.fail.set(fail);
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.0.bytes.borrow().clone()
+        }
+
+        fn file(&self) -> Result<StateFile> {
+            match parse(&self.0.bytes.borrow()) {
+                Parsed::Valid(file) => Ok(file),
+                other => anyhow::bail!("not a valid state file: {other:?}"),
+            }
+        }
+
+        /// The saved entry for library `root`.
+        fn entry(&self, root: &Path) -> Result<FolderEntry> {
+            let key = RootKey::new(root).context("root key")?;
+            self.file()?
+                .folders
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, entry)| entry)
+                .context("no entry for the root")
+        }
+
+        fn store(&self, root: &Path) -> Result<Box<dyn StateStore>> {
+            Ok(Box::new(MemStore {
+                disk: self.clone(),
+                root: RootKey::new(root).context("root key")?,
+            }))
+        }
+    }
+
+    /// A [`StateStore`] over a [`Disk`], merging like `FsStateStore`.
+    #[derive(Debug)]
+    struct MemStore {
+        disk: Disk,
+        root: RootKey,
+    }
+
+    impl StateStore for MemStore {
+        fn load(&mut self) -> Loaded {
+            match parse(&self.disk.0.bytes.borrow()) {
+                Parsed::Valid(file) => Loaded {
+                    settings: file.settings,
+                    folder: file
+                        .folders
+                        .into_iter()
+                        .find(|(key, _)| *key == self.root)
+                        .map(|(_, entry)| entry)
+                        .unwrap_or_default(),
+                    newer: false,
+                },
+                Parsed::Newer => Loaded {
+                    newer: true,
+                    ..Loaded::default()
+                },
+                Parsed::Invalid => Loaded::default(),
+            }
+        }
+
+        fn save(&mut self, session: &Session, keep: Option<&Resume>) -> Result<Saved, String> {
+            let inner = &self.disk.0;
+            inner.saves.set(inner.saves.get() + 1);
+            if inner.fail.get() {
+                return Err("cannot save state to /state/kasset/state: disk full".to_owned());
+            }
+            let current = match parse(&inner.bytes.borrow()) {
+                Parsed::Valid(file) => file,
+                Parsed::Newer => return Ok(Saved::Skipped),
+                Parsed::Invalid => StateFile::default(),
+            };
+            let merged = merge(current, &self.root, session, keep);
+            inner.bytes.replace(render(&merged));
+            Ok(Saved::Written)
+        }
+    }
+
+    /// A store that persists nothing but counts saves, like [`NoState`].
+    #[derive(Debug, Default)]
+    struct Inert(Rc<Cell<usize>>);
+
+    impl StateStore for Inert {
+        fn load(&mut self) -> Loaded {
+            Loaded::default()
+        }
+
+        fn save(&mut self, _: &Session, _: Option<&Resume>) -> Result<Saved, String> {
+            self.0.set(self.0.get() + 1);
+            Ok(Saved::Skipped)
+        }
+
+        fn persists(&self) -> bool {
+            false
+        }
+    }
+
+    /// A library folder of A, B, C, D by "Band" (`Band/LP/<title>.mp3`, not
+    /// created) with playlists in `Playlists/`, and the app running on it.
+    struct Lib {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        tracks: Vec<Track>,
+        app: App<SilentAudio>,
+    }
+
+    impl Lib {
+        fn new() -> Result<Self> {
+            let tmp = tempfile::tempdir()?;
+            let root = fs::canonicalize(tmp.path())?;
+            let tracks: Vec<Track> = ["A", "B", "C", "D"]
+                .iter()
+                .map(|title| Track {
+                    path: root.join(format!("Band/LP/{title}.mp3")),
+                    title: (*title).to_owned(),
+                    artist: "Band".to_owned(),
+                    album: "LP".to_owned(),
+                    number: None,
+                    duration: Some(Duration::from_secs(200)),
+                })
+                .collect();
+            let app = Self::fresh(&root, tracks.clone());
+            Ok(Self {
+                _tmp: tmp,
+                root,
+                tracks,
+                app,
+            })
+        }
+
+        fn fresh(root: &Path, tracks: Vec<Track>) -> App<SilentAudio> {
+            App::new(
+                tracks,
+                SilentAudio::default(),
+                Box::new(FsStore::new(root)),
+                root.display().to_string(),
+                None,
+            )
+        }
+
+        /// Starts kasset again on this folder, restoring from `store`.
+        fn start(&mut self, store: Box<dyn StateStore>) {
+            self.app = Self::fresh(&self.root, self.tracks.clone());
+            self.app.restore(store, &self.root);
+        }
+
+        /// Starts kasset again on this folder, restoring from `disk`.
+        fn start_on(&mut self, disk: &Disk) -> Result<()> {
+            self.start(disk.store(&self.root)?);
+            Ok(())
+        }
+
+        /// Writes playlist `name` listing the given titles.
+        fn write(&self, name: &str, titles: &[&str]) -> Result<()> {
+            let dir = self.root.join("Playlists");
+            fs::create_dir_all(&dir)?;
+            let entries: Vec<String> = titles
+                .iter()
+                .map(|t| {
+                    format!(
+                        "../Band/LP/{t}.mp3
+"
+                    )
+                })
+                .collect();
+            let entries = entries.concat();
+            fs::write(
+                dir.join(format!("{name}.m3u8")),
+                format!("#EXTM3U\n{entries}"),
+            )?;
+            Ok(())
+        }
+
+        fn index(&self, title: &str) -> Result<usize> {
+            self.tracks
+                .iter()
+                .position(|t| t.title == title)
+                .context("no such track")
+        }
+
+        fn current_title(&self) -> Option<String> {
+            self.app.playback().current_track().map(|t| t.title.clone())
+        }
+
+        fn shown(&self) -> Option<&str> {
+            self.app.open_playlist().map(OpenPlaylist::name)
+        }
+
+        fn key(&mut self, code: KeyCode) {
+            self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+
+        /// Plays library track `title` with `Enter` (the library is shown).
+        fn play(&mut self, title: &str) -> Result<()> {
+            let index = self.index(title)?;
+            self.key(KeyCode::Home);
+            for _ in 0..index {
+                self.key(KeyCode::Down);
+            }
+            self.key(KeyCode::Enter);
+            assert_eq!(self.current_title().as_deref(), Some(title));
+            Ok(())
+        }
+
+        fn set_position(&mut self, position: Duration) {
+            self.app.playback_mut().audio_mut().position = position;
+        }
+
+        /// The status text after a tick at `now`.
+        fn status(&mut self, now: Instant) -> String {
+            self.app.tick(now);
+            self.app
+                .status(now)
+                .map(|n| n.text.clone())
+                .unwrap_or_default()
+        }
+
+        /// Quits: `shutdown`, then the final save.
+        fn quit(&mut self) -> Option<String> {
+            self.app.shutdown();
+            self.app.save_final()
+        }
+
+        /// A state file holding `settings` and, for this folder, `entry`.
+        fn disk_with(&self, settings: Option<Settings>, entry: FolderEntry) -> Result<Disk> {
+            let file = StateFile {
+                settings,
+                folders: vec![(RootKey::new(&self.root).context("root key")?, entry)],
+            };
+            Ok(Disk::with(&render(&file)))
+        }
+    }
+
+    /// A resume point at `title`, in whole milliseconds.
+    fn resume_at(title: &str, item: Option<usize>, ms: u64, source: SavedSource) -> Resume {
+        Resume {
+            track: RelPath::new(Path::new(&format!("Band/LP/{title}.mp3")))
+                .unwrap_or_else(|| unreachable!("a valid relative path")),
+            item,
+            position: Duration::from_millis(ms),
+            source,
+        }
+    }
+
+    fn playlist(name: &str) -> SavedSource {
+        SavedSource::Playlist(name.to_owned())
+    }
+
+    const PAUSED_AT: Duration = Duration::from_secs(135);
+
+    // --- Settings ---
+
+    #[test]
+    fn settings_restored() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        for _ in 0..8 {
+            lib.key(KeyCode::Char('-'));
+        }
+        for c in ['z', 'r', 'v', 'l'] {
+            lib.key(KeyCode::Char(c));
+        }
+        assert_eq!(lib.quit(), None);
+        lib.start_on(&disk)?;
+        let playback = lib.app.playback();
+        assert_eq!(playback.volume().percent(), 60);
+        assert!(playback.shuffle());
+        assert_eq!(playback.repeat(), Repeat::All);
+        assert!(!lib.app.visualizer_on());
+        assert!(!lib.app.lyrics_on());
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_hidden_panes_shows_no_notice() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let settings = Settings {
+            visualizer: false,
+            lyrics: false,
+            ..Settings::default()
+        };
+        let disk = lib.disk_with(Some(settings), FolderEntry::default())?;
+        lib.start_on(&disk)?;
+        assert!(!lib.app.visualizer_on());
+        assert!(!lib.app.lyrics_on());
+        assert_eq!(lib.status(Instant::now()), "");
+        Ok(())
+    }
+
+    #[test]
+    fn first_run_has_the_defaults() -> Result<()> {
+        let mut lib = Lib::new()?;
+        lib.start_on(&Disk::default())?;
+        let playback = lib.app.playback();
+        assert_eq!(playback.volume(), Volume::MAX);
+        assert!(!playback.shuffle());
+        assert_eq!(playback.repeat(), Repeat::Off);
+        assert!(lib.app.visualizer_on());
+        assert!(lib.app.lyrics_on());
+        assert_eq!(playback.current(), None);
+        assert_eq!(lib.app.focus(), Focus::Main);
+        assert_eq!(lib.app.main_view(), MainView::Library);
+        assert_eq!(lib.status(Instant::now()), "", "no error on a first run");
+        Ok(())
+    }
+
+    #[test]
+    fn settings_shared_across_folders() -> Result<()> {
+        let disk = Disk::default();
+        let mut music = Lib::new()?;
+        music.start_on(&disk)?;
+        for _ in 0..12 {
+            music.key(KeyCode::Char('-'));
+        }
+        assert_eq!(music.quit(), None);
+        let mut other = Lib::new()?;
+        other.start_on(&disk)?;
+        assert_eq!(other.app.playback().volume().percent(), 40);
+        Ok(())
+    }
+
+    // --- Resume points ---
+
+    #[test]
+    fn separate_folders_keep_separate_resume_points() -> Result<()> {
+        let disk = Disk::default();
+        let mut music = Lib::new()?;
+        music.start_on(&disk)?;
+        music.play("A")?;
+        assert_eq!(music.quit(), None);
+        let mut other = Lib::new()?;
+        other.start_on(&disk)?;
+        other.play("B")?;
+        assert_eq!(other.quit(), None);
+        music.start_on(&disk)?;
+        assert_eq!(music.current_title().as_deref(), Some("A"));
+        other.start_on(&disk)?;
+        assert_eq!(other.current_title().as_deref(), Some("B"));
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_paused_at_the_saved_position() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        lib.play("C")?;
+        lib.set_position(PAUSED_AT);
+        assert_eq!(lib.quit(), None);
+        lib.start_on(&disk)?;
+        assert_eq!(lib.current_title().as_deref(), Some("C"));
+        assert_eq!(lib.app.playback().state(), PlayState::Paused);
+        assert_eq!(lib.app.playback().position(), PAUSED_AT);
+        let audio = lib.app.playback().audio();
+        assert!(audio.loaded && audio.paused, "loaded paused");
+        lib.key(KeyCode::Char(' '));
+        assert_eq!(lib.app.playback().state(), PlayState::Playing);
+        assert_eq!(
+            lib.app.playback().position(),
+            PAUSED_AT,
+            "continues from there"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_in_its_playlist() -> Result<()> {
+        let mut lib = Lib::new()?;
+        lib.write("Running", &["D", "B", "C"])?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        lib.key(KeyCode::Tab);
+        lib.key(KeyCode::Down);
+        lib.key(KeyCode::Enter);
+        assert_eq!(lib.shown(), Some("Running"));
+        lib.key(KeyCode::Down);
+        lib.key(KeyCode::Enter);
+        assert_eq!(lib.current_title().as_deref(), Some("B"));
+        assert_eq!(lib.quit(), None);
+
+        lib.start_on(&disk)?;
+        assert_eq!(lib.shown(), Some("Running"));
+        assert_eq!(lib.app.focus(), Focus::Main);
+        assert_eq!(lib.app.view(), View::Playlist);
+        assert_eq!(
+            lib.app.selected_playlist().map(|p| p.name.as_str()),
+            Some("Running")
+        );
+        assert_eq!(lib.current_title().as_deref(), Some("B"));
+        assert_eq!(
+            *lib.app.playback().source(),
+            Source::Playlist("Running".to_owned())
+        );
+        assert_eq!(lib.app.sidebar_playing(), Some(1));
+        lib.key(KeyCode::Char('n'));
+        assert_eq!(
+            lib.current_title().as_deref(),
+            Some("C"),
+            "next follows Running"
+        );
+        lib.key(KeyCode::Char('p'));
+        lib.key(KeyCode::Char('p'));
+        assert_eq!(
+            lib.current_title().as_deref(),
+            Some("D"),
+            "previous follows Running"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn track_gone_still_shows_the_playlist() -> Result<()> {
+        let mut lib = Lib::new()?;
+        lib.write("Running", &["A", "B"])?;
+        let entry = FolderEntry {
+            resume: Some(resume_at("Gone", None, 5_000, playlist("Running"))),
+            open: Some("Running".to_owned()),
+        };
+        let disk = lib.disk_with(None, entry)?;
+        lib.start_on(&disk)?;
+        assert_eq!(lib.app.playback().current(), None);
+        assert!(!lib.app.playback().audio().loaded, "nothing loaded");
+        assert_eq!(lib.shown(), Some("Running"));
+        assert_eq!(lib.app.focus(), Focus::Main);
+        assert_eq!(lib.status(Instant::now()), "", "no error");
+        Ok(())
+    }
+
+    #[test]
+    fn playlist_gone_resumes_from_the_library() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let entry = FolderEntry {
+            resume: Some(resume_at("C", Some(0), 5_000, playlist("Gym"))),
+            open: Some("Gym".to_owned()),
+        };
+        let disk = lib.disk_with(None, entry)?;
+        lib.start_on(&disk)?;
+        assert_eq!(lib.current_title().as_deref(), Some("C"));
+        assert_eq!(*lib.app.playback().source(), Source::Library);
+        assert_eq!(lib.app.playback().current_item(), Some(lib.index("C")?));
+        assert_eq!(lib.app.main_view(), MainView::Library);
+        assert_eq!(lib.app.focus(), Focus::Main);
+        Ok(())
+    }
+
+    #[test]
+    fn track_no_longer_in_the_playlist() -> Result<()> {
+        let mut lib = Lib::new()?;
+        lib.write("Gym", &["A", "B"])?;
+        let entry = FolderEntry {
+            resume: Some(resume_at("C", Some(1), 5_000, playlist("Gym"))),
+            open: Some("Gym".to_owned()),
+        };
+        let disk = lib.disk_with(None, entry)?;
+        lib.start_on(&disk)?;
+        assert_eq!(lib.current_title().as_deref(), Some("C"));
+        assert_eq!(*lib.app.playback().source(), Source::Library);
+        assert_eq!(lib.shown(), Some("Gym"), "still shown");
+        Ok(())
+    }
+
+    #[test]
+    fn source_and_shown_playlist_differ() -> Result<()> {
+        let mut lib = Lib::new()?;
+        lib.write("Gym", &["D", "C", "A"])?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        lib.key(KeyCode::Tab);
+        lib.key(KeyCode::Down);
+        lib.key(KeyCode::Enter);
+        lib.key(KeyCode::Down);
+        lib.key(KeyCode::Enter);
+        assert_eq!(lib.current_title().as_deref(), Some("C"));
+        // Back to the library, which stays shown.
+        lib.key(KeyCode::Tab);
+        lib.key(KeyCode::Home);
+        lib.key(KeyCode::Enter);
+        assert_eq!(lib.app.main_view(), MainView::Library);
+        assert_eq!(lib.quit(), None);
+
+        lib.start_on(&disk)?;
+        assert_eq!(lib.app.main_view(), MainView::Library);
+        assert_eq!(lib.app.focus(), Focus::Main);
+        assert_eq!(
+            *lib.app.playback().source(),
+            Source::Playlist("Gym".to_owned())
+        );
+        assert_eq!(lib.current_title().as_deref(), Some("C"));
+        lib.key(KeyCode::Char('n'));
+        assert_eq!(
+            lib.current_title().as_deref(),
+            Some("A"),
+            "next follows Gym"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn saved_item_is_used_when_it_still_is_the_track() -> Result<()> {
+        let mut lib = Lib::new()?;
+        lib.write("Twice", &["A", "B", "A", "C"])?;
+        let entry = FolderEntry {
+            resume: Some(resume_at("A", Some(2), 0, playlist("Twice"))),
+            open: None,
+        };
+        lib.start_on(&lib.disk_with(None, entry)?)?;
+        assert_eq!(lib.app.playback().current_item(), Some(2));
+        lib.key(KeyCode::Char('n'));
+        assert_eq!(lib.current_title().as_deref(), Some("C"));
+
+        // A saved item that now names another track: the first match wins.
+        let entry = FolderEntry {
+            resume: Some(resume_at("A", Some(1), 0, playlist("Twice"))),
+            open: None,
+        };
+        lib.start_on(&lib.disk_with(None, entry)?)?;
+        assert_eq!(lib.app.playback().current_item(), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_path_the_scan_did_not_find_is_never_loaded() -> Result<()> {
+        let mut lib = Lib::new()?;
+        for track in [
+            "../../etc/passwd",
+            "/etc/passwd",
+            "Band/LP/Missing.mp3",
+            "Band/LP",
+        ] {
+            let text = format!(
+                "kasset-state 1\nfolder {}\ntrack {track}\nposition-ms 1000\nsource library\n",
+                lib.root.display()
+            );
+            lib.start_on(&Disk::with(text.as_bytes()))?;
+            assert!(!lib.app.playback().audio().loaded, "{track}: no load");
+            assert_eq!(lib.app.playback().current(), None, "{track}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn track_cannot_be_opened() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let entry = FolderEntry {
+            resume: Some(resume_at("B", None, 5_000, SavedSource::Library)),
+            open: None,
+        };
+        let disk = lib.disk_with(None, entry)?;
+        lib.app = Lib::fresh(&lib.root, lib.tracks.clone());
+        lib.app.playback_mut().audio_mut().broken = true;
+        lib.app.restore(disk.store(&lib.root)?, &lib.root);
+        assert!(lib.status(Instant::now()).starts_with("Cannot resume 'B'"));
+        assert_eq!(lib.app.playback().current(), None);
+        assert_eq!(lib.app.playback().state(), PlayState::Stopped);
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_to_resume_keeps_the_shown_playlist() -> Result<()> {
+        let mut lib = Lib::new()?;
+        lib.write("Running", &["A"])?;
+        let state = tempfile::tempdir()?;
+        let file = state.path().join("kasset/state");
+        lib.start(Box::new(FsStateStore::new(file.clone(), &lib.root)));
+        lib.key(KeyCode::Tab);
+        lib.key(KeyCode::Down);
+        lib.key(KeyCode::Enter);
+        assert_eq!(lib.quit(), None);
+        let Parsed::Valid(saved) = parse(&fs::read(&file)?) else {
+            anyhow::bail!("the saved file does not parse");
+        };
+        let entry = &saved.folders.first().context("one folder")?.1;
+        assert_eq!(entry.resume, None, "no track");
+        assert_eq!(entry.open.as_deref(), Some("Running"));
+
+        lib.start(Box::new(FsStateStore::new(file, &lib.root)));
+        assert_eq!(lib.app.playback().current(), None);
+        assert_eq!(lib.shown(), Some("Running"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unresumable_point_is_kept_until_something_plays() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let gone = resume_at("Gone", Some(7), 61_000, playlist("Gym"));
+        let entry = FolderEntry {
+            resume: Some(gone.clone()),
+            open: None,
+        };
+        let disk = lib.disk_with(None, entry)?;
+        lib.start_on(&disk)?;
+        assert_eq!(lib.app.playback().current(), None);
+        assert_eq!(lib.quit(), None);
+        assert_eq!(disk.entry(&lib.root)?.resume, Some(gone), "kept whole");
+
+        lib.start_on(&disk)?;
+        lib.play("D")?;
+        lib.set_position(Duration::from_secs(3));
+        assert_eq!(lib.quit(), None);
+        let saved = disk.entry(&lib.root)?.resume.context("a resume point")?;
+        assert_eq!(saved, resume_at("D", Some(3), 3_000, SavedSource::Library));
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_track_shows_its_lyrics() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let dir = lib.root.join("Band/LP");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("B.lrc"), "[00:01.00]First\n[00:03.00]Second\n")?;
+        let entry = FolderEntry {
+            resume: Some(resume_at("B", None, 2_000, SavedSource::Library)),
+            open: None,
+        };
+        lib.start_on(&lib.disk_with(None, entry)?)?;
+        lib.app.set_lyrics_layout(true);
+        lib.app.tick(Instant::now());
+        assert!(lib.app.lyrics_ready(), "not \"Nothing playing\"");
+        let Some(Lyrics::Synced(lines)) = lib.app.lyrics() else {
+            anyhow::bail!("no synced lyrics: {:?}", lib.app.lyrics());
+        };
+        assert_eq!(lines.first().map(|l| l.text.as_str()), Some("First"));
+        Ok(())
+    }
+
+    // --- When the session is saved ---
+
+    #[test]
+    fn no_session_is_built_without_a_store() -> Result<()> {
+        let mut plain = Lib::new()?;
+        let saves = Rc::new(Cell::new(0));
+        let mut inert = Lib::new()?;
+        inert.start(Box::new(Inert(Rc::clone(&saves))));
+        for lib in [&mut plain, &mut inert] {
+            lib.play("A")?;
+            let start = Instant::now();
+            for s in 0..300 {
+                lib.set_position(Duration::from_secs(s));
+                lib.app.tick(start + Duration::from_secs(s));
+            }
+            assert_eq!(lib.quit(), None);
+            assert_eq!(lib.app.saved.built.get(), 0, "no session built");
+        }
+        assert_eq!(saves.get(), 0, "never asked to save");
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_changed_saves_nothing() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let entry = FolderEntry {
+            resume: Some(resume_at("A", Some(0), 10_000, SavedSource::Library)),
+            open: None,
+        };
+        let disk = lib.disk_with(Some(Settings::default()), entry)?;
+        lib.start_on(&disk)?;
+        assert_eq!(lib.app.playback().state(), PlayState::Paused);
+        let start = Instant::now();
+        for s in 0..=300 {
+            lib.app.tick(start + Duration::from_secs(s));
+        }
+        assert_eq!(disk.saves(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn saved_every_30_seconds_while_playing() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        let start = Instant::now();
+        lib.app.tick(start);
+        lib.play("B")?;
+        for s in 1..30 {
+            lib.set_position(Duration::from_secs(s));
+            lib.app.tick(start + Duration::from_secs(s));
+        }
+        assert_eq!(disk.saves(), 0, "not before 30 s");
+        lib.set_position(Duration::from_millis(30_250));
+        lib.app.tick(start + SAVE_INTERVAL);
+        assert_eq!(disk.saves(), 1);
+        let saved = disk.entry(&lib.root)?.resume.context("a resume point")?;
+        assert_eq!(saved.position, Duration::from_millis(30_250));
+        lib.set_position(Duration::from_secs(45));
+        lib.app.tick(start + Duration::from_secs(59));
+        assert_eq!(disk.saves(), 1, "at most every 30 s");
+        lib.app.tick(start + Duration::from_secs(60));
+        assert_eq!(disk.saves(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_failures_are_reported_once() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        disk.set_failing(true);
+        let start = Instant::now();
+        lib.app.tick(start);
+        lib.play("A")?;
+        let mut errors = 0;
+        for i in 1..=4 {
+            let now = start + SAVE_INTERVAL * i;
+            lib.set_position(Duration::from_secs(u64::from(i)));
+            // A notice lasts `STATUS_TTL`, far less than an interval.
+            errors += usize::from(lib.status(now).starts_with("Cannot save state to"));
+        }
+        assert_eq!(disk.saves(), 4, "tried each interval");
+        assert_eq!(errors, 1, "reported once");
+
+        disk.set_failing(false);
+        lib.set_position(Duration::from_secs(10));
+        lib.app.tick(start + SAVE_INTERVAL * 5);
+        assert_eq!(lib.status(start + SAVE_INTERVAL * 5), "");
+        disk.set_failing(true);
+        lib.set_position(Duration::from_secs(11));
+        let now = start + SAVE_INTERVAL * 6;
+        assert!(
+            lib.status(now)
+                .starts_with("Cannot save state to /state/kasset/state")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_save_is_not_hidden_by_a_playback_error() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        disk.set_failing(true);
+        let start = Instant::now();
+        lib.app.tick(start);
+        lib.play("A")?;
+        // In the tick that saves, the track ends and the next cannot play.
+        let audio = lib.app.playback_mut().audio_mut();
+        audio.ended = true;
+        audio.broken = true;
+        let status = lib.status(start + SAVE_INTERVAL);
+        assert_eq!(disk.saves(), 1);
+        assert!(status.starts_with("Cannot play '"), "{status}");
+        assert!(status.contains("; Cannot save state to"), "{status}");
+        assert_eq!(
+            lib.app.status(start + SAVE_INTERVAL).map(|n| n.level),
+            Some(Level::Error)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resumes_over_a_scanned_library() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("Band").join("LP");
+        fs::create_dir_all(&dir)?;
+        for name in ["one.wav", "two.wav"] {
+            fs::write(dir.join(name), crate::test_support::wav_bytes())?;
+        }
+        // The root as `main` gets it: resolved, then scanned.
+        let root = crate::cli::resolve_root(Some(tmp.path()))?;
+        let disk = Disk::default();
+        let start = |disk: &Disk| -> Result<App<SilentAudio>> {
+            let tracks = crate::library::scan(&root)?.tracks;
+            let mut app = Lib::fresh(&root, tracks);
+            app.restore(disk.store(&root)?, &root);
+            Ok(app)
+        };
+        let mut app = start(&disk)?;
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let played = app.playback().current_track().map(|t| t.path.clone());
+        assert!(played.is_some());
+        app.shutdown();
+        assert_eq!(app.save_final(), None);
+        let saved = disk.entry(&root)?.resume.context("a resume point")?;
+        let expected = RelPath::new(Path::new("Band/LP/two.wav")).context("relative path")?;
+        assert_eq!(saved.track, expected);
+
+        let app = start(&disk)?;
+        assert_eq!(
+            app.playback().current_track().map(|t| t.path.clone()),
+            played
+        );
+        assert_eq!(app.playback().state(), PlayState::Paused);
+        Ok(())
+    }
+
+    #[test]
+    fn a_newer_file_is_never_written() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let original = b"kasset-state 2\nvolume 10\n".to_vec();
+        let disk = Disk::with(&original);
+        lib.start_on(&disk)?;
+        assert_eq!(lib.app.playback().volume(), Volume::MAX, "defaults");
+        let start = Instant::now();
+        let status = lib.status(start);
+        assert!(
+            status.starts_with("Saved state is from a newer kasset"),
+            "{status}"
+        );
+        assert_eq!(lib.app.status(start).map(|n| n.level), Some(Level::Info));
+        lib.play("A")?;
+        lib.key(KeyCode::Char('-'));
+        for s in 1..=120 {
+            lib.set_position(Duration::from_secs(s));
+            lib.app.tick(start + Duration::from_secs(s));
+        }
+        assert_eq!(lib.quit(), None);
+        assert_eq!(disk.saves(), 0);
+        assert_eq!(disk.bytes(), original);
+        Ok(())
+    }
+
+    #[test]
+    fn saved_at_quit() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        assert_eq!(lib.app.save_final(), None, "nothing without shutdown");
+        assert_eq!(disk.saves(), 0);
+        lib.play("C")?;
+        lib.key(KeyCode::Char('-'));
+        lib.set_position(Duration::from_millis(42_123));
+        lib.app.shutdown();
+        assert_eq!(lib.app.playback().position(), Duration::ZERO, "stopped");
+        assert_eq!(disk.saves(), 0, "shutdown writes nothing");
+        assert_eq!(lib.app.save_final(), None);
+        assert_eq!(disk.saves(), 1);
+        let file = disk.file()?;
+        assert_eq!(file.settings.map(|s| s.volume.percent()), Some(95));
+        let saved = disk.entry(&lib.root)?.resume.context("a resume point")?;
+        assert_eq!(
+            saved.position,
+            Duration::from_millis(42_123),
+            "from before the stop"
+        );
+        assert_eq!(lib.app.save_final(), None, "written once");
+        assert_eq!(disk.saves(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_final_save_returns_the_error() -> Result<()> {
+        let mut lib = Lib::new()?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        disk.set_failing(true);
+        let error = lib.quit().context("an error")?;
+        assert!(error.starts_with("cannot save state to /state/kasset/state"));
         Ok(())
     }
 }
