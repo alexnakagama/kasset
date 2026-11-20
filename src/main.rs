@@ -15,7 +15,7 @@ mod queue;
     not(test),
     expect(
         dead_code,
-        reason = "wired into the app and `main` from task groups 3-5"
+        reason = "the store is built and the app restored by `main` in group 5"
     )
 )]
 mod state;

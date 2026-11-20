@@ -305,7 +305,7 @@ impl Queue {
         not(test),
         allow(
             dead_code,
-            reason = "only reached through Playback::set_repeat until group 4 of persist-session-state"
+            reason = "only reached through App::restore until group 5 of persist-session-state"
         )
     )]
     pub const fn set_repeat(&mut self, repeat: Repeat) {

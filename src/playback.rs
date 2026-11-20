@@ -145,6 +145,12 @@ impl<A: Audio> Playback<A> {
         &mut self.audio
     }
 
+    /// The audio output, for tests that inspect it.
+    #[cfg(test)]
+    pub const fn audio(&self) -> &A {
+        &self.audio
+    }
+
     /// All tracks, in library order.
     #[must_use]
     pub fn tracks(&self) -> &[Track] {
@@ -357,11 +363,13 @@ impl<A: Audio> Playback<A> {
 
     /// Turns shuffle on or off, keeping the current track; see
     /// [`Queue::set_shuffle`].
+    // `allow`, not `expect`: older compilers (the MSRV) count the call from
+    // the still-unused `App::restore` as a use, newer ones do not.
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
-            reason = "used by App::restore from group 4 of persist-session-state"
+            reason = "only reached through App::restore until group 5 of persist-session-state"
         )
     )]
     pub fn set_shuffle(&mut self, on: bool) {
@@ -369,11 +377,13 @@ impl<A: Audio> Playback<A> {
     }
 
     /// Sets the repeat mode.
+    // `allow`, not `expect`: older compilers (the MSRV) count the call from
+    // the still-unused `App::restore` as a use, newer ones do not.
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
-            reason = "used by App::restore from group 4 of persist-session-state"
+            reason = "only reached through App::restore until group 5 of persist-session-state"
         )
     )]
     pub const fn set_repeat(&mut self, repeat: Repeat) {
@@ -570,11 +580,13 @@ impl<A: Audio> Playback<A> {
     /// Returns whether the track was loaded. Returns `false` and changes
     /// nothing when `item` is out of range or an item is not a library
     /// index.
+    // `allow`, not `expect`: older compilers (the MSRV) count the call from
+    // the still-unused `App::restore` as a use, newer ones do not.
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
-            reason = "used by App::restore from group 4 of persist-session-state"
+            reason = "only reached through App::restore until group 5 of persist-session-state"
         )
     )]
     pub fn resume(

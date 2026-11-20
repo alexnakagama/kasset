@@ -87,7 +87,7 @@ folder /mnt/other
 
 ### D5. Restoring: settings first, then the resume point, paused
 
-`App::restore(store)` runs once, after `App::new` and before `terminal::run`:
+`App::restore(store, root)` (`root`: the canonical root given to `library::scan`, so scanned paths `strip_prefix` it) runs once, after `App::new` and before `terminal::run`:
 
 1. `store.load()`. `Newer` and `Invalid` give no settings and no resume point.
 2. Settings: new `Playback::set_volume`, `set_shuffle` and `set_repeat` (`Queue` gets `set_repeat`); `visualizer.on` and `lyrics.on` are set without a notice.
@@ -126,7 +126,7 @@ The ~40-line write helper is written for the state store rather than shared with
 
 ### D8. `--no-state`
 
-`Cli` gets `#[arg(long)] no_state: bool`. `make_store(no_state, location, root)` returns `NoState` when the flag is set or no location is known, else `FsStateStore` for that file and root; `main` always calls `App::restore(make_store(…))`, so `--no-state` reads and writes nothing (spec *Private session*). `cli.rs`'s `--help` test checks the flag is listed.
+`Cli` gets `#[arg(long)] no_state: bool`. `make_store(no_state, location, root)` returns `NoState` when the flag is set or no location is known, else `FsStateStore` for that file and root; `main` always calls `App::restore(make_store(…), &root)`, so `--no-state` reads and writes nothing (spec *Private session*). `cli.rs`'s `--help` test checks the flag is listed.
 
 Tests never call `dirs`: `FsStateStore` is always built from an explicit path (a `tempfile` folder), `location` and `make_store` are pure, and `App::new` keeps using `NoState`.
 
