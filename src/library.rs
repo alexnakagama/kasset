@@ -827,23 +827,32 @@ mod tests {
     }
 
     /// Non-UTF-8 names are decoded lossily, never panic, and stay sanitised.
+    ///
+    /// The path is never created: some file systems (APFS on macOS) refuse
+    /// non-UTF-8 names with `EILSEQ`, and inference only looks at the path's
+    /// text — an unreadable file is just a track without tags.
     #[cfg(unix)]
     #[test]
-    fn non_utf8_names_are_inferred_lossily() -> Result<()> {
+    fn non_utf8_names_are_inferred_lossily() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
-        let tmp = tempfile::tempdir()?;
-        let root = tmp.path();
-        let folder = root.join(OsStr::from_bytes(b"Ar\xfft")).join("LP");
-        fs::create_dir_all(&folder)?;
-        let path = folder.join(OsStr::from_bytes(b"Ba\xffnd - So\xfeng.wav"));
-        fs::write(&path, wav_bytes())?;
+        let root = Path::new("/nonexistent-kasset-library");
+        let path = root
+            .join(OsStr::from_bytes(b"Ar\xfft"))
+            .join("LP")
+            .join(OsStr::from_bytes(b"Ba\xffnd - So\xfeng.wav"));
         let t = read_track_in(root, path);
         assert_eq!(t.artist, "Ba\u{fffd}nd");
         assert_eq!(t.title, "So\u{fffd}ng");
         assert_eq!(t.album, "LP");
-        Ok(())
+
+        // Without a file-name artist the lossy folder name is the artist.
+        let path = root
+            .join(OsStr::from_bytes(b"Ar\xfft"))
+            .join("LP")
+            .join("Song.wav");
+        assert_eq!(read_track_in(root, path).artist, "Ar\u{fffd}t");
     }
 
     #[test]
