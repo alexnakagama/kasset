@@ -5,8 +5,10 @@ in a local folder. Type `kasset`, browse your library and play it without
 leaving the terminal.
 
 - Recursive scan of a folder for mp3, flac, ogg/oga (Vorbis), wav and m4a/aac
-- Title, artist, album, track number and duration read from tags, with the
-  file name as fallback
+- Title, artist, album, track number and duration read from tags; when a tag
+  is missing, it is taken from the file name (`01 - Artist - Title`) and from
+  `Artist/Album/` folders, with video labels such as "(Official Audio)"
+  removed from the title
 - Play, pause, stop, next/previous, seek, volume, automatic advance
 - Shuffle and repeat (off / all / one)
 - Live search with `/` over title, artist and album

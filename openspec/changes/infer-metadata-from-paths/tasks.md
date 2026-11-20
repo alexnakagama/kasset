@@ -17,7 +17,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 2. Wire into the scan (`src/library.rs`)
 
-- [ ] 2.1 Add `read_track_in(root, path)` with the merge order of D5, and keep `read_track(path)` as the file-name-only wrapper. Make `scan` call `read_track_in(root, path)` (`root: &Path`, `path: PathBuf`). Existing `library.rs` and `player.rs` tests must pass unchanged (the untagged test files such as `my track.mp3` have no dash and no number, and `read_track` never looks at folders). Update the `read_track` doc comment. Verify with tests on temp files (the in-memory WAV from `test_support`):
+- [x] 2.1 Add `read_track_in(root, path)` with the merge order of D5, and keep `read_track(path)` as the file-name-only wrapper. Make `scan` call `read_track_in(root, path)` (`root: &Path`, `path: PathBuf`). Existing `library.rs` and `player.rs` tests must pass unchanged (the untagged test files such as `my track.mp3` have no dash and no number, and `read_track` never looks at folders). Update the `read_track` doc comment. Verify with tests on temp files (the in-memory WAV from `test_support`):
   - an untagged `Band - Song (Official Audio).wav` at the root scans as artist "Band", title "Song", album "Unknown";
   - an untagged `<root>/Band/LP/02 Song.wav` scans as artist "Band", album "LP", number 2, title "Song", and the same file under `<root>/Band/LP/CD1/` gives the same values;
   - a WAV whose tag has artist "Real" and title "T" under `<root>/X/Y/Other - Name.wav` keeps "Real" and "T", and gets album "Y" (spec *Tags win over the file name*);
@@ -25,7 +25,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
   - a tag track number > 0 beats the inferred one (`07 Song.wav` tagged 3 gives 3), and tag number 0 or none uses the inferred one;
   - `read_track_in` with a path that is not under `root` falls back to the file name only (no folder inference, no panic);
   - `scan` sorts the inferred artists with tagged ones (spec *Library ordering* unchanged).
-- [ ] 2.2 Update `README.md` (feature line: tags, else the file name `Artist - Title` and `Artist/Album/` folders, with video labels removed) and the `library.rs` line in `CLAUDE.md`'s Architecture section. Verify by reading the rendered README section.
+- [x] 2.2 Update `README.md` (feature line: tags, else the file name `Artist - Title` and `Artist/Album/` folders, with video labels removed) and the `library.rs` line in `CLAUDE.md`'s Architecture section. Verify by reading the rendered README section.
 
 ## 3. Integration check
 

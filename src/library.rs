@@ -1,6 +1,11 @@
 //! Discovering audio files under the library root and reading their metadata
 //! (and, on demand, one track's lyrics tag). Files are opened without
 //! blocking and must be regular files; lofty runs inside `panic_guard::quietly`.
+//!
+//! Tags always win, field by field; a missing title, artist, album or track
+//! number is inferred from the file name and the folders below the root by
+//! the pure [`infer`] submodule before falling back to the stem or
+//! [`UNKNOWN`]. Inferred text is sanitised like tag text.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -21,10 +26,6 @@ use crate::bounded_read::open_regular;
 use crate::panic_guard::quietly;
 use crate::text::{display_path, sanitize};
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into `scan` by `read_track_in` (task 2.1)")
-)]
 mod infer;
 
 /// File extensions (lower case) the player can decode.
@@ -169,19 +170,67 @@ pub fn discover(root: &Path) -> Result<Discovery> {
     Ok(out)
 }
 
-/// Reads a track's metadata, falling back to the file name for the title and
-/// [`UNKNOWN`] for artist/album when tags are missing or unreadable.
+/// Reads a track's metadata, inferring missing fields from its **file name
+/// only** (folders are never looked at, since no library root is known).
 ///
-/// Each field is taken from the first tag that has it, primary tag first.
+/// Same as [`read_track_in`] without folder inference: tags first, then the
+/// file name (`NN - Artist - Title`, video labels removed), then the bare stem
+/// for the title and [`UNKNOWN`] for artist/album. Test-only: the scan always
+/// knows the root and calls [`read_track_in`].
+#[cfg(test)]
 #[must_use]
 pub fn read_track(path: PathBuf) -> Track {
+    let inferred = file_name_only(&path);
+    build_track(path, inferred)
+}
+
+/// Reads the metadata of `path`, a track found under the library folder
+/// `root`, inferring missing fields from its file name and from the folders
+/// between `root` and the file (`Artist/Album/`).
+///
+/// Per field, the first value present wins (design D5 of
+/// `infer-metadata-from-paths`):
+/// - title: tag → inferred title → file stem;
+/// - artist: tag → file-name artist → folder artist → [`UNKNOWN`];
+/// - album: tag → folder album → [`UNKNOWN`];
+/// - track number: tag (> 0) → inferred number.
+///
+/// Each tag field is taken from the first tag that has it, primary tag first.
+/// When `path` does not lie under `root`, only the file name is used.
+#[must_use]
+pub fn read_track_in(root: &Path, path: PathBuf) -> Track {
+    let inferred = match path.strip_prefix(root) {
+        Ok(relative) => infer::infer(relative),
+        Err(_) => file_name_only(&path),
+    };
+    build_track(path, inferred)
+}
+
+/// Inference from the last component of `path` alone.
+fn file_name_only(path: &Path) -> infer::Inferred {
+    path.file_name()
+        .map(|name| infer::infer(Path::new(name)))
+        .unwrap_or_default()
+}
+
+/// Reads the tags of `path` and fills each missing field from `inferred`.
+fn build_track(path: PathBuf, inferred: infer::Inferred) -> Track {
     let tagged = read_tagged(&path, scan_options());
     let tags = tagged.as_ref().map(ordered_tags).unwrap_or_default();
 
-    let title = tag_text(&tags, Accessor::title).unwrap_or_else(|| title_from_path(&path));
-    let artist = tag_text(&tags, Accessor::artist).unwrap_or_else(|| UNKNOWN.to_owned());
-    let album = tag_text(&tags, Accessor::album).unwrap_or_else(|| UNKNOWN.to_owned());
-    let number = tags.iter().find_map(|t| t.track().filter(|&n| n > 0));
+    let title = tag_text(&tags, Accessor::title)
+        .or(inferred.title)
+        .unwrap_or_else(|| title_from_path(&path));
+    let artist = tag_text(&tags, Accessor::artist)
+        .or(inferred.artist)
+        .unwrap_or_else(|| UNKNOWN.to_owned());
+    let album = tag_text(&tags, Accessor::album)
+        .or(inferred.album)
+        .unwrap_or_else(|| UNKNOWN.to_owned());
+    let number = tags
+        .iter()
+        .find_map(|t| t.track().filter(|&n| n > 0))
+        .or(inferred.number);
     let duration = tagged
         .as_ref()
         .map(|t| t.properties().duration())
@@ -204,7 +253,11 @@ pub fn read_track(path: PathBuf) -> Track {
 /// Fails when `root` itself cannot be read.
 pub fn scan(root: &Path) -> Result<Library> {
     let found = discover(root)?;
-    let mut tracks: Vec<Track> = found.paths.into_iter().map(read_track).collect();
+    let mut tracks: Vec<Track> = found
+        .paths
+        .into_iter()
+        .map(|path| read_track_in(root, path))
+        .collect();
     sort_tracks(&mut tracks);
     Ok(Library {
         tracks,
@@ -690,6 +743,223 @@ mod tests {
         }
         assert_eq!(lyrics_tag(&tmp.path().join("missing.flac")), None);
         assert_eq!(lyrics_tag(tmp.path()), None);
+        Ok(())
+    }
+
+    /// Writes the in-memory WAV to `root/relative` (creating its folders),
+    /// with `tag` saved into it when given.
+    fn wav_at(root: &Path, relative: &str, tag: Option<&Tag>) -> Result<PathBuf> {
+        use lofty::config::WriteOptions;
+        use lofty::tag::TagExt;
+
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, wav_bytes())?;
+        if let Some(tag) = tag {
+            tag.save_to_path(&path, WriteOptions::default())?;
+        }
+        Ok(path)
+    }
+
+    fn id3(fill: impl FnOnce(&mut Tag)) -> Tag {
+        let mut tag = Tag::new(lofty::tag::TagType::Id3v2);
+        fill(&mut tag);
+        tag
+    }
+
+    #[test]
+    fn scan_infers_artist_and_title_from_the_file_name() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        wav_at(tmp.path(), "Band - Song (Official Audio).wav", None)?;
+        let tracks = scan(tmp.path())?.tracks;
+        let [t] = tracks.as_slice() else {
+            anyhow::bail!("expected one track, got {tracks:?}")
+        };
+        assert_eq!(t.artist, "Band");
+        assert_eq!(t.title, "Song");
+        assert_eq!(t.album, UNKNOWN);
+        assert_eq!(t.number, None);
+        Ok(())
+    }
+
+    #[test]
+    fn folders_give_artist_and_album_and_disc_folders_are_skipped() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        for relative in ["Band/LP/02 Song.wav", "Band/LP/CD1/02 Song.wav"] {
+            let t = read_track_in(root, wav_at(root, relative, None)?);
+            assert_eq!(t.artist, "Band", "{relative}");
+            assert_eq!(t.album, "LP", "{relative}");
+            assert_eq!(t.number, Some(2), "{relative}");
+            assert_eq!(t.title, "Song", "{relative}");
+        }
+        // The scan passes the root, so it infers the same values.
+        let tracks = scan(root)?.tracks;
+        assert_eq!(tracks.len(), 2);
+        assert!(
+            tracks
+                .iter()
+                .all(|t| (t.artist.as_str(), t.album.as_str()) == ("Band", "LP")),
+            "{tracks:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tags_win_over_file_name_and_folders_field_by_field() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let tag = id3(|t| {
+            t.set_artist("Real".to_owned());
+            t.set_title("T".to_owned());
+        });
+        let t = read_track_in(root, wav_at(root, "X/Y/Other - Name.wav", Some(&tag))?);
+        assert_eq!((t.artist.as_str(), t.title.as_str()), ("Real", "T"));
+        assert_eq!(t.album, "Y");
+
+        let tag = id3(|t| t.set_album("Real LP".to_owned()));
+        let t = read_track_in(root, wav_at(root, "X/Y/Other - Name 2.wav", Some(&tag))?);
+        assert_eq!(t.album, "Real LP");
+        assert_eq!((t.artist.as_str(), t.title.as_str()), ("Other", "Name 2"));
+        Ok(())
+    }
+
+    /// Non-UTF-8 names are decoded lossily, never panic, and stay sanitised.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_are_inferred_lossily() -> Result<()> {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let folder = root.join(OsStr::from_bytes(b"Ar\xfft")).join("LP");
+        fs::create_dir_all(&folder)?;
+        let path = folder.join(OsStr::from_bytes(b"Ba\xffnd - So\xfeng.wav"));
+        fs::write(&path, wav_bytes())?;
+        let t = read_track_in(root, path);
+        assert_eq!(t.artist, "Ba\u{fffd}nd");
+        assert_eq!(t.title, "So\u{fffd}ng");
+        assert_eq!(t.album, "LP");
+        Ok(())
+    }
+
+    #[test]
+    fn artist_tag_without_title_tag_takes_the_title_from_the_file_name() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let tag = id3(|t| t.set_artist("Band".to_owned()));
+        let t = read_track_in(root, wav_at(root, "Other - Name.wav", Some(&tag))?);
+        assert_eq!((t.artist.as_str(), t.title.as_str()), ("Band", "Name"));
+        assert_eq!(t.album, UNKNOWN);
+        Ok(())
+    }
+
+    #[test]
+    fn title_tag_without_artist_tag_takes_the_artist_from_the_file_name() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let tag = id3(|t| t.set_title("Song".to_owned()));
+        let t = read_track_in(root, wav_at(root, "Band - whatever.wav", Some(&tag))?);
+        assert_eq!((t.artist.as_str(), t.title.as_str()), ("Band", "Song"));
+        Ok(())
+    }
+
+    #[test]
+    fn track_number_tag_wins_unless_missing_or_zero() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let cases: [(&str, Option<u32>, Option<u32>); 3] = [
+            ("tagged/07 Song.wav", Some(3), Some(3)),
+            ("zero/07 Song.wav", Some(0), Some(7)),
+            ("none/07 Song.wav", None, Some(7)),
+        ];
+        for (relative, tag_number, expected) in cases {
+            let tag = id3(|t| {
+                t.set_album("LP".to_owned());
+                if let Some(n) = tag_number {
+                    t.set_track(n);
+                }
+            });
+            let t = read_track_in(root, wav_at(root, relative, Some(&tag))?);
+            assert_eq!(t.number, expected, "{relative}");
+            assert_eq!(t.title, "Song", "{relative}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn path_outside_the_root_uses_the_file_name_only() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("library");
+        fs::create_dir(&root)?;
+        let elsewhere = wav_at(tmp.path(), "other/Band/LP/02 Artist - Song.wav", None)?;
+        let t = read_track_in(&root, elsewhere.clone());
+        assert_eq!(t.artist, "Artist");
+        assert_eq!(t.album, UNKNOWN);
+        assert_eq!(t.number, Some(2));
+        assert_eq!(t.title, "Song");
+        assert_eq!(t.path, elsewhere);
+
+        // The root itself, or a root that is not a prefix at all, never panics.
+        assert_eq!(read_track_in(&root, root.clone()).artist, UNKNOWN);
+        assert_eq!(
+            read_track_in(Path::new("/nonexistent"), elsewhere).album,
+            UNKNOWN
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_track_never_looks_at_folders() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let t = read_track(wav_at(tmp.path(), "Band/LP/02 Song.wav", None)?);
+        assert_eq!((t.artist.as_str(), t.album.as_str()), (UNKNOWN, UNKNOWN));
+        assert_eq!((t.number, t.title.as_str()), (Some(2), "Song"));
+        Ok(())
+    }
+
+    #[test]
+    fn bare_number_and_label_only_names_keep_their_stem() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let t = read_track_in(root, wav_at(root, "01.wav", None)?);
+        assert_eq!((t.title.as_str(), t.number), ("01", None));
+        let t = read_track_in(root, wav_at(root, "Official Video.wav", None)?);
+        assert_eq!(t.title, "Official Video");
+        assert_eq!(t.artist, UNKNOWN);
+        Ok(())
+    }
+
+    /// Control characters are not allowed in Windows file names.
+    #[cfg(unix)]
+    #[test]
+    fn inferred_folder_and_file_text_is_sanitised() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let path = wav_at(root, "A\u{1b}rt/L\u{7}P/Ba\u{1b}[31mnd - So\tng.wav", None)?;
+        let t = read_track_in(root, path);
+        assert_eq!(t.artist, "Ba [31mnd");
+        assert_eq!(t.album, "L P");
+        assert_eq!(t.title, "So ng");
+        Ok(())
+    }
+
+    #[test]
+    fn scan_sorts_inferred_artists_with_tagged_ones() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        wav_at(root, "Zed - a.wav", None)?;
+        wav_at(
+            root,
+            "b.wav",
+            Some(&id3(|t| t.set_artist("Mid".to_owned()))),
+        )?;
+        wav_at(root, "alpha - c.wav", None)?;
+        let artists: Vec<_> = scan(root)?.tracks.into_iter().map(|t| t.artist).collect();
+        assert_eq!(artists, ["alpha", "Mid", "Zed"]);
         Ok(())
     }
 
