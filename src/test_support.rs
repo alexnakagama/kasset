@@ -33,6 +33,8 @@ pub fn track(title: &str, artist: &str, album: &str) -> crate::library::Track {
         artist: artist.to_owned(),
         album: album.to_owned(),
         number: None,
+        album_artist: None,
+        disc: None,
         duration: Some(std::time::Duration::from_secs(200)),
     }
 }

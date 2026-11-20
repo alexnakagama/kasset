@@ -5,7 +5,10 @@
 //! Tags always win, field by field; a missing title, artist, album or track
 //! number is inferred from the file name and the folders below the root by
 //! the pure [`infer`] submodule before falling back to the stem or
-//! [`UNKNOWN`]. Inferred text is sanitised like tag text.
+//! [`UNKNOWN`]. Inferred text is sanitised like tag text. The album artist
+//! and the disc number come from tags only and are never inferred (D2 of
+//! `add-artist-album-browsing`): a folder name must not override tagged
+//! artists when albums are grouped.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -51,7 +54,12 @@ pub struct Track {
     pub title: String,
     pub artist: String,
     pub album: String,
+    /// Album-artist tag, if any (never inferred). Meant for grouping albums
+    /// (under it, else under [`Track::artist`]); this module only reads it.
+    pub album_artist: Option<String>,
     pub number: Option<u32>,
+    /// Disc number from the tags (> 0), if any (never inferred).
+    pub disc: Option<u32>,
     pub duration: Option<Duration>,
 }
 
@@ -193,7 +201,8 @@ pub fn read_track(path: PathBuf) -> Track {
 /// - title: tag → inferred title → file stem;
 /// - artist: tag → file-name artist → folder artist → [`UNKNOWN`];
 /// - album: tag → folder album → [`UNKNOWN`];
-/// - track number: tag (> 0) → inferred number.
+/// - track number: tag (> 0) → inferred number;
+/// - album artist and disc number (> 0): tag only.
 ///
 /// Each tag field is taken from the first tag that has it, primary tag first.
 /// When `path` does not lie under `root`, only the file name is used.
@@ -231,6 +240,8 @@ fn build_track(path: PathBuf, inferred: infer::Inferred) -> Track {
         .iter()
         .find_map(|t| t.track().filter(|&n| n > 0))
         .or(inferred.number);
+    let album_artist = tag_item_text(&tags, ItemKey::AlbumArtist);
+    let disc = tag_disc(&tags);
     let duration = tagged
         .as_ref()
         .map(|t| t.properties().duration())
@@ -241,7 +252,9 @@ fn build_track(path: PathBuf, inferred: infer::Inferred) -> Track {
         title,
         artist,
         album,
+        album_artist,
         number,
+        disc,
         duration,
     }
 }
@@ -266,14 +279,16 @@ pub fn scan(root: &Path) -> Result<Library> {
     })
 }
 
-/// Sorts by artist, album, track number, then title (text compared
-/// case-insensitively). Untagged track numbers sort after numbered ones and the
-/// path breaks remaining ties so the order is deterministic.
+/// Sorts by artist, album, disc number, track number, then title (text
+/// compared case-insensitively). A missing disc number sorts as disc 1,
+/// untagged track numbers sort after numbered ones, and the path breaks
+/// remaining ties so the order is deterministic.
 pub fn sort_tracks(tracks: &mut [Track]) {
     tracks.sort_by_cached_key(|t| {
         (
             t.artist.to_lowercase(),
             t.album.to_lowercase(),
+            t.disc.unwrap_or(1),
             t.number.map_or((1, 0), |n| (0, n)),
             t.title.to_lowercase(),
             t.path.clone(),
@@ -351,11 +366,25 @@ fn ordered_tags(tagged: &TaggedFile) -> Vec<&Tag> {
         .collect()
 }
 
+/// The first value `get` returns, primary tag first, that is non-empty once
+/// sanitised.
 fn tag_text(
     tags: &[&Tag],
     get: impl for<'a> Fn(&'a Tag) -> Option<std::borrow::Cow<'a, str>>,
 ) -> Option<String> {
     tags.iter().find_map(|t| get(t).and_then(|s| sanitize(&s)))
+}
+
+/// The first disc number above 0, primary tag first.
+fn tag_disc(tags: &[&Tag]) -> Option<u32> {
+    tags.iter().find_map(|t| t.disk().filter(|&n| n > 0))
+}
+
+/// [`tag_text`] for an item with no `Accessor` method (such as
+/// `ItemKey::AlbumArtist`), read with `Tag::get_string`.
+fn tag_item_text(tags: &[&Tag], key: ItemKey) -> Option<String> {
+    tags.iter()
+        .find_map(|t| t.get_string(key).and_then(sanitize))
 }
 
 fn title_from_path(path: &Path) -> String {
@@ -398,6 +427,8 @@ mod tests {
             artist: artist.to_owned(),
             album: album.to_owned(),
             number: no,
+            album_artist: None,
+            disc: None,
             duration: None,
         }
     }
@@ -559,6 +590,8 @@ mod tests {
         assert_eq!(t.artist, UNKNOWN);
         assert_eq!(t.album, UNKNOWN);
         assert_eq!(t.number, None);
+        assert_eq!(t.album_artist, None);
+        assert_eq!(t.disc, None);
         assert_eq!(t.duration, None);
         assert_eq!(t.path, path);
         Ok(())
@@ -641,6 +674,109 @@ mod tests {
         fs::write(&path, bytes)?;
         tag.save_to_path(&path, WriteOptions::default())?;
         Ok(path)
+    }
+
+    #[test]
+    fn album_artist_and_disc_are_read_from_id3() -> Result<()> {
+        use lofty::tag::TagType;
+
+        let tmp = tempfile::tempdir()?;
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_artist("Band".to_owned());
+        tag.insert_text(ItemKey::AlbumArtist, "Various Artists".to_owned());
+        tag.set_disk(2);
+        tag.set_track(1);
+        let path = tagged_copy(&tmp, "song.wav", &wav_bytes(), &tag)?;
+        let t = read_track(path);
+        assert_eq!(t.artist, "Band");
+        assert_eq!(t.album_artist.as_deref(), Some("Various Artists"));
+        assert_eq!(t.disc, Some(2));
+        assert_eq!(t.number, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn album_artist_and_disc_are_read_from_vorbis_comments() -> Result<()> {
+        use crate::test_support::flac_bytes;
+        use lofty::tag::TagType;
+
+        let tmp = tempfile::tempdir()?;
+        let mut tag = Tag::new(TagType::VorbisComments);
+        tag.insert_text(ItemKey::AlbumArtist, "Various Artists".to_owned());
+        tag.set_disk(3);
+        let path = tagged_copy(&tmp, "song.flac", &flac_bytes(), &tag)?;
+        let t = read_track(path);
+        assert_eq!(t.album_artist.as_deref(), Some("Various Artists"));
+        assert_eq!(t.disc, Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn album_artist_is_sanitised_and_blank_or_zero_values_are_missing() -> Result<()> {
+        use lofty::tag::TagType;
+
+        let tmp = tempfile::tempdir()?;
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_text(
+            ItemKey::AlbumArtist,
+            "V\u{1b}[2Ja\u{7}rious\u{9b}31m\r\nArtists".to_owned(),
+        );
+        let path = tagged_copy(&tmp, "dirty.wav", &wav_bytes(), &tag)?;
+        assert_eq!(
+            read_track(path).album_artist.as_deref(),
+            Some("V [2Ja rious 31m Artists")
+        );
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_text(ItemKey::AlbumArtist, " \u{1b}\t ".to_owned());
+        let path = tagged_copy(&tmp, "blank.wav", &wav_bytes(), &tag)?;
+        assert_eq!(read_track(path).album_artist, None);
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_disk(0);
+        let path = tagged_copy(&tmp, "zero.wav", &wav_bytes(), &tag)?;
+        assert_eq!(read_track(path).disc, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_blank_primary_value_falls_through_to_a_later_tag() {
+        use lofty::tag::TagType;
+
+        let mut primary = Tag::new(TagType::Id3v2);
+        primary.insert_text(ItemKey::AlbumArtist, " \u{7} ".to_owned());
+        primary.set_disk(0);
+        let mut secondary = Tag::new(TagType::Ape);
+        secondary.insert_text(ItemKey::AlbumArtist, "Real".to_owned());
+        secondary.set_disk(2);
+        let tags = [&primary, &secondary];
+        assert_eq!(
+            tag_item_text(&tags, ItemKey::AlbumArtist).as_deref(),
+            Some("Real")
+        );
+        assert_eq!(tag_disc(&tags), Some(2));
+
+        // A usable primary value wins.
+        primary.insert_text(ItemKey::AlbumArtist, "Primary".to_owned());
+        primary.set_disk(1);
+        let tags = [&primary, &secondary];
+        assert_eq!(
+            tag_item_text(&tags, ItemKey::AlbumArtist).as_deref(),
+            Some("Primary")
+        );
+        assert_eq!(tag_disc(&tags), Some(1));
+        assert_eq!(tag_item_text(&[], ItemKey::AlbumArtist), None);
+        assert_eq!(tag_disc(&[]), None);
+    }
+
+    #[test]
+    fn album_artist_and_disc_are_never_inferred() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let t = read_track_in(root, wav_at(root, "Band/LP/CD2/02 Song.wav", None)?);
+        assert_eq!((t.artist.as_str(), t.album.as_str()), ("Band", "LP"));
+        assert_eq!((t.album_artist, t.disc), (None, None));
+        Ok(())
     }
 
     #[test]
@@ -1016,7 +1152,35 @@ mod tests {
     }
 
     #[test]
-    fn sorts_by_artist_album_number_title_case_insensitively() {
+    fn discs_sort_before_track_numbers_and_missing_disc_is_disc_one() {
+        let on_disc = |disc: Option<u32>, no: u32, title: &str| Track {
+            disc,
+            ..track("A", "LP", Some(no), title)
+        };
+        // Disc 1 and no disc tie, so the track number then the title decide.
+        let mut tied = vec![
+            on_disc(Some(1), 4, "b"),
+            on_disc(None, 4, "a"),
+            on_disc(Some(1), 3, "c"),
+        ];
+        sort_tracks(&mut tied);
+        let titles: Vec<_> = tied.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["c", "a", "b"]);
+
+        let mut tracks = vec![
+            on_disc(Some(2), 1, "d2t1"),
+            on_disc(Some(1), 5, "d1t5"),
+            on_disc(None, 3, "none-t3"),
+            on_disc(Some(10), 1, "d10t1"),
+            on_disc(Some(1), 2, "d1t2"),
+        ];
+        sort_tracks(&mut tracks);
+        let titles: Vec<_> = tracks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["d1t2", "none-t3", "d1t5", "d2t1", "d10t1"]);
+    }
+
+    #[test]
+    fn sorts_by_artist_album_disc_number_title_case_insensitively() {
         let mut tracks = vec![
             track("beta", "x", Some(1), "b1"),
             track("Alpha", "Zed", Some(1), "a-z1"),

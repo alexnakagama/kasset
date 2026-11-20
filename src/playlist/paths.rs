@@ -240,6 +240,8 @@ mod tests {
             artist: "a".to_owned(),
             album: "l".to_owned(),
             number: None,
+            album_artist: None,
+            disc: None,
             duration: Some(Duration::from_secs(1)),
         }
     }
