@@ -298,6 +298,20 @@ impl Queue {
         self.repeat
     }
 
+    /// Sets the repeat mode; the order and the current item are unchanged.
+    // `allow`, not `expect`: older compilers (the MSRV) count the call from
+    // the still-unused `Playback::set_repeat` as a use, newer ones do not.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "only reached through Playback::set_repeat until group 4 of persist-session-state"
+        )
+    )]
+    pub const fn set_repeat(&mut self, repeat: Repeat) {
+        self.repeat = repeat;
+    }
+
     /// Random permutation of all items with `first` (if any) moved to the
     /// front, which becomes current.
     fn reshuffle<R: Rng + ?Sized>(&mut self, first: Option<usize>, rng: &mut R) {
@@ -764,6 +778,21 @@ mod tests {
         assert_eq!(q.repeat(), Repeat::All);
         assert_eq!(q.items(), [8, 9]);
         check(&q);
+    }
+
+    #[test]
+    fn set_repeat_keeps_order_and_current() {
+        let mut q = list(&[1, 2, 3], Repeat::Off);
+        q.set_shuffle(true, &mut rng());
+        q.select(2, &mut rng());
+        let order = q.order().to_vec();
+        for repeat in [Repeat::One, Repeat::All, Repeat::Off] {
+            q.set_repeat(repeat);
+            assert_eq!(q.repeat(), repeat);
+            assert_eq!(q.order(), order);
+            assert_eq!(q.current_item(), Some(2));
+            check(&q);
+        }
     }
 
     // A, B, C, D are library tracks 10, 11, 12, 13.
