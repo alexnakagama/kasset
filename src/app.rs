@@ -773,7 +773,10 @@ impl<A: Audio> App<A> {
     pub fn sidebar_playing(&self) -> Option<usize> {
         self.playback.current_track()?;
         match self.playback.source() {
-            Source::Library => Some(0),
+            // Artist and album sources mark "Library" until the sidebar
+            // lists "Artists" and "Albums" (task 5.1 of
+            // add-artist-album-browsing).
+            Source::Library | Source::Artist(_) | Source::Album(_) => Some(0),
             Source::Playlist(name) => self.sidebar_value_of(name),
             Source::Detached => None,
         }
@@ -1958,8 +1961,12 @@ impl<A: Audio> App<A> {
                 Source::Playlist(name) => {
                     (SavedSource::Playlist(name.clone()), playback.current_item())
                 }
-                // The library's items are its indices.
-                Source::Library | Source::Detached => (SavedSource::Library, Some(index)),
+                // The library's items are its indices. Artist and album
+                // sources are saved as the library until task 5.3 of
+                // add-artist-album-browsing saves them by name.
+                Source::Library | Source::Detached | Source::Artist(_) | Source::Album(_) => {
+                    (SavedSource::Library, Some(index))
+                }
             };
             Some(Resume {
                 track,
@@ -6411,6 +6418,29 @@ mod state_tests {
             PAUSED_AT,
             "continues from there"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn album_and_artist_sources_are_saved_as_the_library_for_now() -> Result<()> {
+        // Interim until tasks 5.1 and 5.3 of add-artist-album-browsing.
+        let mut lib = Lib::new()?;
+        let disk = Disk::default();
+        lib.start_on(&disk)?;
+        for source in [Source::Album(0), Source::Artist(0)] {
+            assert!(
+                lib.app
+                    .playback_mut()
+                    .play_source(source.clone(), vec![2, 0], 0)
+            );
+            assert_eq!(lib.app.sidebar_playing(), Some(0), "{source:?}");
+            let resume = lib.app.session().folder.resume;
+            assert_eq!(
+                resume.as_ref().map(|r| (r.source.clone(), r.item)),
+                Some((SavedSource::Library, Some(2))),
+                "{source:?}: saved as the library, item = library index"
+            );
+        }
         Ok(())
     }
 
