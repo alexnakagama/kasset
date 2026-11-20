@@ -363,29 +363,11 @@ impl<A: Audio> Playback<A> {
 
     /// Turns shuffle on or off, keeping the current track; see
     /// [`Queue::set_shuffle`].
-    // `allow`, not `expect`: older compilers (the MSRV) count the call from
-    // the still-unused `App::restore` as a use, newer ones do not.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "only reached through App::restore until group 5 of persist-session-state"
-        )
-    )]
     pub fn set_shuffle(&mut self, on: bool) {
         self.queue.set_shuffle(on, &mut rand::rng());
     }
 
     /// Sets the repeat mode.
-    // `allow`, not `expect`: older compilers (the MSRV) count the call from
-    // the still-unused `App::restore` as a use, newer ones do not.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "only reached through App::restore until group 5 of persist-session-state"
-        )
-    )]
     pub const fn set_repeat(&mut self, repeat: Repeat) {
         self.queue.set_repeat(repeat);
     }
@@ -580,15 +562,6 @@ impl<A: Audio> Playback<A> {
     /// Returns whether the track was loaded. Returns `false` and changes
     /// nothing when `item` is out of range or an item is not a library
     /// index.
-    // `allow`, not `expect`: older compilers (the MSRV) count the call from
-    // the still-unused `App::restore` as a use, newer ones do not.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "only reached through App::restore until group 5 of persist-session-state"
-        )
-    )]
     pub fn resume(
         &mut self,
         source: Source,

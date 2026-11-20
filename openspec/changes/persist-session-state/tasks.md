@@ -67,12 +67,12 @@ Test hermeticity, for every group: no test calls `dirs` or builds a store from t
 
 ## 5. Command line, wiring and docs (`src/cli.rs`, `src/main.rs`, README, CLAUDE.md)
 
-- [ ] 5.1 Add `--no-state` to `Cli` (D8), and the pure `make_store(no_state, location, root)` in `main.rs`. `main` always calls `App::restore(make_store(…), &root)` (the root passed to `library::scan`) before `terminal::run`, then passes its result to `finish(app, result)` (D6). `finish` calls `App::save_final()` for every outcome, prints `kasset: cannot save state to <path>: <reason>` on failure, and returns the result unchanged. `terminal.rs` is unchanged. Verify with tests:
+- [x] 5.1 Add `--no-state` to `Cli` (D8), and the pure `make_store(no_state, location, root)` in `main.rs`. `main` always calls `App::restore(make_store(…), &root)` (the root passed to `library::scan`) before `terminal::run`, then passes its result to `finish(app, result)` (D6). `finish` calls `App::save_final()` for every outcome, prints `kasset: cannot save state to <path>: <reason>` on failure, and returns the result unchanged. `terminal.rs` is unchanged. Verify with tests:
   - `finish` with a recording fake store saves exactly once for `Ok(Exit::Quit)`, `Ok(Exit::Signal(15))` and `Err(_)`, and returns each unchanged; with a failing store it still returns the same result;
   - `--no-state` parses and is listed in `--help` (spec *Listed in the help*);
   - `make_store(true, Some(path), root)` and `make_store(false, None, root)` give a store whose save creates no file. `make_store(false, Some(path), root)` gives one that writes `path` (spec *Private session*, *No state folder known*);
   - spec *State kept outside the music folder*: after a save through `make_store` with the state path in one temp folder and the root in another, the root folder's listing is unchanged.
-- [ ] 5.2 Update `README.md`:
+- [x] 5.2 Update `README.md`:
   - add a "Saved state" section covering what is saved, the per-folder resume, the location on each OS, `--no-state`, how to reset by deleting the file, that a symlinked file is replaced (symlink the folder instead), and the privacy note;
   - add `--no-state` to the usage line;
   - in "Known limitations", remove "saved state between runs", and add that the shuffled order is not restored and that the resume point follows the file name.
