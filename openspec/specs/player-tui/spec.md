@@ -7,7 +7,7 @@ Provides the `kasset` command and the full-screen, keyboard-driven terminal inte
 ## Requirements
 
 ### Requirement: kasset command
-The system SHALL be invoked as `kasset [DIR]`, and SHALL support `--help` and `--version` without opening the TUI.
+The system SHALL be invoked as `kasset [--no-state] [DIR]`, and SHALL support `--help` and `--version` without opening the TUI. `--no-state` SHALL run without reading or writing saved state (see *Run without saved state*).
 
 #### Scenario: Help
 - **WHEN** the user runs `kasset --help`
@@ -16,6 +16,10 @@ The system SHALL be invoked as `kasset [DIR]`, and SHALL support `--help` and `-
 #### Scenario: Launch
 - **WHEN** the user runs `kasset`
 - **THEN** the full-screen player opens in the terminal
+
+#### Scenario: Launch without saved state
+- **WHEN** the user runs `kasset --no-state`
+- **THEN** the full-screen player opens with the default settings and nothing resumed
 
 ### Requirement: Terminal restoration
 The system SHALL restore the terminal to its original state (cursor, raw mode, alternate screen) on quit, on error, and on panic.
@@ -117,8 +121,12 @@ Exactly one pane, the sidebar or the main pane, SHALL have keyboard focus. Navig
 - **THEN** the sidebar selection moves down one row and the main pane's selection is unchanged
 
 #### Scenario: Focus on start
-- **WHEN** kasset starts
+- **WHEN** kasset starts with no playlist to restore
 - **THEN** the main pane shows the library and has focus
+
+#### Scenario: Focus on a restored playlist
+- **WHEN** kasset starts and restores the playlist "Running" (see *Resume on start*)
+- **THEN** the main pane shows "Running" and has focus
 
 ### Requirement: Narrow terminals
 When the terminal is narrower than 70 columns, the system SHALL show only the focused pane, using the full width. Keys SHALL behave as in the two-pane layout.

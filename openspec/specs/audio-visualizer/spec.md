@@ -70,7 +70,7 @@ The bars SHALL fall to zero, with the same gradual motion, when playback is paus
 - **THEN** the bars reflect only the new track's audio once it has started
 
 ### Requirement: Toggle the visualizer
-The visualizer SHALL be on when kasset starts. In Normal mode, from either pane, `v` SHALL turn it off or on. While the terminal is too short for the spectrum strip, `v` SHALL show a status message: that the visualizer is off, or that it is on and needs a taller terminal. The strip SHALL appear once the terminal is tall enough. The setting SHALL last until kasset quits.
+The visualizer SHALL start on, or as it was when kasset last quit (see *Remembered settings*). In Normal mode, from either pane, `v` SHALL turn it off or on. While the terminal is too short for the spectrum strip, `v` SHALL show a status message: that the visualizer is off, or that it is on and needs a taller terminal. The strip SHALL appear once the terminal is tall enough. The setting SHALL be kept across runs.
 
 #### Scenario: Hide and show
 - **WHEN** the spectrum strip is shown and the user presses `v`
@@ -91,6 +91,10 @@ The visualizer SHALL be on when kasset starts. In Normal mode, from either pane,
 #### Scenario: Listed in the help
 - **WHEN** the user runs `kasset --help` or presses `?`
 - **THEN** `v` is listed with the action "show / hide the visualizer"
+
+#### Scenario: Kept across runs
+- **WHEN** the user hides the visualizer, quits and starts kasset again
+- **THEN** the spectrum strip is not shown until the user presses `v`
 
 ### Requirement: Visualizer refresh rate
 While the spectrum strip is shown and a track is playing, the system SHALL redraw the screen at least 25 times per second. When the strip is not shown, or no track is playing and every bar has fallen to zero, the system SHALL NOT redraw more often than it does without the visualizer.
