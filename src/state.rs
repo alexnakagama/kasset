@@ -5,7 +5,7 @@
 //! queue item, position, play source) and the playlist shown in the main pane.
 //! [`parse`] reads the state file, [`render`] writes it and [`merge`] folds one
 //! run's [`Session`] into what is on disk. Reading and writing the file itself
-//! is the job of the store (task group 2); this module is pure.
+//! is the job of [`store`]; this module is pure.
 //!
 //! Format (D3 of the `persist-session-state` design), one `key value` per line:
 //!
@@ -61,6 +61,8 @@
 //!   back whole: an entry that does not fit is left out and later (older)
 //!   ones that still fit are kept, and a first entry too large on its own
 //!   loses its resume point, then its playlist, then is left out entirely.
+
+pub mod store;
 
 use std::path::{Component, Path};
 use std::time::Duration;

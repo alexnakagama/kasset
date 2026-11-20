@@ -15,7 +15,7 @@ mod queue;
     not(test),
     expect(
         dead_code,
-        reason = "wired into the app and `main` from task groups 2-5"
+        reason = "wired into the app and `main` from task groups 3-5"
     )
 )]
 mod state;
