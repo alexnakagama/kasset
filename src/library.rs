@@ -21,6 +21,12 @@ use crate::bounded_read::open_regular;
 use crate::panic_guard::quietly;
 use crate::text::{display_path, sanitize};
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into `scan` by `read_track_in` (task 2.1)")
+)]
+mod infer;
+
 /// File extensions (lower case) the player can decode.
 ///
 /// `.opus` is deliberately absent: symphonia cannot decode it.

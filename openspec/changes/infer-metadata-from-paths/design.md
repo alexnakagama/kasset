@@ -49,8 +49,8 @@ All hand-written string scanning; no `regex` dependency.
 
 The vocabulary is a `const` slice: `official, music, lyric, lyrics, audio, video, visualizer, visualiser, hd, hq, 4k`. Words are compared ASCII case-insensitively after splitting on spaces.
 - **Bracketed groups**: scan for `(`…`)` and `[`…`]` (no nesting). A group is removed, together with one space next to it, when it has at least one word and every word is in the vocabulary. This works anywhere in the title, so `All I Want Is You (Official Video) ft. J. Cole` becomes `All I Want Is You ft. J. Cole`.
-- **Trailing run**: walk words from the end while they are in the vocabulary. Remove the run only if its first word is `official`. This protects titles that end in "Music" or "Video".
-- After either removal, trailing separators (`-`, `–`, `—`, `|`) and spaces left at the end of the title are trimmed, so `Song - Official Video` becomes `Song`, not `Song -`.
+- **Trailing run**: walk words from the end while they are in the vocabulary. The run is cut from its first `official` on; a run without `official` is kept. This protects titles that end in "Music" or "Video" (`Born to the Music` stays, `Born to the Music Official Video` becomes `Born to the Music`).
+- After either removal, separators (`-`, `–`, `—`, `|`) and spaces left at either end of the title are trimmed, so `Song - Official Video` becomes `Song`, not `Song -`, and `[HD] - Song` becomes `Song`.
 - If the result is empty, keep the original title.
 
 The scan is linear and the input is capped at 256 characters, so it can't stall.

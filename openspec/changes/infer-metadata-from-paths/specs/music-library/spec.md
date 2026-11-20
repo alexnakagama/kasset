@@ -70,7 +70,7 @@ When a file name begins with 1 to 3 digits followed by a spaced dash, a period a
 - **THEN** it has no track number and its title is "01"
 
 ### Requirement: Video suffixes removed from inferred titles
-A title taken from the file name SHALL have video-release labels removed, case-insensitively: any bracketed group (round or square) whose words all come from the label vocabulary (official, music, lyric, lyrics, audio, video, visualizer, visualiser, hd, hq, 4k), and an unbracketed run of those words at the end that starts with "official". If removal would leave the title empty, the title SHALL be kept unchanged.
+A title taken from the file name SHALL have video-release labels removed, case-insensitively: any bracketed group (round or square) whose words all come from the label vocabulary (official, music, lyric, lyrics, audio, video, visualizer, visualiser, hd, hq, 4k), and, within the unbracketed run of those words at the end, everything from its first "official" on. If removal would leave the title empty, the title SHALL be kept unchanged.
 
 #### Scenario: Bracketed label
 - **WHEN** `Kendrick Lamar - dodger blue (Official Audio).mp3` has no tags
