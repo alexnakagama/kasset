@@ -16,6 +16,8 @@ leaving the terminal.
   their own and readable by other players
 - Lyrics of the current track beside the track list, following the song
   line by line when they are timed (`.lrc` files or lyrics tags)
+- Remembers your settings and, for each music folder, the track and
+  position you stopped at
 
 ## Install
 
@@ -99,7 +101,7 @@ To remove it: `cargo uninstall kasset`.
 ## Usage
 
 ```sh
-kasset [DIR]
+kasset [--no-state] [DIR]
 ```
 
 - `kasset ~/Downloads/albums` opens that folder.
@@ -107,6 +109,8 @@ kasset [DIR]
   `XDG_MUSIC_DIR` entry in `~/.config/user-dirs.dirs`, set with
   `xdg-user-dirs-update`; else `~/Music`) and, if there is none, the current
   directory.
+- `kasset --no-state` starts with the default settings and nothing resumed,
+  and neither reads nor writes the saved state (see [Saved state](#saved-state)).
 - `kasset --help` prints usage and the key summary; `kasset --version` prints
   the version.
 
@@ -278,10 +282,12 @@ to a file outside `Playlists/` (one planted in a downloaded music folder, say)
 can be played, renamed and deleted but is read-only, so kasset never writes
 through it.
 
-This is the only place kasset writes to: nothing outside `Playlists/` is ever
-modified, and only when you create, edit, rename or delete a playlist. Saving
-writes a dot-prefixed temporary file next to the playlist and renames it over
-the original.
+This is the only place in the music folder kasset writes to: nothing else
+in it is ever modified, and `Playlists/` only when you create, edit, rename or
+delete a playlist. Saving writes a dot-prefixed temporary file next to the
+playlist and renames it over the original. The only other file kasset writes
+is its saved state, in your per-user state folder (see
+[Saved state](#saved-state)).
 
 Shuffle plays every track once, in random order, before any repeats; the
 current track stays current when you turn it on. The search filter only
@@ -290,6 +296,60 @@ changes the visible list, not the play order.
 A track that cannot be opened or decoded is reported in the status bar and
 skipped, even with repeat one. If every track fails in a row, playback stops
 and the last error stays visible.
+
+## Saved state
+
+kasset remembers between runs:
+
+- **Settings**, shared by every music folder: the volume, shuffle, the repeat
+  mode, and whether the visualizer and the lyrics pane are shown.
+- **For each music folder** (the last 20 opened, identified by their full
+  resolved path): the current track and its position, whether it was played
+  from the library or from a playlist, and which playlist the main pane
+  shows.
+
+When you open a folder again, its track is loaded **paused** at the saved
+position, never playing on its own: `Space` continues it. Next and previous
+follow the same play order (the library or the playlist) as before, and the
+playlist that was shown is shown again. A track the scan no longer finds is
+not resumed, and a playlist that is gone, or no longer holds the track, is
+replaced by the library. If the saved position can't be reached (the file
+became shorter, or can't seek), the track starts paused at 0:00. A resume
+point that can't be used (the track's drive isn't mounted, say) is kept,
+and used on a later start once the track is found again, until you play
+something else in that folder.
+
+The state is saved when you quit (`q`, `Ctrl+C`) and when a `SIGINT`,
+`SIGTERM` or `SIGHUP` stops kasset, as long as the save completes within the
+2-second grace period after the signal (see [Terminal notes](#terminal-notes);
+the previous save is then kept intact), and, while it runs, at most every 30
+seconds when something changed, so after a crash you resume at most about 30
+seconds earlier. A failed save never stops the music or changes the exit
+status: it is shown once in the status line, or printed after the terminal is
+restored when quitting.
+
+The file is:
+
+| Platform | Location |
+|---|---|
+| Linux | `$XDG_STATE_HOME/kasset/state` (default `~/.local/state/kasset/state`) |
+| macOS | `~/Library/Application Support/kasset/state` |
+| Windows | `%LOCALAPPDATA%\kasset\state` |
+
+- **`--no-state`** runs without it: default settings, nothing resumed, and
+  the file is neither read nor written.
+- **To reset**, delete the file (kasset starts with the defaults and writes
+  a new one). A damaged file is also ignored and replaced with a valid one.
+- The file is replaced on every save (written next to it, then renamed). A
+  **symbolic link at `state` is replaced** by a regular file, never written
+  through; to keep the state elsewhere (a dotfiles repository, say),
+  symlink the `kasset` folder instead.
+- A state file from a newer kasset is left untouched: the older version
+  starts with the defaults and says so once.
+- **Privacy:** the file lists the music folders you opened and the track you
+  were last playing in each. On Linux and macOS it is readable by you only
+  (mode `0600`, in a folder created with mode `0700`). Use `--no-state` for
+  a session that leaves no trace, or delete the file.
 
 ## Terminal notes
 
@@ -316,9 +376,15 @@ and the last error stays visible.
 
 - **Opus (`.opus`) is not supported**; such files are not listed. The decoder
   used (symphonia) has no Opus support.
-- No album art, streaming sources, configuration file, media keys / MPRIS or
-  saved state between runs (other than playlists). Only `.m3u8` playlists in
-  the `Playlists` folder are read; `.m3u` and `.pls` files are not.
+- No album art, streaming sources, configuration file or media keys / MPRIS.
+  Only `.m3u8` playlists in the `Playlists` folder are read; `.m3u` and
+  `.pls` files are not.
+- With shuffle on, the resumed track is the same, but the rest of the
+  shuffled order is new: the order itself is not saved.
+- The resume point follows the file name (its path inside the music
+  folder): a renamed or moved track is not resumed, and a different song
+  saved under the same name is resumed at the old position (or at 0:00 if
+  that is past its end).
 - Playlists that are not valid UTF-8, or that are over 16 MiB or 100 000
   entries, can be opened and played but are read-only: entries cannot be
   added, removed or moved (the file can still be renamed or deleted).

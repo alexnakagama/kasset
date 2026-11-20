@@ -16,6 +16,10 @@ pub struct Cli {
     /// Music folder to open [default: your music directory, else the current directory]
     #[arg(value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub dir: Option<PathBuf>,
+
+    /// Do not read or write the saved state (settings and resume point) in this run
+    #[arg(long)]
+    pub no_state: bool,
 }
 
 /// Resolves the library root: the given folder, else the user's music
@@ -75,7 +79,7 @@ mod tests {
     #[test]
     fn help_includes_keybindings() {
         let help = Cli::command().render_long_help().to_string();
-        assert!(help.contains("Usage: kasset [DIR]"));
+        assert!(help.contains("Usage: kasset [OPTIONS] [DIR]"));
         assert!(help.contains("pause / resume"));
         assert!(help.contains("move focus between the sidebar and the main pane"));
         assert!(help.contains("add the selected / every listed track to a playlist"));
@@ -111,6 +115,30 @@ mod tests {
         assert!(matches!(cli, Ok(None)));
         let cli = Cli::try_parse_from(["kasset", "/music"]).map(|c| c.dir);
         assert!(matches!(cli, Ok(Some(p)) if p == Path::new("/music")));
+    }
+
+    #[test]
+    fn parses_no_state() {
+        let cli = Cli::try_parse_from(["kasset"]).map(|c| c.no_state);
+        assert!(matches!(cli, Ok(false)));
+        let cli = Cli::try_parse_from(["kasset", "--no-state", "/music"]);
+        assert!(
+            matches!(cli, Ok(Cli { no_state: true, dir: Some(ref p) }) if p == Path::new("/music"))
+        );
+        let cli = Cli::try_parse_from(["kasset", "/music", "--no-state"]).map(|c| c.no_state);
+        assert!(matches!(cli, Ok(true)));
+    }
+
+    /// Spec: *Listed in the help*.
+    #[test]
+    fn help_lists_no_state() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Usage: kasset [OPTIONS] [DIR]"), "{help}");
+        let listed = help
+            .lines()
+            .any(|line| line.trim_start().starts_with("--no-state"));
+        assert!(listed, "--help does not list --no-state:\n{help}");
+        assert!(help.contains("saved state"), "{help}");
     }
 
     #[test]

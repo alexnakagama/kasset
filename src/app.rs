@@ -1832,13 +1832,6 @@ impl<A: Audio> App<A> {
     /// not found, read-only). Called once, after [`App::new`] and before the
     /// first tick, with the exact root the tracks were scanned from: a
     /// differently spelled root matches no track, so nothing is resumed.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called from `main` in group 5 of persist-session-state"
-        )
-    )]
     pub fn restore(&mut self, store: Box<dyn StateStore>, root: &Path) {
         let mut saved = SavedState::none();
         saved.store = store;
@@ -1871,13 +1864,6 @@ impl<A: Audio> App<A> {
     /// Writes the session [`App::shutdown`] took. Does nothing (and returns
     /// `None`) when `shutdown` did not run or nothing is saved this run.
     /// Returns the error message, naming the state file, when the save failed.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called from `main` in group 5 of persist-session-state"
-        )
-    )]
     pub fn save_final(&mut self) -> Option<String> {
         let session = self.saved.last_words.take()?;
         self.saved

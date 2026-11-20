@@ -299,15 +299,6 @@ impl Queue {
     }
 
     /// Sets the repeat mode; the order and the current item are unchanged.
-    // `allow`, not `expect`: older compilers (the MSRV) count the call from
-    // the still-unused `Playback::set_repeat` as a use, newer ones do not.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "only reached through App::restore until group 5 of persist-session-state"
-        )
-    )]
     pub const fn set_repeat(&mut self, repeat: Repeat) {
         self.repeat = repeat;
     }
