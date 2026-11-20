@@ -912,6 +912,37 @@ mod tests {
         Ok(())
     }
 
+    /// `cli` canonicalises the root, which on Windows gives a verbatim
+    /// `\\?\C:\…` path; `discover` joins entries onto that same root, so the
+    /// `strip_prefix` in `read_track_in` still sees the folders (the Windows CI
+    /// job runs this with a verbatim root).
+    #[test]
+    fn canonical_root_keeps_folder_inference() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().canonicalize()?;
+        wav_at(&root, "Band/LP/CD1/01 Song.wav", None)?;
+        let tracks = scan(&root)?.tracks;
+        let [t] = tracks.as_slice() else {
+            anyhow::bail!("expected one track, got {tracks:?}")
+        };
+        assert_eq!((t.artist.as_str(), t.album.as_str()), ("Band", "LP"));
+        assert_eq!((t.number, t.title.as_str()), (Some(1), "Song"));
+        Ok(())
+    }
+
+    /// On unix `\` is an ordinary file-name character, not a separator, so a
+    /// Windows-style name gives no folder values and stays in the title.
+    #[cfg(unix)]
+    #[test]
+    fn backslash_is_not_a_separator_on_unix() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let t = read_track_in(root, wav_at(root, r"Band\LP\02 Song.wav", None)?);
+        assert_eq!((t.artist.as_str(), t.album.as_str()), (UNKNOWN, UNKNOWN));
+        assert_eq!((t.number, t.title.as_str()), (None, r"Band\LP\02 Song"));
+        Ok(())
+    }
+
     #[test]
     fn read_track_never_looks_at_folders() -> Result<()> {
         let tmp = tempfile::tempdir()?;

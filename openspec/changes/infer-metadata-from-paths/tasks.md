@@ -29,7 +29,7 @@ Every group ends green: `cargo test` (the whole suite) and `cargo clippy --all-t
 
 ## 3. Integration check
 
-- [ ] 3.1 Run `cargo run -- ~/Música` (or a temp folder with copies of untagged MP3s named like YouTube downloads) and confirm by eye that artist and title are filled in, labels are gone, and "Calling (Spider-Man Across the Spider-Verse)" stays Unknown/unchanged. Run `cargo +1.89 build` (no new dependencies, so the MSRV is unchanged).
+- [x] 3.1 Run `cargo run -- ~/Música` (or a temp folder with copies of untagged MP3s named like YouTube downloads) and confirm by eye that artist and title are filled in, labels are gone, and "Calling (Spider-Man Across the Spider-Verse)" stays Unknown/unchanged. Run `cargo +1.89 build` (no new dependencies, so the MSRV is unchanged).
 
 ## Workflow follow-up
 

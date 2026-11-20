@@ -48,9 +48,9 @@ All hand-written string scanning; no `regex` dependency.
 ### D3. Label stripping
 
 The vocabulary is a `const` slice: `official, music, lyric, lyrics, audio, video, visualizer, visualiser, hd, hq, 4k`. Words are compared ASCII case-insensitively after splitting on spaces.
-- **Bracketed groups**: scan for `(`…`)` and `[`…`]` (no nesting). A group is removed, together with one space next to it, when it has at least one word and every word is in the vocabulary. This works anywhere in the title, so `All I Want Is You (Official Video) ft. J. Cole` becomes `All I Want Is You ft. J. Cole`.
+- **Bracketed groups**: scan for `(`…`)` and `[`…`]` (no nesting). A group is removed, together with one space next to it, when it has at least one word and every word is in the vocabulary. This works anywhere in the title, so `All I Want Is You (Official Video) ft. J. Cole` becomes `All I Want Is You ft. J. Cole`. A group inside an unclosed bracket of the other kind (`Song (Live [HD])`) is kept, so no `Song (Live )` is left.
 - **Trailing run**: walk words from the end while they are in the vocabulary. The run is cut from its first `official` on; a run without `official` is kept. This protects titles that end in "Music" or "Video" (`Born to the Music` stays, `Born to the Music Official Video` becomes `Born to the Music`).
-- After either removal, separators (`-`, `–`, `—`, `|`) and spaces left at either end of the title are trimmed, so `Song - Official Video` becomes `Song`, not `Song -`, and `[HD] - Song` becomes `Song`.
+- After either removal, runs of separators (`-`, `–`, `—`, `|`) left standing alone at either end of the title (a space or the end on their inner side) are trimmed with the spaces around them, so `Song - Official Video` becomes `Song`, not `Song -`, and `[HD] - Song` becomes `Song`, while `-1 (Official Video)` keeps `-1`.
 - If the result is empty, keep the original title.
 
 The scan is linear and the input is capped at 256 characters, so it can't stall.
