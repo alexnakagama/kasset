@@ -438,8 +438,9 @@ mod tests {
 
     #[test]
     fn location_prefers_the_state_folder() {
-        let state = PathBuf::from("/s");
-        let local = PathBuf::from("/l");
+        // Absolute on every platform (`/s` has no drive letter on Windows).
+        let state = std::env::temp_dir().join("s");
+        let local = std::env::temp_dir().join("l");
         assert_eq!(
             location(Some(state.clone()), Some(local.clone())),
             Some(state.join("kasset").join("state"))
