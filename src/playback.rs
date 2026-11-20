@@ -3,6 +3,12 @@
 //! skipping tracks that cannot be played. It also passes the newest decoded
 //! samples through for the visualizer ([`Playback::recent_samples`]), so
 //! nothing above it reaches the audio output directly.
+//!
+//! A saved session is continued with [`Playback::resume`] (after the
+//! `set_volume` / `set_shuffle` / `set_repeat` setters restore the
+//! settings): it loads one track paused at a position and, unlike every
+//! other way of starting a track, never moves on to another track when that
+//! one fails.
 
 use std::time::Duration;
 
@@ -343,6 +349,37 @@ impl<A: Audio> Playback<A> {
         self.queue.cycle_repeat()
     }
 
+    /// Sets the volume and passes it to the audio output.
+    pub fn set_volume(&mut self, volume: Volume) {
+        self.volume = volume;
+        self.audio.set_volume(volume);
+    }
+
+    /// Turns shuffle on or off, keeping the current track; see
+    /// [`Queue::set_shuffle`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by App::restore from group 4 of persist-session-state"
+        )
+    )]
+    pub fn set_shuffle(&mut self, on: bool) {
+        self.queue.set_shuffle(on, &mut rand::rng());
+    }
+
+    /// Sets the repeat mode.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by App::restore from group 4 of persist-session-state"
+        )
+    )]
+    pub const fn set_repeat(&mut self, repeat: Repeat) {
+        self.queue.set_repeat(repeat);
+    }
+
     /// Housekeeping, to be called regularly (every UI frame): reports output
     /// device errors, advances when the current track ends and skips tracks
     /// that fail to decode.
@@ -380,11 +417,6 @@ impl<A: Audio> Playback<A> {
     /// Whether every entry of `tracks` is a library index.
     fn valid_tracks(&self, tracks: &[usize]) -> bool {
         tracks.iter().all(|&t| t < self.tracks.len())
-    }
-
-    fn set_volume(&mut self, volume: Volume) {
-        self.volume = volume;
-        self.audio.set_volume(volume);
     }
 
     /// The current track finished normally: continue per repeat mode.
@@ -522,6 +554,81 @@ impl<A: Audio> Playback<A> {
         true
     }
 
+    /// Continues a saved session: makes `items` (library indices) from
+    /// `source` the play order and loads the item at position `item`
+    /// **paused** at `position`. Shuffle and repeat stay as they are (with
+    /// shuffle on, the new order starts at `item`).
+    ///
+    /// The track starts at zero instead when its tag length is known and
+    /// `position` is at or past it, and a load that fails to seek
+    /// ([`SeekFailed`], for any reason) is retried once at zero, since the
+    /// file itself may be playable. Other load errors are not retried.
+    /// Unlike every other way of starting a track, a failure never moves on
+    /// to another one: nothing is current, playback is stopped, and the
+    /// notice (kept as the stop reason) says "Cannot resume …".
+    ///
+    /// Returns whether the track was loaded. Returns `false` and changes
+    /// nothing when `item` is out of range or an item is not a library
+    /// index.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by App::restore from group 4 of persist-session-state"
+        )
+    )]
+    pub fn resume(
+        &mut self,
+        source: Source,
+        items: Vec<usize>,
+        item: usize,
+        position: Duration,
+    ) -> bool {
+        if item >= items.len() || !self.valid_tracks(&items) {
+            return false;
+        }
+        // `items` were checked to be library indices, so `items[item]` is
+        // the track `select` makes current, with or without shuffle.
+        let Some(track) = self.tracks.get(items[item]) else {
+            return false;
+        };
+        let path = track.path.clone();
+        let name = sanitize(&track.title).unwrap_or_else(|| file_name(track));
+        let start = if track.duration.is_some_and(|length| position >= length) {
+            Duration::ZERO
+        } else {
+            position
+        };
+        self.audio.stop();
+        self.retry = false;
+        self.failures = 0;
+        self.queue.reset(items);
+        self.source = source;
+        self.queue.select(item, &mut rand::rng());
+        let mut loaded = self.audio.load(&path, start, true);
+        if !start.is_zero() && loaded.as_ref().is_err_and(anyhow::Error::is::<SeekFailed>) {
+            loaded = self.audio.load(&path, Duration::ZERO, true);
+        }
+        match loaded {
+            Ok(()) => {
+                self.state = PlayState::Paused;
+                self.stop_reason = None;
+                true
+            }
+            Err(err) => {
+                self.audio.stop();
+                let notice = Notice::error(format!("Cannot resume '{name}': {}", reason(&err)));
+                // Same list and source, but nothing current.
+                let items = self.queue.items().to_vec();
+                self.queue.reset(items);
+                self.state = PlayState::Stopped;
+                self.stop_reason = Some(notice.clone());
+                self.notice = Some(notice);
+                false
+            }
+        }
+    }
+
     /// Applies a change made to playlist `name` to the play order, if that
     /// playlist is the one playing; the current track keeps playing. Returns
     /// whether the play order changed. Edits with out-of-range positions or
@@ -615,6 +722,9 @@ mod tests {
         decoded_length: Option<Duration>,
         /// Make seeks (loads at a non-zero start) fail; `true` = past the end.
         seek_failure: Option<bool>,
+        /// Files that fail to open when loaded from the start (but may still
+        /// reach `seek_failure` when loaded at a position).
+        broken_from_start: HashSet<PathBuf>,
     }
 
     impl Audio for FakeAudio {
@@ -625,6 +735,9 @@ mod tests {
             }
             if let Some(past_end) = self.seek_failure.filter(|_| !start.is_zero()) {
                 return Err(SeekFailed::for_test(past_end).into());
+            }
+            if start.is_zero() && self.broken_from_start.contains(path) {
+                bail!("cannot decode the file");
             }
             self.loaded = Some(path.to_owned());
             self.status = Some(Status::Active);
@@ -1562,5 +1675,332 @@ mod tests {
         p.stop();
         assert_eq!(p.recent_samples(&mut out), None);
         assert_eq!(out, Vec::<f32>::new());
+    }
+
+    /// Resumes item `item` of `items` from the library at `position`.
+    fn resume_at(
+        p: &mut Playback<FakeAudio>,
+        items: Vec<usize>,
+        item: usize,
+        at: Duration,
+    ) -> bool {
+        p.resume(Source::Library, items, item, at)
+    }
+
+    /// Asserts that a failed resume left nothing current, stopped, with one
+    /// "Cannot resume" error notice that is also the stop reason.
+    fn assert_resume_failed(p: &mut Playback<FakeAudio>) {
+        assert_eq!(p.current(), None);
+        assert_eq!(p.current_item(), None);
+        assert_eq!(p.state(), PlayState::Stopped);
+        assert_eq!(p.audio.loaded, None);
+        let notice = p.take_notice().unwrap_or_else(|| Notice::info("none"));
+        assert_eq!(notice.level, Level::Error);
+        assert!(
+            notice.text.starts_with("Cannot resume 'Song 1': "),
+            "{}",
+            notice.text
+        );
+        assert_eq!(p.take_notice(), None, "one notice");
+        assert_eq!(p.stop_reason(), Some(&notice));
+        assert!(
+            p.audio
+                .loads
+                .iter()
+                .all(|(loaded, _, _)| *loaded == path(1)),
+            "no other track is loaded"
+        );
+        let loads = p.audio.loads.len();
+        p.tick();
+        p.tick();
+        assert_eq!(p.audio.loads.len(), loads, "nothing is retried later");
+        assert_eq!(p.current(), None);
+    }
+
+    #[test]
+    fn resume_loads_paused_at_the_position() {
+        let mut p = playback(3, &[]);
+        assert!(resume_at(&mut p, vec![0, 1, 2], 1, secs(135)));
+        assert_eq!(p.state(), PlayState::Paused);
+        assert_eq!(p.current(), Some(1));
+        assert_eq!(p.current_item(), Some(1));
+        assert_eq!(p.source(), &Source::Library);
+        assert_eq!(p.audio.loads, [(path(1), secs(135), true)]);
+        assert!(p.audio.paused, "never plays on its own");
+        assert_eq!(p.position(), secs(135));
+        assert_eq!(p.take_notice(), None);
+        assert_eq!(p.stop_reason(), None);
+
+        p.toggle_pause();
+        assert_eq!(p.state(), PlayState::Playing);
+        assert!(!p.audio.paused);
+        assert_eq!(p.position(), secs(135), "continues from there");
+        assert_eq!(p.audio.loads.len(), 1, "no reload");
+    }
+
+    #[test]
+    fn resume_past_the_tag_length_starts_at_zero() {
+        // `library` gives every track a 200 s tag length.
+        for at in [secs(200), secs(201), secs(7 * 24 * 3600)] {
+            let mut p = playback(3, &[]);
+            assert!(resume_at(&mut p, vec![0, 1, 2], 1, at));
+            assert_eq!(p.audio.loads, [(path(1), Duration::ZERO, true)], "{at:?}");
+            assert_eq!(p.state(), PlayState::Paused);
+        }
+        let mut p = playback(3, &[]);
+        assert!(resume_at(&mut p, vec![0, 1, 2], 1, secs(199)));
+        assert_eq!(p.audio.loads, [(path(1), secs(199), true)], "just inside");
+    }
+
+    #[test]
+    fn resume_without_a_tag_length_tries_the_position() {
+        let mut tracks = library(2);
+        tracks[1].duration = None;
+        let mut p = Playback::new(tracks, FakeAudio::default());
+        assert!(resume_at(&mut p, vec![0, 1], 1, secs(900)));
+        assert_eq!(p.audio.loads, [(path(1), secs(900), true)]);
+    }
+
+    #[test]
+    fn resume_retries_at_zero_after_any_seek_failure() {
+        for past_end in [true, false] {
+            let mut p = playback(3, &[]);
+            p.audio.seek_failure = Some(past_end);
+            assert!(resume_at(&mut p, vec![0, 1, 2], 1, secs(60)), "{past_end}");
+            assert_eq!(
+                p.audio.loads,
+                [(path(1), secs(60), true), (path(1), Duration::ZERO, true)]
+            );
+            assert_eq!(p.state(), PlayState::Paused);
+            assert_eq!(p.current(), Some(1));
+            assert_eq!(p.position(), Duration::ZERO);
+            assert_eq!(p.take_notice(), None);
+        }
+    }
+
+    #[test]
+    fn resume_failing_after_the_retry_loads_nothing_else() {
+        let mut p = playback(3, &[]);
+        p.audio.seek_failure = Some(false);
+        p.audio.broken_from_start.insert(path(1));
+        assert!(!resume_at(&mut p, vec![0, 1, 2], 1, secs(60)));
+        assert_eq!(
+            p.audio.loads,
+            [(path(1), secs(60), true), (path(1), Duration::ZERO, true)],
+            "exactly two loads"
+        );
+        assert_resume_failed(&mut p);
+    }
+
+    #[test]
+    fn resume_of_a_broken_file_is_not_retried() {
+        for at in [secs(60), Duration::ZERO] {
+            let mut p = playback(3, &[1]);
+            set_repeat(&mut p, Repeat::All);
+            assert!(!resume_at(&mut p, vec![0, 1, 2], 1, at));
+            assert_eq!(p.audio.loads, [(path(1), at, true)], "exactly one load");
+            assert_resume_failed(&mut p);
+        }
+    }
+
+    #[test]
+    fn failed_resume_keeps_the_source_and_space_does_nothing() {
+        let mut p = playback(6, &[1]);
+        assert!(!p.resume(running(), vec![4, 1, 3], 1, secs(5)));
+        assert_eq!(p.source(), &running());
+        assert_eq!(p.items(), [4, 1, 3]);
+        p.toggle_pause();
+        assert_eq!(p.audio.loads.len(), 1, "nothing current to start");
+        assert_eq!(p.state(), PlayState::Stopped);
+        p.next();
+        assert_eq!(p.current(), Some(4), "next starts the list from its top");
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.stop_reason(), None);
+    }
+
+    #[test]
+    fn resume_name_is_sanitised() {
+        let mut tracks = library(2);
+        tracks[1].title = "Bad\u{1b}[2J\nName".to_owned();
+        let audio = FakeAudio {
+            broken: [path(1)].into_iter().collect(),
+            ..FakeAudio::default()
+        };
+        let mut p = Playback::new(tracks, audio);
+        assert!(!resume_at(&mut p, vec![0, 1], 1, secs(5)));
+        let text = p.take_notice().map(|n| n.text).unwrap_or_default();
+        assert!(text.starts_with("Cannot resume '"), "{text}");
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+    }
+
+    #[test]
+    fn resume_with_shuffle_starts_a_shuffled_order_at_the_track() {
+        let mut p = playback(6, &[]);
+        p.set_shuffle(true);
+        assert!(p.resume(running(), vec![4, 2, 0, 3, 1], 2, secs(10)));
+        assert_eq!(p.current(), Some(0));
+        assert_eq!(p.current_item(), Some(2));
+        assert_eq!(p.source(), &running());
+        assert_eq!(p.state(), PlayState::Paused);
+        assert!(p.shuffle());
+
+        let mut seen = vec![0];
+        for _ in 0..4 {
+            p.next();
+            seen.push(p.current().unwrap_or(usize::MAX));
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2, 3, 4], "each item of the source once");
+        assert!(!seen.contains(&5), "never the library");
+        p.next();
+        assert_eq!(p.current(), seen.last().copied(), "end of the order");
+        p.audio.position = secs(1);
+        p.prev();
+        assert_eq!(
+            p.current(),
+            Some(seen[3]),
+            "previous follows the same order"
+        );
+    }
+
+    #[test]
+    fn resume_replaces_a_playing_track() {
+        let mut p = playback(3, &[]);
+        p.play(2);
+        assert!(resume_at(&mut p, vec![0, 1, 2], 0, secs(5)));
+        assert_eq!(p.audio.loaded, Some(path(0)));
+        assert_eq!(
+            p.audio.loads,
+            [(path(2), Duration::ZERO, false), (path(0), secs(5), true)]
+        );
+        assert_eq!(p.state(), PlayState::Paused);
+
+        let mut p = playback(3, &[1]);
+        p.play(2);
+        assert!(!resume_at(&mut p, vec![0, 1, 2], 1, secs(5)));
+        assert_eq!(
+            p.audio.loads,
+            [(path(2), Duration::ZERO, false), (path(1), secs(5), true)]
+        );
+        assert_eq!(p.audio.loaded, None, "the old track is not left audible");
+        assert_eq!(p.current(), None);
+        assert_eq!(p.state(), PlayState::Stopped);
+    }
+
+    #[test]
+    fn resume_cancels_a_pending_retry() {
+        let n = MAX_ATTEMPTS_PER_CALL * 2 + 3;
+        for (item, ok) in [(n - 1, true), (0, false)] {
+            let broken: Vec<usize> = (0..n - 1).collect();
+            let mut p = playback(n, &broken);
+            p.play(0);
+            assert!(p.retry, "skipping is deferred to the next tick");
+            assert_eq!(resume_at(&mut p, (0..n).collect(), item, secs(5)), ok);
+            let loads = p.audio.loads.len();
+            for _ in 0..3 {
+                p.tick();
+            }
+            assert_eq!(
+                p.audio.loads.len(),
+                loads,
+                "no deferred skipping after resume"
+            );
+            if ok {
+                assert_eq!(p.current(), Some(n - 1));
+                assert_eq!(p.state(), PlayState::Paused);
+            } else {
+                assert_eq!(p.current(), None);
+                assert_eq!(p.state(), PlayState::Stopped);
+            }
+        }
+    }
+
+    #[test]
+    fn resume_duplicates_with_repeat_one_from_a_detached_queue() {
+        let mut p = playback(3, &[]);
+        p.set_repeat(Repeat::One);
+        assert!(p.play_source(running(), vec![1, 1, 1], 0));
+        assert!(p.edit_playlist("Running", Edit::Remove(0)));
+        assert!(p.queue.is_detached());
+        let before = p.audio.loads.len();
+
+        assert!(p.resume(running(), vec![1, 1, 1], 2, secs(5)));
+        assert_eq!(p.current_item(), Some(2));
+        assert_eq!(p.current(), Some(1));
+        assert!(!p.queue.is_detached());
+        assert_eq!(p.audio.loads.len(), before + 1, "exactly one load");
+        assert_eq!(p.repeat(), Repeat::One, "modes are kept");
+
+        p.toggle_pause();
+        end_track(&mut p);
+        assert_eq!(p.current_item(), Some(2), "repeat one replays the item");
+    }
+
+    #[test]
+    fn resume_name_falls_back_to_the_file_name_and_is_capped() {
+        let mut tracks = library(2);
+        tracks[1].title = "\u{1b}\u{7}".to_owned();
+        let audio = FakeAudio {
+            broken: [path(1)].into_iter().collect(),
+            ..FakeAudio::default()
+        };
+        let mut p = Playback::new(tracks, audio);
+        assert!(!resume_at(&mut p, vec![0, 1], 1, secs(5)));
+        let text = p.take_notice().map(|n| n.text).unwrap_or_default();
+        assert!(text.starts_with("Cannot resume '01.mp3': "), "{text}");
+
+        let mut tracks = library(2);
+        tracks[1].title = "x".repeat(10_000);
+        let audio = FakeAudio {
+            broken: [path(1)].into_iter().collect(),
+            ..FakeAudio::default()
+        };
+        let mut p = Playback::new(tracks, audio);
+        assert!(!resume_at(&mut p, vec![0, 1], 1, secs(5)));
+        let text = p.take_notice().map(|n| n.text).unwrap_or_default();
+        assert!(text.chars().count() < 600, "{} chars", text.chars().count());
+    }
+
+    #[test]
+    fn invalid_resume_changes_nothing() {
+        let mut p = playback(3, &[]);
+        p.play(2);
+        assert!(
+            !resume_at(&mut p, vec![0, 1], 2, secs(5)),
+            "item out of range"
+        );
+        assert!(
+            !resume_at(&mut p, vec![0, 7], 1, secs(5)),
+            "not a library index"
+        );
+        assert!(!resume_at(&mut p, Vec::new(), 0, secs(5)), "empty list");
+        assert_eq!(p.current(), Some(2));
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.audio.loads.len(), 1);
+    }
+
+    #[test]
+    fn setters_change_what_is_reported() {
+        let mut p = playback(3, &[]);
+        p.set_volume(Volume::new(60));
+        assert_eq!(p.volume(), Volume::new(60));
+        assert_eq!(p.audio.volume, Some(Volume::new(60)), "reaches the audio");
+        p.volume_up();
+        assert_eq!(p.volume(), Volume::new(65));
+
+        p.play(1);
+        p.set_shuffle(true);
+        assert!(p.shuffle());
+        assert_eq!(p.current(), Some(1), "shuffle keeps the current track");
+        p.set_shuffle(false);
+        assert!(!p.shuffle());
+        assert_eq!(p.current(), Some(1));
+
+        for repeat in [Repeat::One, Repeat::All, Repeat::Off] {
+            p.set_repeat(repeat);
+            assert_eq!(p.repeat(), repeat);
+        }
+        assert_eq!(p.audio.loads.len(), 1, "no setter reloads the track");
     }
 }

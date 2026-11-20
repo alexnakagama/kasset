@@ -33,7 +33,7 @@ Test hermeticity, for every group: no test calls `dirs` or builds a store from t
 
 ## 3. Playback setters and paused resume (`src/playback.rs`, `src/queue.rs`)
 
-- [ ] 3.1 Add `Queue::set_repeat`, and `Playback::set_volume` (public), `set_shuffle`, `set_repeat` and `Playback::resume(source, items, item, position)` as in D5. Resume loads paused at the position: zero when a tag duration is known and the position is at or past it, and a retry at zero after any `SeekFailed` but not after other errors. It never skips to another track. On failure it leaves nothing current, `Stopped`, with the notice "Cannot resume …" (sanitised). Existing queue and playback tests must pass unchanged. Update the `CLAUDE.md` `playback.rs` line. Verify with `FakeAudio` tests:
+- [x] 3.1 Add `Queue::set_repeat`, and `Playback::set_volume` (public), `set_shuffle`, `set_repeat` and `Playback::resume(source, items, item, position)` as in D5. Resume loads paused at the position: zero when a tag duration is known and the position is at or past it, and a retry at zero after any `SeekFailed` but not after other errors. It never skips to another track. On failure it leaves nothing current, `Stopped`, with the notice "Cannot resume …" (sanitised). Existing queue and playback tests must pass unchanged. Update the `CLAUDE.md` `playback.rs` line. Verify with `FakeAudio` tests:
   - spec *Resumed paused*: the state is `Paused`, the audio was loaded paused at 2:15, and `toggle_pause` plays from there;
   - spec *Position past the end*: a saved position past the tag duration loads at zero;
   - spec *Position cannot be reached*: a `SeekFailed` with `past_end` and one without both lead to one retry at zero, which succeeds;
