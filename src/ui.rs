@@ -3325,6 +3325,8 @@ mod lyrics_tests {
                 artist: "Band".to_owned(),
                 album: "LP".to_owned(),
                 number: None,
+                album_artist: None,
+                disc: None,
                 duration: Some(Duration::from_secs(200)),
             });
         }

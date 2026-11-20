@@ -2711,6 +2711,8 @@ mod playlist_tests {
                 artist: artist.to_owned(),
                 album: "LP".to_owned(),
                 number: None,
+                album_artist: None,
+                disc: None,
                 duration: Some(Duration::from_secs(200)),
             })
             .collect();
@@ -3166,6 +3168,8 @@ mod playlist_tests {
                 artist: format!("Artist {}", i % 500),
                 album: format!("Album {}", i % 37),
                 number: None,
+                album_artist: None,
+                disc: None,
                 duration: None,
             })
             .collect();
@@ -5513,6 +5517,8 @@ mod lyrics_tests {
                     artist: "Band".to_owned(),
                     album: "LP".to_owned(),
                     number: None,
+                    album_artist: None,
+                    disc: None,
                     duration: Some(Duration::from_secs(200)),
                 });
             }
@@ -6158,6 +6164,8 @@ mod state_tests {
                     artist: "Band".to_owned(),
                     album: "LP".to_owned(),
                     number: None,
+                    album_artist: None,
+                    disc: None,
                     duration: Some(Duration::from_secs(200)),
                 })
                 .collect();

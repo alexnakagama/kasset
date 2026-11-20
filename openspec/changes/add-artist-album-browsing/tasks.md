@@ -4,8 +4,8 @@ Every group ends green: `cargo test` (the whole suite), `cargo clippy --all-targ
 
 ## 1. Album artist and disc number (`src/library.rs`)
 
-- [ ] 1.1 Add `album_artist: Option<String>` and `disc: Option<u32>` to `Track` (D2). `build_track` reads `ItemKey::AlbumArtist` (first tag that has it, primary first, through `sanitize`, using a new helper next to `tag_text` built on `Tag::get_string`, since album artist has no `Accessor` method) and `Accessor::disk` (> 0). Neither is inferred. Update `test_support::track` and every `Track { … }` literal. Update the `library.rs` `//!` doc and its `CLAUDE.md` line. Verify with tests: spec *Album artist and disc read* (an ID3 tag with album artist and disc 2 round-trips), *Album artist is untrusted text* (control characters are sanitised away), and an untagged file has both `None`.
-- [ ] 1.2 `sort_tracks` orders by artist, album, disc (missing = 1), number, title, path. Verify with spec *Discs in order* and the existing *Album order preserved* test.
+- [x] 1.1 Add `album_artist: Option<String>` and `disc: Option<u32>` to `Track` (D2). `build_track` reads `ItemKey::AlbumArtist` (first tag that has it, primary first, through `sanitize`, using a new helper next to `tag_text` built on `Tag::get_string`, since album artist has no `Accessor` method) and `Accessor::disk` (> 0). Neither is inferred. Update `test_support::track` and every `Track { … }` literal. Update the `library.rs` `//!` doc and its `CLAUDE.md` line. Verify with tests: spec *Album artist and disc read* (an ID3 tag with album artist and disc 2 round-trips), *Album artist is untrusted text* (control characters are sanitised away), and an untagged file has both `None`.
+- [x] 1.2 `sort_tracks` orders by artist, album, disc (missing = 1), number, title, path. Verify with spec *Discs in order* and the existing *Album order preserved* test.
 
 ## 2. Pure catalog (new `src/browse.rs`)
 

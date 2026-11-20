@@ -767,6 +767,8 @@ mod tests {
                 artist: "Band".to_owned(),
                 album: "Album".to_owned(),
                 number: u32::try_from(i + 1).ok(),
+                album_artist: None,
+                disc: None,
                 duration: Some(Duration::from_secs(200)),
             })
             .collect()
