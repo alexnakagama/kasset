@@ -22,10 +22,12 @@
 //! - **artist / title**: the rest is split at the first spaced dash; the left
 //!   side is the artist, the right side the title. No split when a side is empty;
 //! - **labels**: the title loses every `(…)` / `[…]` group whose words all come
-//!   from [`LABEL_WORDS`], and the run of those words at its end from its
+//!   from [`LABEL_WORDS`] (unless it sits inside an open bracket of the other
+//!   kind, as in `(Live [HD])`), and the run of those words at its end from its
 //!   first `official` on (a run without `official` stays, so titles ending in
-//!   "Music" or "Video" survive); separators left dangling at either end are
-//!   trimmed. Labels are stripped after the stem is capped at
+//!   "Music" or "Video" survive); separator runs (`-`, `–`, `—`, `|`) left
+//!   standing alone at either end are trimmed (`Song -` → `Song`, but `-1`
+//!   stays). Labels are stripped after the stem is capped at
 //!   [`MAX_TEXT_CHARS`](crate::text::MAX_TEXT_CHARS), like the plain
 //!   file-name title, so a label cut by the cap stays. A title that
 //!   would become empty is kept as it was;
@@ -57,10 +59,11 @@ const LABEL_WORDS: &[&str] = &[
 /// when they have a space on both sides: hyphen, en dash, em dash.
 const DASHES: [char; 3] = ['-', '\u{2013}', '\u{2014}'];
 
-/// Characters trimmed from both ends of a title after a label was removed, so
+/// Separators trimmed from either end of a title after a label was removed, so
 /// `Song - Official Video` becomes `Song`, not `Song -`, and `[HD] - Song`
-/// becomes `Song`.
-const DANGLING: [char; 5] = [' ', '-', '\u{2013}', '\u{2014}', '|'];
+/// becomes `Song`. Only a run that stands alone (space or end on its inner
+/// side) is trimmed, so a title such as `-1` keeps its dash.
+const SEPARATORS: [char; 4] = ['-', '\u{2013}', '\u{2014}', '|'];
 
 /// Metadata candidates read from a path. Every string is sanitised; `None`
 /// means nothing could be inferred.
@@ -200,22 +203,44 @@ fn strip_labels(title: &str) -> String {
         text.truncate(cut);
         removed = true;
     }
-    if removed {
-        text.truncate(text.trim_end_matches(DANGLING).len());
-        let leading = text.len() - text.trim_start_matches(DANGLING).len();
-        text.drain(..leading);
-    }
+    let text = if removed {
+        trim_separators(&text)
+    } else {
+        &text
+    };
     if text.is_empty() {
         title.to_owned()
     } else {
-        text
+        text.to_owned()
+    }
+}
+
+/// `text` (single-spaced), trimmed, without separator runs that stand alone at
+/// either end: `Song -` and `- Song` give `Song`, but `-1` and `Song-` are
+/// kept. Each pass removes at least one character, so this is linear.
+fn trim_separators(text: &str) -> &str {
+    let mut text = text.trim();
+    loop {
+        let before = text.len();
+        let end = text.trim_end_matches(SEPARATORS);
+        if end.len() < text.len() && (end.is_empty() || end.ends_with(' ')) {
+            text = end.trim_end();
+        }
+        let start = text.trim_start_matches(SEPARATORS);
+        if start.len() < text.len() && (start.is_empty() || start.starts_with(' ')) {
+            text = start.trim_start();
+        }
+        if text.len() == before {
+            return text;
+        }
     }
 }
 
 /// Replaces each `(…)` / `[…]` label group with a space. Brackets don't nest:
 /// a closer pairs with the latest unpaired opener of its kind, so the scan is
-/// linear and unbalanced brackets are simply left alone. Also returns whether
-/// anything was removed.
+/// linear and unbalanced brackets are simply left alone. A group inside an
+/// unclosed opener of the other kind is kept. Also returns whether anything
+/// was removed.
 fn remove_label_groups(text: &str) -> (String, bool) {
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
@@ -234,9 +259,13 @@ fn remove_label_groups(text: &str) -> (String, bool) {
             b']' => square.take(),
             _ => continue,
         };
+        // A group inside an unclosed opener of the other kind (`(Live [HD])`)
+        // is part of that bracket's text and stays, so no `(Live )` is left.
+        let other = if b == b')' { square } else { round };
         // Brackets are ASCII, so `open + 1` and `i` are char boundaries. A label
         // group holds no brackets, so it never overlaps one already removed.
         if let Some(open) = open.filter(|&open| open >= copied)
+            && other.is_none_or(|other| other > open)
             && is_label_group(&text[open + 1..i])
         {
             out.push_str(&text[copied..open]);
@@ -546,6 +575,41 @@ mod tests {
         assert_eq!(title("Band - [HD] - Song.mp3").as_deref(), Some("Song"));
         assert_eq!(strip_labels("Song | Official Music Video"), "Song");
         assert_eq!(strip_labels("Song – (Official Video)"), "Song");
+        assert_eq!(strip_labels("Song -- Official Video"), "Song");
+        assert_eq!(strip_labels("|| Song (HD)"), "Song");
+    }
+
+    #[test]
+    fn separators_that_belong_to_the_title_stay() {
+        assert_eq!(strip_labels("-1 (Official Video)"), "-1");
+        assert_eq!(strip_labels("Song- (Official Video)"), "Song-");
+        assert_eq!(strip_labels("--1 [HD]"), "--1");
+        // Without a removed label nothing is trimmed.
+        assert_eq!(strip_labels("Song -"), "Song -");
+        assert_eq!(strip_labels("- (HD)"), "- (HD)");
+    }
+
+    #[test]
+    fn nested_label_groups_stay() {
+        assert_eq!(
+            title("Song (Live [HD]).mp3").as_deref(),
+            Some("Song (Live [HD])")
+        );
+        assert_eq!(title("Song [(HD)].mp3").as_deref(), Some("Song [(HD)]"));
+        // An unclosed opener before a label group keeps it too (when in doubt,
+        // leave the title alone); an opener closed before it doesn't.
+        assert_eq!(
+            title("Song ( [Official Video].mp3").as_deref(),
+            Some("Song ( [Official Video]")
+        );
+        assert_eq!(
+            title("Song (Live) [Official Video].mp3").as_deref(),
+            Some("Song (Live)")
+        );
+        assert_eq!(
+            title("Song [Live] (Official Video).mp3").as_deref(),
+            Some("Song [Live]")
+        );
     }
 
     #[test]

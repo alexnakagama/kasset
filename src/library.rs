@@ -827,23 +827,32 @@ mod tests {
     }
 
     /// Non-UTF-8 names are decoded lossily, never panic, and stay sanitised.
+    ///
+    /// The path is never created: some file systems (APFS on macOS) refuse
+    /// non-UTF-8 names with `EILSEQ`, and inference only looks at the path's
+    /// text — an unreadable file is just a track without tags.
     #[cfg(unix)]
     #[test]
-    fn non_utf8_names_are_inferred_lossily() -> Result<()> {
+    fn non_utf8_names_are_inferred_lossily() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
-        let tmp = tempfile::tempdir()?;
-        let root = tmp.path();
-        let folder = root.join(OsStr::from_bytes(b"Ar\xfft")).join("LP");
-        fs::create_dir_all(&folder)?;
-        let path = folder.join(OsStr::from_bytes(b"Ba\xffnd - So\xfeng.wav"));
-        fs::write(&path, wav_bytes())?;
+        let root = Path::new("/nonexistent-kasset-library");
+        let path = root
+            .join(OsStr::from_bytes(b"Ar\xfft"))
+            .join("LP")
+            .join(OsStr::from_bytes(b"Ba\xffnd - So\xfeng.wav"));
         let t = read_track_in(root, path);
         assert_eq!(t.artist, "Ba\u{fffd}nd");
         assert_eq!(t.title, "So\u{fffd}ng");
         assert_eq!(t.album, "LP");
-        Ok(())
+
+        // Without a file-name artist the lossy folder name is the artist.
+        let path = root
+            .join(OsStr::from_bytes(b"Ar\xfft"))
+            .join("LP")
+            .join("Song.wav");
+        assert_eq!(read_track_in(root, path).artist, "Ar\u{fffd}t");
     }
 
     #[test]
@@ -909,6 +918,37 @@ mod tests {
             read_track_in(Path::new("/nonexistent"), elsewhere).album,
             UNKNOWN
         );
+        Ok(())
+    }
+
+    /// `cli` canonicalises the root, which on Windows gives a verbatim
+    /// `\\?\C:\…` path; `discover` joins entries onto that same root, so the
+    /// `strip_prefix` in `read_track_in` still sees the folders (the Windows CI
+    /// job runs this with a verbatim root).
+    #[test]
+    fn canonical_root_keeps_folder_inference() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().canonicalize()?;
+        wav_at(&root, "Band/LP/CD1/01 Song.wav", None)?;
+        let tracks = scan(&root)?.tracks;
+        let [t] = tracks.as_slice() else {
+            anyhow::bail!("expected one track, got {tracks:?}")
+        };
+        assert_eq!((t.artist.as_str(), t.album.as_str()), ("Band", "LP"));
+        assert_eq!((t.number, t.title.as_str()), (Some(1), "Song"));
+        Ok(())
+    }
+
+    /// On unix `\` is an ordinary file-name character, not a separator, so a
+    /// Windows-style name gives no folder values and stays in the title.
+    #[cfg(unix)]
+    #[test]
+    fn backslash_is_not_a_separator_on_unix() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        let t = read_track_in(root, wav_at(root, r"Band\LP\02 Song.wav", None)?);
+        assert_eq!((t.artist.as_str(), t.album.as_str()), (UNKNOWN, UNKNOWN));
+        assert_eq!((t.number, t.title.as_str()), (None, r"Band\LP\02 Song"));
         Ok(())
     }
 
