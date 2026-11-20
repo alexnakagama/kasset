@@ -29,8 +29,8 @@
 //!
 //! The spectrum visualizer is on at start (or as saved); `v` (Normal mode,
 //! either pane) turns it off or on, with a status message when the terminal
-//! is too short for the strip, where the change cannot be seen. Whether the strip fits and
-//! how many bars it has are fed back by the event loop
+//! is too short for the strip, where the change cannot be seen. Whether the
+//! strip fits and how many bars it has are fed back by the event loop
 //! ([`App::set_spectrum_layout`]). [`App::tick`] measures the spectrum only
 //! while the strip is shown, and passes samples only while playing with
 //! audio arriving (the tap's count advanced within [`STALE_AFTER`]), so a
@@ -40,11 +40,11 @@
 //! The lyrics pane ([`LyricsPane`]) is on at start (or as saved); `l`
 //! (Normal mode, either pane) turns it off or on, with a status message
 //! when the terminal is too narrow for it, like `v`. Whether it fits is fed
-//! back by the event loop ([`App::set_lyrics_layout`]). It never takes focus. While it is shown,
-//! [`App::tick`] reads the current track's lyrics once each time the
-//! current track's *path* changes (so seeking, pausing or replaying the same
-//! file never reads again); while it is not shown nothing is read and the
-//! cache is dropped, so showing it again always reads afresh.
+//! back by the event loop ([`App::set_lyrics_layout`]). It never takes focus.
+//! While it is shown, [`App::tick`] reads the current track's lyrics once
+//! each time the current track's *path* changes (so seeking, pausing or
+//! replaying the same file never reads again); while it is not shown nothing
+//! is read and the cache is dropped, so showing it again always reads afresh.
 //! [`App::lyrics_deadline`] tells the event loop when the highlighted synced
 //! line changes next, or asks for an immediate frame while a read is due
 //! (track changed, pane shown or widened), so the pane is never left blank
@@ -2033,7 +2033,7 @@ fn relative(root: &Path, path: &Path) -> Option<RelPath> {
 /// `d` cut to whole milliseconds and at most [`MAX_POSITION`], so a position
 /// read back from the state file compares equal.
 fn whole_millis(d: Duration) -> Duration {
-    Duration::from_millis(u64::try_from(d.min(MAX_POSITION).as_millis()).unwrap_or(u64::MAX))
+    u64::try_from(d.min(MAX_POSITION).as_millis()).map_or(MAX_POSITION, Duration::from_millis)
 }
 
 /// `failure` (an error) shown with `other`: an error comes first, so it is

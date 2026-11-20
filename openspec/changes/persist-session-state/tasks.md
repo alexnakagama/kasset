@@ -86,7 +86,7 @@ Test hermeticity, for every group: no test calls `dirs` or builds a store from t
 
 ## 6. Integration check
 
-- [ ] 6.1 Run a scripted check with the release build, a pty harness answering DSR, `XDG_STATE_HOME` set to a temp folder, and a generated fixture library of WAV files in a temp folder. Each step has a pass/fail assertion:
+- [x] 6.1 Run a scripted check with the release build, a pty harness answering DSR, `XDG_STATE_HOME` set to a temp folder, and a generated fixture library of WAV files in a temp folder. Each step has a pass/fail assertion:
   - play a track, set the volume to 60%, turn shuffle on, set repeat to "all", hide the visualizer, wait 5 s, and quit with `q`;
   - start again: the screen shows vol 60%, shuffle on, repeat all and no spectrum strip; the track is current and paused, and its position is within 1 s of where it was at quit; `Space` makes the position advance;
   - `--no-state`: the screen shows vol 100%, and `cmp` of the state file before and after the run passes;
