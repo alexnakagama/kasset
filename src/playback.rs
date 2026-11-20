@@ -4,6 +4,11 @@
 //! samples through for the visualizer ([`Playback::recent_samples`]), so
 //! nothing above it reaches the audio output directly.
 //!
+//! The play order's identity is a [`Source`]: the library, a playlist, an
+//! artist or an album of the browse catalog (both by catalog index, valid
+//! for one run), or a deleted playlist playing on ([`Source::Detached`]).
+//! Only playlist sources follow playlist edits, renames and deletions.
+//!
 //! A saved session is continued with [`Playback::resume`] (after the
 //! `set_volume` / `set_shuffle` / `set_repeat` setters restore the
 //! settings): it loads one track paused at a position and, unlike every
@@ -37,7 +42,10 @@ pub enum PlayState {
 }
 
 /// Where the play order comes from; compared by the interface to decide
-/// whether an open playlist is the one playing.
+/// whether an open playlist, album or artist is the one playing.
+/// `Playback` only stores and compares it: the items always come from the
+/// caller, and only [`Source::Playlist`] follows playlist edits, renames and
+/// deletions.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Source {
     /// The whole library, in library order.
@@ -45,6 +53,27 @@ pub enum Source {
     Library,
     /// The saved playlist with this name.
     Playlist(String),
+    /// All tracks of the artist with this index in the run's
+    /// `browse::Catalog`, album by album. The index is only valid within one
+    /// run and is never saved.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "played by the app from task 5.1 of add-artist-album-browsing"
+        )
+    )]
+    Artist(usize),
+    /// The tracks of the album with this index in the run's
+    /// `browse::Catalog`, in album order. Only valid within one run.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "played by the app from task 5.1 of add-artist-album-browsing"
+        )
+    )]
+    Album(usize),
     /// A playlist that was deleted while playing: its play order keeps
     /// going, but it no longer belongs to any playlist.
     Detached,
@@ -1623,6 +1652,153 @@ mod tests {
         assert_eq!(p.source(), &Source::Library);
         end_track(&mut p);
         assert_eq!(p.current(), Some(1));
+    }
+
+    // ---- Albums and artists as the play order ----
+
+    #[test]
+    fn album_plays_to_its_end() {
+        // The album lists A, B, C (library 4, 1, 3); B plays, repeat off.
+        let mut p = playback(6, &[]);
+        assert!(p.play_source(Source::Album(0), vec![4, 1, 3], 1));
+        assert_eq!(p.source(), &Source::Album(0));
+        assert_eq!(p.current(), Some(1));
+        assert_eq!(p.current_item(), Some(1));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(3), "C, not the next library track");
+        assert_eq!(p.current_item(), Some(2));
+        end_track(&mut p);
+        assert_eq!(p.state(), PlayState::Stopped, "repeat off stops at its end");
+        assert_eq!(p.current(), Some(3));
+        assert_eq!(p.source(), &Source::Album(0), "still the album's order");
+    }
+
+    #[test]
+    fn album_wraps_with_repeat_all() {
+        let mut p = playback(6, &[]);
+        set_repeat(&mut p, Repeat::All);
+        assert!(p.play_source(Source::Album(0), vec![4, 1, 3], 2));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(4), "A follows C");
+        assert_eq!(p.current_item(), Some(0));
+        p.audio.position = secs(1);
+        p.prev();
+        assert_eq!(p.current(), Some(3), "previous wraps within the album");
+    }
+
+    #[test]
+    fn artist_order_spans_its_albums() {
+        // Two albums concatenated: [5, 2] then [0, 4].
+        let mut p = playback(6, &[]);
+        assert!(p.play_source(Source::Artist(1), vec![5, 2, 0, 4], 1));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(0), "the second album's first track");
+        assert_eq!(p.source(), &Source::Artist(1));
+    }
+
+    #[test]
+    fn playlist_changes_leave_album_and_artist_sources_alone() {
+        for source in [Source::Album(0), Source::Artist(0)] {
+            let mut p = playback(6, &[]);
+            assert!(p.play_source(source.clone(), vec![2, 3, 4], 0));
+            p.playlist_renamed("Running", "Morning run");
+            p.playlist_deleted("Running");
+            assert!(!p.is_playing_playlist("Running"));
+            assert!(!p.edit_playlist("Running", Edit::Remove(0)));
+            assert!(!p.edit_playlist("Running", Edit::Replace(vec![5])));
+            assert!(!p.edit_playlist("Running", Edit::Append(vec![5])));
+            assert!(!p.edit_playlist("Running", Edit::Move { from: 0, to: 2 }));
+            assert_eq!(p.source(), &source, "{source:?} unchanged");
+            assert_eq!(p.items(), &[2, 3, 4], "{source:?} items unchanged");
+            assert_eq!(p.current(), Some(2));
+            assert_eq!(p.state(), PlayState::Playing);
+        }
+    }
+
+    #[test]
+    fn switching_from_a_playlist_to_an_album_stops_following_it() {
+        let mut p = playback(6, &[]);
+        assert!(p.play_source(running(), vec![2, 3, 4], 0));
+        assert!(
+            p.is_playing_playlist("Running"),
+            "control: the playlist is followed"
+        );
+        assert!(p.edit_playlist("Running", Edit::Remove(2)));
+        assert!(p.play_source(Source::Album(0), vec![2, 3, 4], 0));
+        assert!(!p.is_playing_playlist("Running"));
+        assert!(!p.edit_playlist("Running", Edit::Remove(0)));
+        p.playlist_renamed("Running", "Other");
+        p.playlist_deleted("Running");
+        assert_eq!(p.source(), &Source::Album(0));
+        assert_eq!(p.items(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn album_and_artist_sources_are_told_apart() {
+        let mut p = playback(6, &[]);
+        assert!(p.play_source(Source::Album(1), vec![0, 1], 0));
+        assert_ne!(p.source(), &Source::Album(0));
+        assert_ne!(p.source(), &Source::Artist(1));
+        assert!(
+            !p.play_source(Source::Artist(0), vec![0, 9], 0),
+            "not a library index"
+        );
+        assert_eq!(
+            p.source(),
+            &Source::Album(1),
+            "a refused play changes nothing"
+        );
+        assert!(
+            !p.play_source(Source::Artist(0), vec![0, 1], 2),
+            "out of range"
+        );
+        assert_eq!(p.source(), &Source::Album(1));
+    }
+
+    #[test]
+    fn shuffle_stays_in_the_album() {
+        // Shuffle on, repeat off, a 4-track album in a 10-track library.
+        for _ in 0..20 {
+            let mut p = playback(10, &[]);
+            assert!(p.toggle_shuffle());
+            let album = vec![7, 2, 9, 4];
+            assert!(p.play_source(Source::Album(3), album.clone(), 2));
+            assert_eq!(p.current(), Some(9), "the chosen track plays first");
+            let mut played = vec![9];
+            for _ in 0..3 {
+                end_track(&mut p);
+                assert_eq!(p.state(), PlayState::Playing);
+                played.extend(p.current());
+            }
+            end_track(&mut p);
+            assert_eq!(p.state(), PlayState::Stopped, "then playback stops");
+            played.sort_unstable();
+            let mut expected = album;
+            expected.sort_unstable();
+            assert_eq!(played, expected, "every album track exactly once");
+            assert_eq!(p.source(), &Source::Album(3));
+        }
+    }
+
+    #[test]
+    fn library_play_after_album_restores_library() {
+        let mut p = playback(6, &[]);
+        assert!(p.play_source(Source::Album(0), vec![4, 1], 0));
+        p.play(2);
+        assert_eq!(p.source(), &Source::Library);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(3), "library order again");
+    }
+
+    #[test]
+    fn resume_keeps_an_album_source() {
+        let mut p = playback(6, &[]);
+        assert!(p.resume(Source::Album(2), vec![4, 1, 3], 1, secs(5)));
+        assert_eq!(p.source(), &Source::Album(2));
+        assert_eq!(p.state(), PlayState::Paused);
+        p.toggle_pause();
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(3), "next follows the album");
     }
 
     #[test]

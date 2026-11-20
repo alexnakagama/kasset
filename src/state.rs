@@ -31,6 +31,13 @@
 //! - Settings come before the first `folder` line; each `folder` line starts
 //!   an entry that owns the lines after it. Folders are most recently used
 //!   first, at most [`MAX_FOLDERS`].
+//! - `source` is `library`, `playlist <name>`, `artist <name>` or
+//!   `album <artist> <title>` (two encoded fields, one space apart; an
+//!   encoded value never holds a space). A value this version does not know
+//!   is ignored, so the source defaults to the library: a file written with
+//!   an artist or album source still reads as a library source in a version
+//!   that predates them (which then saves it back as `library`), and
+//!   [`FORMAT_VERSION`] did not change for them.
 //! - Paths and names are percent-encoded: every byte outside `0x21..=0x7E`,
 //!   and `%`, is written `%XX`, so any value fits on one printable line. On
 //!   Unix paths are encoded from their raw bytes; elsewhere from UTF-8, and a
@@ -53,6 +60,11 @@
 //!   [`valid_name`]); they may hold control characters, as file names can.
 //!   They are only ever matched exactly against the playlist listing, never
 //!   used as paths, and sanitised before they are shown;
+//! - artist and album names (`source artist`, `source album`) are non-empty
+//!   UTF-8 of at most [`MAX_GROUP_NAME_BYTES`] bytes (see
+//!   [`valid_group_name`]). They are not file names, so `/` and control
+//!   characters are allowed; they are only ever compared with the names of
+//!   the scanned library's artists and albums, never used as paths;
 //! - a position is at most [`MAX_POSITION`]; a larger one is ignored on read
 //!   and clamped on write;
 //! - a [`RootKey`] is the canonical root's bytes and is compared exactly;
@@ -81,6 +93,10 @@ pub const MAX_STATE_BYTES: usize = 64 * 1024;
 
 /// Longest playlist name kept, in bytes (a file name limit on common filesystems).
 pub const MAX_NAME_BYTES: usize = 255;
+
+/// Longest artist or album name kept, in bytes: four times
+/// `text::MAX_TEXT_CHARS`, so any sanitised tag text fits.
+pub const MAX_GROUP_NAME_BYTES: usize = 4 * crate::text::MAX_TEXT_CHARS;
 
 /// Latest resume position kept (one week), far beyond any real track.
 pub const MAX_POSITION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -119,6 +135,10 @@ pub enum SavedSource {
     Library,
     /// The playlist with exactly this name.
     Playlist(String),
+    /// All tracks of the album artist with this name, album by album.
+    Artist(String),
+    /// The album with this title by this album artist, in album order.
+    Album { artist: String, title: String },
 }
 
 /// The track to resume in one library folder, and how it was being played.
@@ -489,13 +509,38 @@ fn parse_repeat(value: &[u8]) -> Option<Repeat> {
         .find(|repeat| repeat.label().as_bytes() == value)
 }
 
-/// `library` or `playlist <name>`.
+/// `library`, `playlist <name>`, `artist <name>` or `album <artist> <title>`.
 fn parse_source(value: &[u8]) -> Option<SavedSource> {
     if value == b"library" {
         return Some(SavedSource::Library);
     }
-    let name = value.strip_prefix(b"playlist ")?;
-    decode_name(name).map(SavedSource::Playlist)
+    if let Some(name) = value.strip_prefix(b"playlist ") {
+        return decode_name(name).map(SavedSource::Playlist);
+    }
+    if let Some(name) = value.strip_prefix(b"artist ") {
+        return decode_group_name(name).map(SavedSource::Artist);
+    }
+    let fields = value.strip_prefix(b"album ")?;
+    let space = fields.iter().position(|&b| b == b' ')?;
+    let (artist, title) = (fields.get(..space)?, fields.get(space + 1..)?);
+    Some(SavedSource::Album {
+        artist: decode_group_name(artist)?,
+        title: decode_group_name(title)?,
+    })
+}
+
+/// An artist or album name that passes [`valid_group_name`].
+fn decode_group_name(value: &[u8]) -> Option<String> {
+    String::from_utf8(decode(value)?)
+        .ok()
+        .filter(|name| valid_group_name(name))
+}
+
+/// Whether `name` can be saved as an artist or album name: not empty and at
+/// most [`MAX_GROUP_NAME_BYTES`] bytes. Any other text is allowed (it is
+/// only compared with the library's names).
+const fn valid_group_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_GROUP_NAME_BYTES
 }
 
 /// A playlist name that passes [`valid_name`].
@@ -638,6 +683,22 @@ fn render_entry(root: &RootKey, resume: Option<&Resume>, open: Option<&str>) -> 
                     "source",
                     &format!("playlist {}", encode(name.as_bytes())),
                 );
+            }
+            SavedSource::Artist(name) if valid_group_name(name) => {
+                push_line(
+                    &mut out,
+                    "source",
+                    &format!("artist {}", encode(name.as_bytes())),
+                );
+            }
+            SavedSource::Album { artist, title }
+                if valid_group_name(artist) && valid_group_name(title) =>
+            {
+                let (artist, title) = (encode(artist.as_bytes()), encode(title.as_bytes()));
+                push_line(&mut out, "source", &format!("album {artist} {title}"));
+            }
+            SavedSource::Artist(_) | SavedSource::Album { .. } => {
+                push_line(&mut out, "source", "library");
             }
         }
     }
@@ -929,6 +990,207 @@ mod tests {
                 ),
                 (root("/b"), FolderEntry::default()),
             ]
+        );
+    }
+
+    // --- artist and album sources ---
+
+    /// A one-folder file resuming `a.mp3` from `source`.
+    fn with_source(source: SavedSource) -> StateFile {
+        StateFile {
+            settings: None,
+            folders: vec![(
+                root("/m"),
+                FolderEntry {
+                    resume: Some(Resume {
+                        track: rel("a.mp3"),
+                        item: Some(2),
+                        position: Duration::from_millis(1_500),
+                        source,
+                    }),
+                    open: None,
+                },
+            )],
+        }
+    }
+
+    /// The source parsed from a file whose only source line is `line`.
+    fn source_of(line: &[u8]) -> Option<SavedSource> {
+        let mut text = b"kasset-state 1\nfolder /m\ntrack a.mp3\n".to_vec();
+        text.extend_from_slice(line);
+        text.push(b'\n');
+        valid(&text).folders[0]
+            .1
+            .resume
+            .as_ref()
+            .map(|r| r.source.clone())
+    }
+
+    fn album(artist: &str, title: &str) -> SavedSource {
+        SavedSource::Album {
+            artist: artist.to_owned(),
+            title: title.to_owned(),
+        }
+    }
+
+    #[test]
+    fn album_source_remembered() {
+        let file = with_source(album("Air", "Moon Safari"));
+        let text = String::from_utf8(render(&file)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            text.contains("\nsource album Air Moon%20Safari\n"),
+            "{text}"
+        );
+        assert_eq!(valid(text.as_bytes()), file);
+
+        let file = with_source(SavedSource::Artist("Daft Punk".to_owned()));
+        let text = String::from_utf8(render(&file)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(text.contains("\nsource artist Daft%20Punk\n"), "{text}");
+        assert_eq!(valid(text.as_bytes()), file);
+    }
+
+    #[test]
+    fn round_trips_awkward_artist_and_album_names() {
+        // Unlike playlist names these are not file names: `/` is kept.
+        let awkward = "AC/DC 100% \n\r\t\u{1b}[31m 日本語 % %41 ../x \0 ";
+        let longest = "é".repeat(MAX_GROUP_NAME_BYTES / 2);
+        let cjk = "音".repeat(256);
+        for name in [awkward, " ", "/", "%", longest.as_str(), cjk.as_str()] {
+            for source in [
+                SavedSource::Artist(name.to_owned()),
+                album(name, "Back in Black"),
+                album("Various Artists", name),
+                album(name, name),
+            ] {
+                let file = with_source(source);
+                let bytes = render(&file);
+                assert!(!bytes.contains(&b'\r') && !bytes.contains(&0), "{name:?}");
+                assert_eq!(valid(&bytes), file, "{name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_artist_and_album_names_are_saved_as_the_library() {
+        let too_long = "x".repeat(MAX_GROUP_NAME_BYTES + 1);
+        for source in [
+            SavedSource::Artist(String::new()),
+            SavedSource::Artist(too_long.clone()),
+            album("", "Moon Safari"),
+            album("Air", ""),
+            album(&too_long, "Moon Safari"),
+            album("Air", &too_long),
+        ] {
+            let text = String::from_utf8(render(&with_source(source.clone())))
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(text.contains("\nsource library\n"), "{source:?}: {text}");
+            assert_eq!(
+                valid(text.as_bytes()),
+                with_source(SavedSource::Library),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_artist_and_album_sources_are_ignored() {
+        let too_long = "x".repeat(MAX_GROUP_NAME_BYTES + 1);
+        let longest = "x".repeat(MAX_GROUP_NAME_BYTES);
+        for line in [
+            "source album x",
+            "source album  ",
+            "source album x ",
+            "source album  x",
+            "source album a b c",
+            "source album",
+            "source album ",
+            "source artist",
+            "source artist ",
+            "source artist a b",
+            "source Artist Air",
+            "source artist\tAir",
+            "source album a%2 b",
+            "source album a b%zz",
+            "source album a%FF b",
+            "source artist %C3",
+            "source artist a%",
+            "source artist café",
+            &format!("source artist {too_long}"),
+            &format!("source album {too_long} x"),
+            &format!("source album x {too_long}"),
+        ] {
+            assert_eq!(
+                source_of(line.as_bytes()),
+                Some(SavedSource::Library),
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            source_of(format!("source artist {longest}").as_bytes()),
+            Some(SavedSource::Artist(longest.clone()))
+        );
+        assert_eq!(
+            source_of(b"source album %2F x%2Fy"),
+            Some(album("/", "x/y")),
+            "an escaped `/` is allowed"
+        );
+        // A bad source line does not hide a later valid one.
+        assert_eq!(
+            source_of(b"source album x\nsource artist Air"),
+            Some(SavedSource::Artist("Air".to_owned()))
+        );
+        assert_eq!(
+            source_of(b"source artist Air\nsource album Air x"),
+            Some(SavedSource::Artist("Air".to_owned())),
+            "first valid value wins"
+        );
+    }
+
+    #[test]
+    fn artist_and_album_sources_keep_the_version() {
+        let file = with_source(album("Air", "Moon Safari"));
+        assert!(render(&file).starts_with(b"kasset-state 1\n"));
+        assert_eq!(FORMAT_VERSION, 1);
+    }
+
+    #[test]
+    fn a_file_from_0_6_0_parses_unchanged() {
+        // Written by kasset 0.6.0 (before artist and album sources).
+        let old = b"kasset-state 1\nvolume 60\nshuffle on\nrepeat all\nvisualizer off\n\
+                    lyrics on\nfolder /home/user/M%C3%BAsica\ntrack Band/LP/01%20Song.flac\n\
+                    item 3\nposition-ms 135000\nsource playlist Running\nopen Running\n\
+                    folder /mnt/other\ntrack x.mp3\nposition-ms 0\nsource library\n";
+        let file = valid(old);
+        let mut expected = sample_file();
+        expected.folders[1].1.resume = Some(Resume {
+            track: rel("x.mp3"),
+            item: None,
+            position: Duration::ZERO,
+            source: SavedSource::Library,
+        });
+        assert_eq!(file, expected);
+        assert_eq!(render(&file), old.to_vec(), "written back byte for byte");
+    }
+
+    #[test]
+    fn two_longest_album_names_fit_with_twenty_folders() {
+        // Worst case: every byte escaped (3×) in both fields.
+        let name = "\u{1}".repeat(MAX_GROUP_NAME_BYTES);
+        let mut file = with_source(album(&name, &name));
+        let entry = file.folders[0].1.clone();
+        file.folders = (0..MAX_FOLDERS)
+            .map(|i| (root(&format!("/m{i}")), entry.clone()))
+            .collect();
+        let bytes = render(&file);
+        assert!(bytes.len() <= MAX_STATE_BYTES);
+        let parsed = valid(&bytes);
+        assert_eq!(
+            parsed.folders[0], file.folders[0],
+            "the current folder is kept whole"
+        );
+        assert!(
+            file.folders.starts_with(&parsed.folders),
+            "only whole folders, newest first"
         );
     }
 
