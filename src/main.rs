@@ -11,6 +11,14 @@ mod playback;
 mod player;
 mod playlist;
 mod queue;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the app and `main` from task groups 2-5"
+    )
+)]
+mod state;
 mod terminal;
 #[cfg(test)]
 mod test_support;
