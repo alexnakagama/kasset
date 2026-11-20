@@ -297,7 +297,9 @@ and the last error stays visible.
 - The terminal is restored on quit, on error, on panic and on `SIGINT`,
   `SIGTERM` or `SIGHUP`. A **second** signal of the same kind is an emergency
   exit for when `kasset` is stuck (for example on a stalled network mount): it
-  ends the process at once without restoring the terminal. Run `reset` if the
+  ends the process at once without restoring the terminal. If `kasset` has not
+  quit 2 seconds after the first signal, it ends the same way on its own, so
+  closing the terminal window always stops the music. Run `reset` if the
   shell is left in a bad state afterwards.
 - The borders, the progress bar (`━ ╸ ─`), the playing markers (`▶ ‖ ■`)
   and the ellipsis (`…`) are Unicode characters of "ambiguous" East Asian

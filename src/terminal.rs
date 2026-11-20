@@ -1,11 +1,13 @@
 //! Terminal setup and teardown, and the event loop driving the [`App`].
 //!
 //! The terminal is restored (raw mode off, main screen, cursor shown) on
-//! every way out: normal quit, error, termination signal, and panic. The one
-//! exception is a *second* termination signal of the same kind, an emergency
-//! exit for when the loop is stuck (e.g. on a stalled network mount): it ends
-//! the process at once, like `SIGKILL` would, and the terminal may then need
-//! `reset`. While the
+//! every way out: normal quit, error, termination signal, and panic. The
+//! exceptions are the emergency exits for when the loop is stuck after a
+//! termination signal (e.g. on a stalled network mount, or in crossterm's
+//! input reader once the terminal is closed): a *second* signal of the same
+//! kind ends the process at once, like `SIGKILL` would, and so does a watchdog
+//! thread when the loop has not quit within `SIGNAL_GRACE` (2 s) of the
+//! first; the terminal may then need `reset`. While the
 //! UI is up, the process's standard error is pointed at `/dev/null` so that C
 //! libraries (ALSA in particular) cannot print over the screen.
 //!
@@ -271,13 +273,24 @@ fn event_loop<A: Audio>(
     }
 }
 
+/// How long the event loop has, after a termination signal, to quit on its
+/// own before the watchdog ends the process. Far longer than a frame plus the
+/// shutdown, which normally take well under a second.
+#[cfg(unix)]
+const SIGNAL_GRACE: Duration = Duration::from_secs(2);
+
 /// Termination signals turned into flags polled by the event loop, so the
-/// terminal is restored instead of being left in raw mode. A second signal of
-/// the same kind terminates immediately, in case the loop is stuck; that exit
-/// skips the restore (nothing else is async-signal-safe), see the module docs.
+/// terminal is restored instead of being left in raw mode. In case the loop is
+/// stuck, two things end the process without the restore (nothing else is
+/// async-signal-safe or safe to do from another thread), see the module docs:
+/// a second signal of the same kind, at once; and a watchdog thread, when the
+/// loop has not quit [`SIGNAL_GRACE`] after the first signal. The watchdog
+/// matters when the terminal is closed: the hangup sends a single `SIGHUP`,
+/// and crossterm's input reader spins forever on the dead terminal, so the
+/// loop never gets to see the flag (and the music would play on).
 struct Signals {
     #[cfg(unix)]
-    flags: Vec<(i32, std::sync::Arc<AtomicBool>)>,
+    flags: std::sync::Arc<Vec<(i32, std::sync::Arc<AtomicBool>)>>,
 }
 
 impl Signals {
@@ -285,8 +298,12 @@ impl Signals {
     fn register() -> Result<Self> {
         use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
         use signal_hook::flag;
+        use signal_hook::low_level::pipe;
+        use std::os::unix::net::UnixStream;
         use std::sync::Arc;
 
+        // The handlers write a byte to `wake` to start the watchdog's grace.
+        let (mut wait, wake) = UnixStream::pair().context("cannot install signal handlers")?;
         let mut flags = Vec::new();
         for signal in [SIGINT, SIGTERM, SIGHUP] {
             let raised = Arc::new(AtomicBool::new(false));
@@ -294,9 +311,31 @@ impl Signals {
             // earlier delivery, not this one.
             flag::register_conditional_shutdown(signal, 128 + signal, Arc::clone(&raised))
                 .and_then(|_| flag::register(signal, Arc::clone(&raised)))
+                .and_then(|_| pipe::register(signal, wake.try_clone()?))
                 .context("cannot install signal handlers")?;
             flags.push((signal, raised));
         }
+        let flags = Arc::new(flags);
+        let watched = Arc::clone(&flags);
+        thread::Builder::new()
+            .name("kasset-signal-watchdog".to_owned())
+            .spawn(move || {
+                use std::io::Read;
+                let mut byte = [0u8];
+                // Blocks until a signal arrives; an error means none ever can.
+                if wait.read_exact(&mut byte).is_err() {
+                    return;
+                }
+                thread::sleep(SIGNAL_GRACE);
+                // Still running: the loop is stuck. Ending the process is
+                // what stops the audio.
+                let signal = watched
+                    .iter()
+                    .find(|(_, raised)| raised.load(Ordering::Acquire))
+                    .map_or(SIGHUP, |&(signal, _)| signal);
+                std::process::exit(128 + signal);
+            })
+            .context("cannot start the signal watchdog")?;
         Ok(Self { flags })
     }
 
