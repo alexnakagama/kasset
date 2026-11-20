@@ -155,10 +155,14 @@ impl FsStateStore {
     /// Reads and parses the file; anything unreadable is [`Parsed::Invalid`].
     ///
     /// A missing file, and something that is not a regular file (a FIFO, a
-    /// socket), hold no state: they read as [`Parsed::Invalid`] and a save
-    /// replaces them. Any other error (permission denied, I/O error, too many
-    /// open files, a link loop) is returned, so a save never replaces a file
-    /// that may hold other folders' state just because it could not be read.
+    /// socket, a device), hold no state: they read as [`Parsed::Invalid`] and
+    /// a save replaces them. Opening some of those fails before the type
+    /// check in [`read_limited`] can run (a socket gives `ENXIO`), so on any
+    /// other open error the path's type is looked up (following a link, like
+    /// the read): a non-regular file still reads as [`Parsed::Invalid`]. Any
+    /// other error (permission denied, I/O error, too many open files, a link
+    /// loop) is returned, so a save never replaces a file that may hold other
+    /// folders' state just because it could not be read.
     fn read(&self) -> io::Result<Parsed> {
         match read_limited(&self.file, MAX_STATE_BYTES as u64) {
             Ok((bytes, truncated, _)) => Ok(parse(whole_lines(&bytes, truncated))),
@@ -170,7 +174,12 @@ impl FsStateStore {
             {
                 Ok(Parsed::Invalid)
             }
-            Err(err) => Err(err),
+            Err(err) => match fs::metadata(&self.file) {
+                // A folder is not a state file either, but a save cannot
+                // replace it, so its error stays.
+                Ok(meta) if !meta.is_file() && !meta.is_dir() => Ok(Parsed::Invalid),
+                _ => Err(err),
+            },
         }
     }
 
@@ -341,7 +350,10 @@ fn create_temp(dir: &Path) -> io::Result<(PathBuf, File)> {
 }
 
 /// Removes regular `.state.tmp-*` files in `dir` untouched for
-/// [`STALE_TEMP_AGE`]: leftovers of killed runs. Best effort.
+/// [`STALE_TEMP_AGE`]: leftovers of killed runs. Best effort. A file whose
+/// modification time is in the future (clock skew) is never treated as stale:
+/// it may belong to a save in progress, and it is at most
+/// [`MAX_STATE_BYTES`].
 fn sweep_stale_temps(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -779,6 +791,26 @@ mod tests {
         let mut store = FsStateStore::new(path.clone(), Path::new("/music"));
         assert_eq!(store.save(&session(60, None), None), Ok(Saved::Written));
         assert!(fs::symlink_metadata(&path)?.file_type().is_file());
+        Ok(())
+    }
+
+    /// Opening a socket fails (`ENXIO`) before the type check; it holds no
+    /// state, so loading gives defaults and a save replaces it.
+    #[cfg(unix)]
+    #[test]
+    fn socket_loads_as_empty_and_is_replaced_by_a_save() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = state_path(&tmp);
+        fs::create_dir_all(path.parent().unwrap_or(tmp.path()))?;
+        let _listener = std::os::unix::net::UnixListener::bind(&path)?;
+        let mut store = FsStateStore::new(path.clone(), Path::new("/music"));
+        assert_eq!(store.load(), Loaded::default());
+        assert_eq!(store.save(&session(60, None), None), Ok(Saved::Written));
+        assert!(fs::symlink_metadata(&path)?.file_type().is_file());
+        assert_eq!(
+            store.load().settings.map(|s| s.volume),
+            Some(Volume::new(60))
+        );
         Ok(())
     }
 
