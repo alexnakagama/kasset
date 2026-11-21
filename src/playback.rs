@@ -56,23 +56,9 @@ pub enum Source {
     /// All tracks of the artist with this index in the run's
     /// `browse::Catalog`, album by album. The index is only valid within one
     /// run and is never saved.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "played by the app from task 5.1 of add-artist-album-browsing"
-        )
-    )]
     Artist(usize),
     /// The tracks of the album with this index in the run's
     /// `browse::Catalog`, in album order. Only valid within one run.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "played by the app from task 5.1 of add-artist-album-browsing"
-        )
-    )]
     Album(usize),
     /// A playlist that was deleted while playing: its play order keeps
     /// going, but it no longer belongs to any playlist.
