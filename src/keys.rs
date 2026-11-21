@@ -6,8 +6,9 @@
 //! - Every entry's `keys` column is ASCII, so the `--help` text lines up in
 //!   any terminal; bar labels may use arrows (`↑/↓`).
 //! - A context's bar lists its labels in table order. Groups are ordered so
-//!   that each view's own keys (library, sidebar, playlist) come before the
-//!   shared transport keys, because the bar is cut at the terminal's width.
+//!   that each view's own keys (library, sidebar, playlist, browse levels)
+//!   come before the shared transport keys, because the bar is cut at the
+//!   terminal's width.
 //! - Every [`BarContext`] has a non-empty bar, and no bar label is wider
 //!   than 24 columns.
 //!
@@ -32,6 +33,14 @@ pub enum BarContext {
     Playlist,
     /// Normal mode, sidebar focused.
     Sidebar,
+    /// Normal mode, main pane showing the artist or the album list (the
+    /// first browse level, where `Esc` goes to the sidebar).
+    BrowseTop,
+    /// Normal mode, main pane showing an artist's albums.
+    BrowseGroups,
+    /// Normal mode, main pane showing a browsed list of tracks (an album, or
+    /// an artist's tracks).
+    BrowseTracks,
     /// Typing a search query.
     Search,
     /// Choosing the playlist to add tracks to.
@@ -49,10 +58,13 @@ pub enum BarContext {
 impl BarContext {
     /// Every context, for exhaustive checks.
     #[cfg(test)]
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 12] = [
         Self::Library,
         Self::Playlist,
         Self::Sidebar,
+        Self::BrowseTop,
+        Self::BrowseGroups,
+        Self::BrowseTracks,
         Self::Search,
         Self::Picker,
         Self::Name,
@@ -60,12 +72,29 @@ impl BarContext {
         Self::ConfirmDelete,
         Self::Help,
     ];
+
+    /// Whether this is a Normal-mode context (a view, not a prompt or the
+    /// overlay): its bar ends with [`HELP_HINT`].
+    #[must_use]
+    pub fn is_normal(self) -> bool {
+        NORMAL.contains(&self)
+    }
 }
 
-use BarContext::{ConfirmDelete, Help, Library, Name, Picker, Playlist, Rename, Search, Sidebar};
+use BarContext::{
+    BrowseGroups, BrowseTop, BrowseTracks, ConfirmDelete, Help, Library, Name, Picker, Playlist,
+    Rename, Search, Sidebar,
+};
 
-/// The three Normal-mode contexts.
-const NORMAL: &[BarContext] = &[Library, Playlist, Sidebar];
+/// The Normal-mode contexts.
+const NORMAL: &[BarContext] = &[
+    Library,
+    Playlist,
+    Sidebar,
+    BrowseTop,
+    BrowseGroups,
+    BrowseTracks,
+];
 
 /// A short label for the key bar and the contexts whose bar shows it.
 #[derive(Debug)]
@@ -103,14 +132,15 @@ pub const GROUPS: &[Group] = &[
         entries: &[
             Entry {
                 keys: "Enter",
-                action: "play the selected track (in the library or a playlist)",
-                bar: &[shown("Enter play", &[Library, Playlist])],
+                action: "play the selected track (in the library, a playlist, an album or an \
+                         artist's tracks)",
+                bar: &[shown("Enter play", &[Library, Playlist, BrowseTracks])],
             },
             Entry {
                 keys: "a / A",
                 action: "add the selected / every listed track to a playlist",
                 bar: &[
-                    shown("a/A add", &[Library]),
+                    shown("a/A add", &[Library, BrowseTracks]),
                     shown("↑/↓ choose", &[Picker]),
                     shown("type a name", &[Name]),
                     shown("Enter add", &[Picker]),
@@ -125,8 +155,9 @@ pub const GROUPS: &[Group] = &[
         entries: &[
             Entry {
                 keys: "Enter",
-                action: "in the sidebar: show the selected entry in the main pane and focus it",
-                bar: &[shown("Enter open", &[Sidebar])],
+                action: "open the selected sidebar entry, artist, album or All tracks in the \
+                         main pane (and focus it)",
+                bar: &[shown("Enter open", &[Sidebar, BrowseTop, BrowseGroups])],
             },
             Entry {
                 keys: "d",
@@ -159,13 +190,29 @@ pub const GROUPS: &[Group] = &[
             },
             Entry {
                 keys: "Esc",
-                action: "in a playlist: clear the filter, then focus the sidebar",
-                bar: &[shown("Esc sidebar", &[Playlist])],
+                action: "in a playlist or the artist / album list: clear the filter, then \
+                         focus the sidebar",
+                bar: &[shown("Esc sidebar", &[Playlist, BrowseTop])],
             },
             Entry {
                 keys: "Tab, Shift+Tab",
                 action: "move focus between the sidebar and the main pane",
                 bar: &[shown("Tab focus", NORMAL)],
+            },
+        ],
+    },
+    Group {
+        title: "Browse",
+        entries: &[
+            Entry {
+                keys: "Esc / Backspace",
+                action: "back one level, to the entry opened (Esc clears a filter first)",
+                bar: &[shown("Esc back", &[BrowseGroups, BrowseTracks])],
+            },
+            Entry {
+                keys: "a",
+                action: "on an artist, album or All tracks: add all its tracks to a playlist",
+                bar: &[shown("a add", &[BrowseTop, BrowseGroups])],
             },
         ],
     },
@@ -224,7 +271,7 @@ pub const GROUPS: &[Group] = &[
             },
             Entry {
                 keys: "Esc",
-                action: "clear an active filter",
+                action: "clear an active filter (before going back or to the sidebar)",
                 bar: &[],
             },
             Entry {
@@ -403,6 +450,69 @@ mod tests {
         assert_eq!(bar(Library)[..2], ["Enter play", "a/A add"]);
         assert_eq!(bar(Sidebar)[..3], ["Enter open", "R rename", "D delete"]);
         assert_eq!(bar(Playlist)[..3], ["Enter play", "d remove", "J/K move"]);
+        assert_eq!(bar(BrowseTop)[..2], ["Enter open", "Esc sidebar"]);
+        assert_eq!(bar(BrowseGroups)[..1], ["Enter open"]);
+        assert_eq!(bar(BrowseTracks)[..2], ["Enter play", "a/A add"]);
+    }
+
+    /// Every view's own keys come before the shared transport keys, which
+    /// start with `Space pause`.
+    #[test]
+    fn own_keys_come_before_the_transport_keys() {
+        let own: [(BarContext, &[&str]); 6] = [
+            (Library, &["Enter play", "a/A add"]),
+            (
+                Playlist,
+                &["Enter play", "d remove", "J/K move", "Esc sidebar"],
+            ),
+            (Sidebar, &["Enter open", "R rename", "D delete"]),
+            (BrowseTop, &["Enter open", "Esc sidebar", "a add"]),
+            (BrowseGroups, &["Enter open", "Esc back", "a add"]),
+            (BrowseTracks, &["Enter play", "a/A add", "Esc back"]),
+        ];
+        for (context, labels) in own {
+            let bar = bar(context);
+            let Some(transport) = bar.iter().position(|&l| l == "Space pause") else {
+                panic!("{context:?} has no transport keys");
+            };
+            for label in labels {
+                let at = bar.iter().position(|l| l == label);
+                assert!(
+                    at.is_some_and(|at| at < transport),
+                    "{context:?}: {label:?} in {bar:?}"
+                );
+            }
+            assert!(context.is_normal(), "{context:?}");
+        }
+    }
+
+    /// Spec *Artist list bar*: `Esc` goes to the sidebar there, and back a
+    /// level deeper down.
+    #[test]
+    fn browse_bars_name_where_esc_goes() {
+        assert!(!bar(BrowseTop).contains(&"Esc back"));
+        assert!(!bar(BrowseGroups).contains(&"Esc sidebar"));
+        assert!(!bar(BrowseTracks).contains(&"Esc sidebar"));
+        assert!(!bar(BrowseTracks).contains(&"a add"), "a/A add instead");
+        assert!(!bar(Library).contains(&"Esc back"));
+    }
+
+    /// Spec *Help lists back*.
+    #[test]
+    fn help_lists_going_back() {
+        let text = help_text();
+        let Some(line) = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("Esc / Backspace"))
+        else {
+            panic!("--help does not list Esc / Backspace: {text}");
+        };
+        assert!(line.contains("back one level"), "{line}");
+        assert!(text.contains("\nBrowse:\n"), "{text}");
+        let titles: Vec<&str> = GROUPS.iter().map(|group| group.title).collect();
+        let sidebar = titles.iter().position(|&t| t == "Sidebar & playlists");
+        let browse = titles.iter().position(|&t| t == "Browse");
+        assert_eq!(browse, sidebar.map(|s| s + 1), "{titles:?}");
     }
 
     #[test]

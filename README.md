@@ -192,7 +192,7 @@ are not read.
 
 | Key                    | Action                                   |
 | ---------------------- | ---------------------------------------- |
-| `Enter`                | play the selected track                  |
+| `Enter`                | play the selected track (in the library, a playlist, an album or an artist's tracks) |
 | `Space`                | pause / resume                           |
 | `s`                    | stop                                     |
 | `n` / `p`              | next / previous track (`p` restarts the track after 3 s) |
@@ -201,7 +201,7 @@ are not read.
 | `z`                    | toggle shuffle                           |
 | `r`                    | cycle repeat: off → all → one            |
 | `/`                    | search; `Enter` keeps the filter, `Esc` clears it |
-| `Esc`                  | clear an active filter (see also Playlists below) |
+| `Esc`                  | clear an active filter (see also Playlists and Browsing below) |
 | `↑` / `↓`, `k` / `j`   | move the selection                       |
 | `PgUp` / `PgDn`        | move the selection by a page             |
 | `g` / `Home`, `G` / `End` | first / last row                      |
@@ -220,16 +220,31 @@ as commands until you press `Enter` or `Esc`.
 | `Tab`, `Shift+Tab`     | move focus between the sidebar and the main pane; each list keeps its own selection and filter |
 | `a`                    | in the library: add the selected track to a playlist |
 | `A`                    | in the library: add every listed track (after any search) to a playlist |
-| `Enter`                | in the sidebar: show the selected entry ("Library" or a playlist) in the main pane and focus it; in a playlist: play from the selected track |
-| `Esc`                  | in a playlist: clear the filter, then focus the sidebar (the playlist stays shown); in the sidebar: clear the filter |
+| `Enter`                | in the sidebar: show the selected entry ("Library", "Artists", "Albums" or a playlist) in the main pane and focus it; in a playlist: play from the selected track |
+| `Esc`                  | in a playlist or the artist / album list: clear the filter, then focus the sidebar (the list stays shown); in the sidebar: clear the filter |
 | `d`                    | in a playlist: remove the selected entry (only that occurrence) |
 | `J` / `K`              | in a playlist: move the selected entry down / up (not while filtered) |
 | `R`                    | in the sidebar: rename the selected playlist (changing only the letter case is allowed) |
 | `D`                    | in the sidebar: delete the selected playlist after a `y` confirmation; any other key cancels |
 
-The sidebar lists "Library" first, then your playlists with their track
-counts; they are listed when kasset starts and again whenever the sidebar
-gets the focus. `R` and `D` do nothing on "Library".
+The sidebar lists "Library", "Artists" and "Albums" first, then your
+playlists with their track counts; they are listed when kasset starts and
+again whenever the sidebar gets the focus. `R` and `D` do nothing on the
+first three entries.
+
+### Browsing
+
+| Key                    | Action                                   |
+| ---------------------- | ---------------------------------------- |
+| `Enter`                | on an artist: list its albums ("All tracks" first); on an album or "All tracks": list its tracks; on a track: play it, with that album or artist as the play order |
+| `Backspace`            | back one level, to the entry you opened (even while filtered) |
+| `Esc`                  | clear the filter, else back one level; on the artist or album list: focus the sidebar |
+| `a`                    | on an artist, album or "All tracks": add all its tracks to a playlist; on a track: add it |
+| `A`                    | in a list of tracks: add every listed track to a playlist |
+| `/`                    | filter the level: artists by name, albums by title or artist, tracks as in the library |
+
+Each level keeps its own filter and selection, and "Artists" and "Albums"
+come back to where you left them.
 
 **Changed in this version:** `Tab` used to swap the whole list between the
 library and the playlists; it now moves the focus between the two panes.
