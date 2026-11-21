@@ -25,6 +25,9 @@
 //!   someone else's album has no entry.
 //! - Search keys are lower-cased: an artist's name, an album's title and
 //!   artist joined by `\n` (so a query never matches across the two).
+//! - [`Catalog::find_artist`] / [`Catalog::find_album`] find a group again
+//!   by name, compared by key, so a saved source survives a re-scan whose
+//!   indices differ; the names given are untrusted and only compared.
 
 use std::collections::BTreeMap;
 
@@ -177,6 +180,33 @@ impl Catalog {
     #[must_use]
     pub fn album(&self, index: usize) -> Option<&Album> {
         self.albums.get(index)
+    }
+
+    /// The album artist whose name is `name` ignoring case (compared by
+    /// key, as the grouping does): how a saved artist source is found again
+    /// in a later run. `name` may be any untrusted text; it is only
+    /// compared.
+    #[must_use]
+    pub fn find_artist(&self, name: &str) -> Option<usize> {
+        let key = name.to_lowercase();
+        // Artists are sorted by key, and keys are unique.
+        self.artists
+            .binary_search_by(|artist| artist.search_key.as_str().cmp(key.as_str()))
+            .ok()
+    }
+
+    /// The album titled `title` by album artist `artist`, both ignoring case
+    /// (compared by key, as the grouping does): how a saved album source is
+    /// found again in a later run. Untrusted input, only compared.
+    #[must_use]
+    pub fn find_album(&self, artist: &str, title: &str) -> Option<usize> {
+        let artist = self.artist(self.find_artist(artist)?)?;
+        let key = title.to_lowercase();
+        // An album's title key is its first spelling lower-cased.
+        artist.albums.iter().copied().find(|&b| {
+            self.album(b)
+                .is_some_and(|album| album.title.to_lowercase() == key)
+        })
     }
 
     /// The artist's tracks: their albums' tracks concatenated, album by album
@@ -511,6 +541,49 @@ mod tests {
             catalog.album(0).map(Album::search_key),
             Some("moon safari\näir")
         );
+    }
+
+    #[test]
+    fn groups_found_again_by_name_ignoring_case() {
+        let tracks = [
+            with("a", "Air", "Moon Safari", None, None, Some(1)),
+            with("b", "Air", "Talkie Walkie", None, None, Some(1)),
+            with("c", "Björk", "Debut", None, None, Some(1)),
+            with("d", "Guest", "Hits", Some("Various Artists"), None, Some(1)),
+            with("e", "Other", "Debut", None, None, Some(1)),
+        ];
+        let catalog = Catalog::build(&tracks);
+        let artist = |name: &str| catalog.find_artist(name).and_then(|a| catalog.artist(a));
+        assert_eq!(artist("Air").map(Artist::name), Some("Air"));
+        assert_eq!(artist("BJÖRK").map(Artist::name), Some("Björk"));
+        assert_eq!(
+            artist("various artists").map(Artist::name),
+            Some("Various Artists")
+        );
+        // Only album artists are listed, so a guest is not found.
+        for missing in ["Guest", "", "Ai", "Air ", "Air\nMoon Safari", "%41ir"] {
+            assert_eq!(catalog.find_artist(missing), None, "{missing:?}");
+        }
+
+        let album = |artist: &str, title: &str| {
+            catalog
+                .find_album(artist, title)
+                .and_then(|b| catalog.album(b))
+                .map(|b| (b.title(), catalog.artist(b.artist()).map(Artist::name)))
+        };
+        assert_eq!(
+            album("air", "TALKIE walkie"),
+            Some(("Talkie Walkie", Some("Air")))
+        );
+        // Same title, different artists: the artist picks the album.
+        assert_eq!(album("Björk", "Debut"), Some(("Debut", Some("Björk"))));
+        assert_eq!(album("Other", "Debut"), Some(("Debut", Some("Other"))));
+        assert_eq!(album("Air", "Debut"), None, "not Air's album");
+        assert_eq!(album("Nobody", "Debut"), None);
+        assert_eq!(album("Air", ""), None);
+        assert_eq!(album("Air", "Moon Safari\nAir"), None);
+        assert_eq!(Catalog::default().find_album("Air", "Moon Safari"), None);
+        assert_eq!(Catalog::default().find_artist("Air"), None);
     }
 
     /// Measures [`Catalog::build`] on a large library (design risk: start-up

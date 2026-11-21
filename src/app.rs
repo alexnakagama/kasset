@@ -27,6 +27,14 @@
 //!   The stacks are kept while something else is shown, so `Enter` on
 //!   "Artists" comes back to the same place. Catalog indices are only valid
 //!   for the run and are never saved.
+//! - `Enter` on a browsed track plays it with its album or artist
+//!   ([`Source::Album`] / [`Source::Artist`], the level's tracks unfiltered)
+//!   as the play order. The sidebar marks "Artists" or "Albums" for those
+//!   sources; [`App::browse_row_playing`] gives the browse rows' markers (a
+//!   track row only when its own level's album or artist plays). `a` on an
+//!   artist, album or "All tracks" row offers all its tracks, in the order
+//!   they are listed when opened; in a track list `a` / `A` add the selected
+//!   or the listed tracks, as in the library.
 //!
 //! Each list (library, sidebar, open playlist, every browse level) keeps
 //! its own filter and selection; going back leaves the parent level as it
@@ -80,9 +88,11 @@
 //! store and continues the saved session once at start: the settings, the
 //! shown playlist (focused), then the track, loaded **paused**. The state
 //! file is untrusted: it only ever selects a track the scan found (matched by
-//! its path relative to the root) and playlists the listing found (by exact
-//! name). A resume point that could not be resumed is kept and saved again
-//! until a track becomes current. [`App::tick`] saves at most every
+//! its path relative to the root), playlists the listing found (by exact
+//! name), and artists and albums of the catalog (by name, ignoring case,
+//! like the grouping); the browse location is not saved. A resume point
+//! that could not be resumed is kept and saved again until a track becomes
+//! current. [`App::tick`] saves at most every
 //! [`SAVE_INTERVAL`], only when the session changed, and reports only the
 //! first of a run of failed saves. [`App::shutdown`] takes the final session
 //! before it stops the audio and writes nothing; [`App::save_final`] writes
@@ -143,7 +153,7 @@ pub enum Mode {
 /// The "add to playlist" popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
-    /// Library indices of the tracks to add, in library order.
+    /// Library indices of the tracks to add, in the order to add.
     tracks: Vec<usize>,
     /// The playlists offered, as listed when the picker opened.
     choices: Vec<PlaylistInfo>,
@@ -978,6 +988,48 @@ impl<A: Audio> App<A> {
         self.browse_level().map_or(&[], |level| &level.tracks)
     }
 
+    /// Whether row `value` of browse level `kind` (see [`BrowseKind`] for
+    /// what values are) has the playing marker, while a track is loaded:
+    ///
+    /// - an album row when that album is the play order;
+    /// - an artist row when that artist is, or one of its albums is;
+    /// - "All tracks" when that artist is;
+    /// - a track row (a position in the level's tracks) only when the
+    ///   level's own album or artist is the play order and the row is its
+    ///   current item, so a track played from elsewhere is never marked.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "drawn from task 6.1 of add-artist-album-browsing")
+    )]
+    pub fn browse_row_playing(&self, kind: BrowseKind, value: usize) -> bool {
+        if self.playback.current_track().is_none() {
+            return false;
+        }
+        let source = self.playback.source();
+        let album_playing = |b: usize| *source == Source::Album(b);
+        match kind {
+            BrowseKind::Artists => match *source {
+                Source::Artist(a) => a == value,
+                Source::Album(b) => self.catalog.album(b).is_some_and(|al| al.artist() == value),
+                Source::Library | Source::Playlist(_) | Source::Detached => false,
+            },
+            BrowseKind::ArtistAlbums(a) => match artist_album_of_value(value) {
+                None => *source == Source::Artist(a),
+                Some(i) => self
+                    .catalog
+                    .artist(a)
+                    .and_then(|artist| artist.albums().get(i))
+                    .is_some_and(|&b| album_playing(b)),
+            },
+            BrowseKind::Albums => album_playing(value),
+            BrowseKind::Album(b) => album_playing(b) && self.playback.current_item() == Some(value),
+            BrowseKind::ArtistTracks(a) => {
+                *source == Source::Artist(a) && self.playback.current_item() == Some(value)
+            }
+        }
+    }
+
     /// The browse stack shown in the main pane, if any.
     fn browse_nav(&self) -> Option<&Vec<BrowseLevel>> {
         match self.browse? {
@@ -1073,16 +1125,19 @@ impl<A: Audio> App<A> {
     }
 
     /// The sidebar value of the entry that is the play order (see
-    /// [`SidebarEntry`]), while a track is loaded. `None` before anything
-    /// was played, and while a deleted playlist plays on (no entry is its
-    /// order).
+    /// [`SidebarEntry`]), while a track is loaded: "Library", the playlist,
+    /// "Artists" for an artist or "Albums" for an album. `None` before
+    /// anything was played, and while a deleted playlist plays on (no entry
+    /// is its order).
     #[must_use]
     pub fn sidebar_playing(&self) -> Option<usize> {
         self.playback.current_track()?;
         match self.playback.source() {
-            // Artist and album sources mark "Library" until task 5.1 of
-            // add-artist-album-browsing marks "Artists" and "Albums".
-            Source::Library | Source::Artist(_) | Source::Album(_) => SidebarEntry::Library.value(),
+            Source::Library => SidebarEntry::Library.value(),
+            // The source does not record the route: an album reached
+            // through "Artists" still marks "Albums".
+            Source::Artist(_) => SidebarEntry::Artists.value(),
+            Source::Album(_) => SidebarEntry::Albums.value(),
             Source::Playlist(name) => self.sidebar_value_of(name),
             Source::Detached => None,
         }
@@ -1342,12 +1397,22 @@ impl<A: Audio> App<A> {
                 Focus::Main => self.focus_sidebar(None),
                 Focus::Sidebar => self.focus_main(),
             },
-            KeyCode::Char('a') if self.view() == View::Library => {
+            KeyCode::Char('a') if matches!(self.view(), View::Library | View::Tracks) => {
                 let tracks = self.selected_track().into_iter().collect();
                 self.open_picker(tracks);
             }
+            // An empty level has no row: nothing to add, nothing said.
+            KeyCode::Char('a') if self.view() == View::Groups => {
+                if let Some(tracks) = self.selected_group_tracks() {
+                    self.open_picker(tracks);
+                }
+            }
             KeyCode::Char('A') if self.view() == View::Library => {
                 let tracks = self.library.rows.clone();
+                self.open_picker(tracks);
+            }
+            KeyCode::Char('A') if self.view() == View::Tracks => {
+                let tracks = self.listed_browse_tracks();
                 self.open_picker(tracks);
             }
             KeyCode::Char('d') if self.view() == View::Playlist => self.remove_selected(),
@@ -1731,9 +1796,7 @@ impl<A: Audio> App<A> {
             }
             View::Playlists => self.show_selected(),
             View::Groups => self.browse_into(),
-            // Playing a browsed track comes with task 5.1 of
-            // add-artist-album-browsing.
-            View::Tracks => {}
+            View::Tracks => self.play_browsed(),
             View::Playlist => {
                 let Some(open) = &self.open else {
                     return;
@@ -1748,6 +1811,63 @@ impl<A: Audio> App<A> {
                     }
                 }
             }
+        }
+    }
+
+    /// The tracks of the selected artist, album or "All tracks" row of the
+    /// shown browse level, in the order its own level lists them unfiltered
+    /// (album order; an artist album by album). `None` without a selected
+    /// group row.
+    fn selected_group_tracks(&self) -> Option<Vec<usize>> {
+        let level = self.browse_level()?;
+        let value = level.list.selected_value()?;
+        let catalog = &self.catalog;
+        let album = |b: usize| catalog.album(b).map(|album| album.tracks().to_vec());
+        match level.kind {
+            BrowseKind::Artists => catalog.artist(value).map(|_| catalog.artist_tracks(value)),
+            BrowseKind::ArtistAlbums(a) => match artist_album_of_value(value) {
+                None => catalog.artist(a).map(|_| catalog.artist_tracks(a)),
+                Some(i) => album(*catalog.artist(a)?.albums().get(i)?),
+            },
+            BrowseKind::Albums => album(value),
+            BrowseKind::Album(_) | BrowseKind::ArtistTracks(_) => None,
+        }
+    }
+
+    /// The tracks a browsed track list shows (its filter applied), in the
+    /// order listed.
+    fn listed_browse_tracks(&self) -> Vec<usize> {
+        self.browse_level().map_or_else(Vec::new, |level| {
+            level
+                .list
+                .rows
+                .iter()
+                .filter_map(|&i| level.tracks.get(i).copied())
+                .collect()
+        })
+    }
+
+    /// `Enter` on a browsed track: plays it with the level's album or
+    /// artist, in the order listed unfiltered, as the play order.
+    fn play_browsed(&mut self) {
+        let Some(level) = self.browse_level() else {
+            return;
+        };
+        let Some(item) = level.list.selected_value() else {
+            return;
+        };
+        let source = match level.kind {
+            BrowseKind::Album(b) => Source::Album(b),
+            BrowseKind::ArtistTracks(a) => Source::Artist(a),
+            BrowseKind::Artists | BrowseKind::ArtistAlbums(_) | BrowseKind::Albums => return,
+        };
+        let items = level.tracks.clone();
+        // The items come from the catalog of these very tracks, so this
+        // cannot fail; reported rather than ignored all the same.
+        if !self.playback.play_source(source, items, item) {
+            self.notify(Notice::error(
+                "Cannot play: the track list does not match the library",
+            ));
         }
     }
 
@@ -2119,7 +2239,8 @@ impl<A: Audio> App<A> {
     /// Adds library `tracks` to existing playlist `name` and saves it.
     fn add_to(&mut self, name: &str, tracks: &[usize]) {
         // Unreachable from the keys since the focus model (`a`/`A` need the
-        // library shown, so nothing is open), kept as a safeguard.
+        // library or a browse level shown, so nothing is open), kept as a
+        // safeguard.
         // The open copy is what the user last saw: a change made on disk
         // since then is detected on save instead of silently merged.
         let open_copy = self
@@ -2273,8 +2394,11 @@ impl<A: Audio> App<A> {
     /// the playlist that was shown (focused, if it is still listed), then the
     /// resume point, loaded paused (see [`Playback::resume`]). The play
     /// source is the saved playlist if it is listed and still holds the
-    /// track, else the library. A resume point that cannot be resumed is
-    /// kept and saved again until a track becomes current. A newer state file
+    /// track, or the saved artist or album if the catalog has one by that
+    /// name that still holds it, else the library. The browse location is
+    /// not restored: the main pane shows the library (or the playlist). A
+    /// resume point that cannot be resumed is kept and saved again until a
+    /// track becomes current. A newer state file
     /// gives one notice and turns saving off for the run. Reopening the
     /// shown playlist gives the same notices as opening it by hand (entries
     /// not found, read-only). Called once, after [`App::new`] and before the
@@ -2364,30 +2488,45 @@ impl<A: Audio> App<A> {
         self.playback.resume(source, items, item, resume.position)
     }
 
-    /// The saved source playlist of `resume` as the play order for library
-    /// track `track`: its items and the item to start at (the saved one if
-    /// it still is that track, else the first that is). `None` when the
-    /// source is the library, or the playlist is not listed, cannot be read
-    /// or no longer holds the track.
+    /// The saved source of `resume` as the play order for library track
+    /// `track`: its items and the item to start at (the saved one if it
+    /// still is that track, else the first that is). `None` when the source
+    /// is the library, when the playlist is not listed or cannot be read,
+    /// when no scanned artist or album has the saved names (compared
+    /// ignoring case, like the grouping), or when the source no longer holds
+    /// the track. Saved names are only compared, never used as paths.
     fn resume_source(&self, resume: &Resume, track: usize) -> Option<(Source, Vec<usize>, usize)> {
-        let SavedSource::Playlist(name) = &resume.source else {
-            return None;
-        };
-        self.sidebar_value_of(name)?;
-        let items = match &self.open {
-            Some(open) if open.name() == name => open.items.clone(),
-            // Read only for its items; the main pane is not changed.
-            _ => self.store.load(name, self.resolver()).ok()?.tracks(),
+        let (source, items) = match &resume.source {
+            SavedSource::Library => return None,
+            SavedSource::Playlist(name) => {
+                self.sidebar_value_of(name)?;
+                let items = match &self.open {
+                    Some(open) if open.name() == name => open.items.clone(),
+                    // Read only for its items; the main pane is not changed.
+                    _ => self.store.load(name, self.resolver()).ok()?.tracks(),
+                };
+                (Source::Playlist(name.clone()), items)
+            }
+            SavedSource::Artist(name) => {
+                let a = self.catalog.find_artist(name)?;
+                (Source::Artist(a), self.catalog.artist_tracks(a))
+            }
+            SavedSource::Album { artist, title } => {
+                let b = self.catalog.find_album(artist, title)?;
+                (Source::Album(b), self.catalog.album(b)?.tracks().to_vec())
+            }
         };
         let item = resume
             .item
             .filter(|&i| items.get(i) == Some(&track))
             .or_else(|| items.iter().position(|&t| t == track))?;
-        Some((Source::Playlist(name.clone()), items, item))
+        Some((source, items, item))
     }
 
     /// The session as it would be saved now. A detached play order is saved
-    /// as the library; the position is in whole milliseconds.
+    /// as the library; an artist or album source by its names (catalog
+    /// indices are only valid for the run); the position is in whole
+    /// milliseconds.
     fn session(&self) -> Session {
         #[cfg(test)]
         self.saved.built.set(self.saved.built.get() + 1);
@@ -2402,16 +2541,35 @@ impl<A: Audio> App<A> {
         let resume = self.saved.root.as_deref().and_then(|root| {
             let index = playback.current()?;
             let track = relative(root, &playback.tracks().get(index)?.path)?;
+            let library = (SavedSource::Library, Some(index));
             let (source, item) = match playback.source() {
                 Source::Playlist(name) => {
                     (SavedSource::Playlist(name.clone()), playback.current_item())
                 }
-                // The library's items are its indices. Artist and album
-                // sources are saved as the library until task 5.3 of
-                // add-artist-album-browsing saves them by name.
-                Source::Library | Source::Detached | Source::Artist(_) | Source::Album(_) => {
-                    (SavedSource::Library, Some(index))
-                }
+                // Catalog indices are only valid for this run: saved by
+                // name. An index the catalog lacks (never, in practice)
+                // falls back to the library.
+                Source::Artist(a) => self.catalog.artist(*a).map_or(library, |artist| {
+                    (
+                        SavedSource::Artist(artist.name().to_owned()),
+                        playback.current_item(),
+                    )
+                }),
+                Source::Album(b) => self.catalog.album(*b).map_or(library, |album| {
+                    let artist = self
+                        .catalog
+                        .artist(album.artist())
+                        .map_or_else(String::new, |artist| artist.name().to_owned());
+                    (
+                        SavedSource::Album {
+                            artist,
+                            title: album.title().to_owned(),
+                        },
+                        playback.current_item(),
+                    )
+                }),
+                // The library's items are its indices.
+                Source::Library | Source::Detached => library,
             };
             Some(Resume {
                 track,
@@ -6896,29 +7054,6 @@ mod state_tests {
     }
 
     #[test]
-    fn album_and_artist_sources_are_saved_as_the_library_for_now() -> Result<()> {
-        // Interim until tasks 5.1 and 5.3 of add-artist-album-browsing.
-        let mut lib = Lib::new()?;
-        let disk = Disk::default();
-        lib.start_on(&disk)?;
-        for source in [Source::Album(0), Source::Artist(0)] {
-            assert!(
-                lib.app
-                    .playback_mut()
-                    .play_source(source.clone(), vec![2, 0], 0)
-            );
-            assert_eq!(lib.app.sidebar_playing(), Some(0), "{source:?}");
-            let resume = lib.app.session().folder.resume;
-            assert_eq!(
-                resume.as_ref().map(|r| (r.source.clone(), r.item)),
-                Some((SavedSource::Library, Some(2))),
-                "{source:?}: saved as the library, item = library index"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
     fn resumed_in_its_playlist() -> Result<()> {
         let mut lib = Lib::new()?;
         lib.write("Running", &["D", "B", "C"])?;
@@ -7398,15 +7533,17 @@ mod state_tests {
     }
 }
 
-/// Key sequences for browsing by artist and album (tasks 4.1–4.3 of
+/// Key sequences for browsing by artist and album (tasks 4.1–5.3 of
 /// add-artist-album-browsing).
 #[cfg(test)]
 mod browse_tests {
     use super::*;
     use crate::library::sort_tracks;
     use crate::playlist::FsStore;
+    use crate::state::store::FsStateStore;
+    use crate::state::{Parsed, RootKey, StateFile, parse, render};
     use crate::test_support::SilentAudio;
-    use anyhow::{Result, bail};
+    use anyhow::{Context as _, Result, bail};
     use std::fs;
 
     struct Lib {
@@ -8142,6 +8279,555 @@ mod browse_tests {
         m.keys(&[KeyCode::Esc]);
         assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Album(0)));
         assert_eq!(m.app.browse_depth(), 2);
+        Ok(())
+    }
+
+    // --- Playing and markers (task 5.1) ---
+
+    impl Lib {
+        fn current_title(&self) -> Option<String> {
+            self.app.playback().current_track().map(|t| t.title.clone())
+        }
+
+        /// Ends the current track and lets the app move on.
+        fn end_track(&mut self) {
+            self.app.playback_mut().audio_mut().ended = true;
+            self.app.tick(Instant::now());
+        }
+
+        /// Opens `path` (sidebar entry, then each name in turn) and plays
+        /// the track named last with `Enter`.
+        fn play(&mut self, entry: SidebarEntry, path: &[&str]) -> Result<()> {
+            self.show(entry)?;
+            let Some((track, groups)) = path.split_last() else {
+                bail!("empty path");
+            };
+            for name in groups {
+                self.open(name)?;
+            }
+            self.open(track)?;
+            assert_eq!(self.current_title().as_deref(), Some(*track));
+            Ok(())
+        }
+
+        /// Whether the shown level's row named `name` has the playing marker.
+        fn marked(&self, name: &str) -> Result<bool> {
+            let MainView::Browse(kind) = self.app.main_view() else {
+                bail!("not browsing");
+            };
+            let Some(row) = self.names().iter().position(|n| n == name) else {
+                bail!("{name} not listed in {:?}", self.names());
+            };
+            let Some(&value) = self.app.main_list().rows.get(row) else {
+                bail!("row {row} missing");
+            };
+            Ok(self.app.browse_row_playing(kind, value))
+        }
+
+        /// The names of the shown level's rows with the playing marker.
+        fn marked_rows(&self) -> Result<Vec<String>> {
+            let mut marked = Vec::new();
+            for name in self.names() {
+                if self.marked(&name)? {
+                    marked.push(name);
+                }
+            }
+            Ok(marked)
+        }
+    }
+
+    /// Spec *Artist play order spans albums*.
+    #[test]
+    fn artist_play_order_spans_albums() -> Result<()> {
+        let mut m = music()?;
+        m.play(
+            SidebarEntry::Artists,
+            &["Air", "All tracks", "Kelly Watch the Stars"],
+        )?;
+        let air = m.artist("Air");
+        assert_eq!(
+            air.map(Source::Artist).as_ref(),
+            Some(m.app.playback().source())
+        );
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Artists.value());
+        m.end_track();
+        assert_eq!(m.current_title().as_deref(), Some("Cherry Blossom Girl"));
+        m.keys(&[KeyCode::Char('n')]);
+        assert_eq!(m.current_title().as_deref(), Some("Venus"));
+        // Repeat off: the artist's last track ends the play order.
+        m.end_track();
+        assert_eq!(m.app.playback().state(), PlayState::Stopped);
+        Ok(())
+    }
+
+    /// Spec *Album playing* and *Album source*; the album plays to its end.
+    #[test]
+    fn album_playing_marks_its_rows_and_albums() -> Result<()> {
+        let mut m = music()?;
+        assert_eq!(m.app.sidebar_playing(), None, "nothing played yet");
+        m.show(SidebarEntry::Albums)?;
+        assert_eq!(m.marked_rows()?, Vec::<String>::new());
+        m.play(SidebarEntry::Albums, &["Moon Safari", "Sexy Boy"])?;
+        let album = m.album("Moon Safari");
+        assert_eq!(
+            album.map(Source::Album).as_ref(),
+            Some(m.app.playback().source())
+        );
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Albums.value());
+        assert_eq!(m.marked_rows()?, ["Sexy Boy"]);
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.marked_rows()?, ["Moon Safari"]);
+        m.show(SidebarEntry::Artists)?;
+        assert_eq!(m.marked_rows()?, ["Air"], "an album of Air plays");
+
+        m.end_track();
+        assert_eq!(m.current_title().as_deref(), Some("Kelly Watch the Stars"));
+        m.end_track();
+        assert_eq!(m.app.playback().state(), PlayState::Stopped, "album ended");
+        Ok(())
+    }
+
+    /// Spec *Album played through Artists*.
+    #[test]
+    fn album_played_through_artists() -> Result<()> {
+        let mut m = music()?;
+        m.play(
+            SidebarEntry::Artists,
+            &["Air", "Moon Safari", "La Femme d'Argent"],
+        )?;
+        assert_eq!(
+            m.album("Moon Safari").map(Source::Album).as_ref(),
+            Some(m.app.playback().source())
+        );
+        assert_eq!(m.marked_rows()?, ["La Femme d'Argent"]);
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.marked_rows()?, ["Moon Safari"], "not All tracks");
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.marked_rows()?, ["Air"]);
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Albums.value());
+        Ok(())
+    }
+
+    #[test]
+    fn artist_source_marks_all_tracks_and_the_artist() -> Result<()> {
+        let mut m = music()?;
+        m.play(SidebarEntry::Artists, &["Air", "All tracks", "Venus"])?;
+        assert_eq!(m.marked_rows()?, ["Venus"]);
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.marked_rows()?, ["All tracks"], "no album is the order");
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.marked_rows()?, ["Air"]);
+        // The album holding the track is not the play order.
+        m.show(SidebarEntry::Albums)?;
+        assert_eq!(m.marked_rows()?, Vec::<String>::new());
+        m.open("Talkie Walkie")?;
+        assert_eq!(m.marked_rows()?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// Spec *Different play order*, then the library becoming the order
+    /// again after an album played.
+    #[test]
+    fn library_order_marks_no_browsed_track() -> Result<()> {
+        let mut m = music()?;
+        m.play(SidebarEntry::Albums, &["Moon Safari", "Sexy Boy"])?;
+        m.show(SidebarEntry::Library)?;
+        m.select("Sexy Boy")?;
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(*m.app.playback().source(), Source::Library);
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Library.value());
+        m.keys(&[KeyCode::Char('n')]);
+        assert_eq!(
+            m.current_title().as_deref(),
+            Some("Kelly Watch the Stars"),
+            "library order"
+        );
+        // "Albums" comes back to Moon Safari, where the album was played.
+        m.show(SidebarEntry::Albums)?;
+        assert_eq!(m.marked_rows()?, Vec::<String>::new());
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.marked_rows()?, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_album_plays_the_whole_album() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Albums)?;
+        m.open("Moon Safari")?;
+        m.chars("/sexy");
+        m.keys(&[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(m.current_title().as_deref(), Some("Sexy Boy"));
+        assert_eq!(
+            m.marked_rows()?,
+            ["Sexy Boy"],
+            "marked in the filtered list"
+        );
+        m.keys(&[KeyCode::Char('n')]);
+        assert_eq!(m.current_title().as_deref(), Some("Kelly Watch the Stars"));
+        Ok(())
+    }
+
+    // --- Adding to playlists (task 5.2) ---
+
+    impl Lib {
+        /// The file names (without extension) playlist `name` lists, in order.
+        fn entries(&self, name: &str) -> Result<Vec<String>> {
+            let text = fs::read_to_string(self.root.join(format!("Playlists/{name}.m3u8")))?;
+            Ok(text
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .filter_map(|line| Path::new(line).file_stem())
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .collect())
+        }
+
+        /// In the picker: the existing playlist at `choice` (0 = first).
+        fn pick(&mut self, choice: usize) {
+            assert!(matches!(self.app.mode(), Mode::Picker(_)), "picker open");
+            self.keys(&[KeyCode::Home]);
+            for _ in 0..=choice {
+                self.keys(&[KeyCode::Down]);
+            }
+            self.keys(&[KeyCode::Enter]);
+        }
+
+        /// In the picker: "New playlist…" named `name`.
+        fn pick_new(&mut self, name: &str) {
+            assert!(matches!(self.app.mode(), Mode::Picker(_)), "picker open");
+            self.keys(&[KeyCode::Home, KeyCode::Enter]);
+            self.chars(name);
+            self.keys(&[KeyCode::Enter]);
+            assert_eq!(*self.app.mode(), Mode::Normal);
+        }
+    }
+
+    /// Spec *Add a whole album*.
+    #[test]
+    fn add_a_whole_album() -> Result<()> {
+        let mut m = music()?;
+        m.write("Chill", &[("Air", "Moon Safari", "Sexy Boy")])?;
+        m.show(SidebarEntry::Albums)?;
+        m.select("Moon Safari")?;
+        m.chars("a");
+        let Mode::Picker(picker) = m.app.mode() else {
+            bail!("picker not open");
+        };
+        assert_eq!(picker.track_count(), 3);
+        m.pick(0);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(
+            m.entries("Chill")?,
+            ["Sexy Boy", "La Femme d'Argent", "Kelly Watch the Stars"],
+            "album order, the track already there skipped"
+        );
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Albums));
+        Ok(())
+    }
+
+    #[test]
+    fn add_an_artist_all_tracks_or_artist_row() -> Result<()> {
+        let all = [
+            "La Femme d'Argent",
+            "Sexy Boy",
+            "Kelly Watch the Stars",
+            "Cherry Blossom Girl",
+            "Venus",
+        ];
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.open("Air")?;
+        m.select("All tracks")?;
+        m.chars("a");
+        m.pick_new("Air all");
+        assert_eq!(m.entries("Air all")?, all);
+        // `a` on an artist row of the artist list adds the same.
+        m.keys(&[KeyCode::Backspace]);
+        m.select("Air")?;
+        m.chars("a");
+        m.pick_new("Air row");
+        assert_eq!(m.entries("Air row")?, all);
+        // And on one of the artist's albums, that album only.
+        m.open("Air")?;
+        m.select("Talkie Walkie")?;
+        m.chars("a");
+        m.pick_new("Talkie");
+        assert_eq!(m.entries("Talkie")?, ["Cherry Blossom Girl", "Venus"]);
+        Ok(())
+    }
+
+    #[test]
+    fn add_browsed_tracks_selected_or_listed() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.open("Air")?;
+        m.open("All tracks")?;
+        m.select("Venus")?;
+        m.chars("a");
+        m.pick_new("One");
+        assert_eq!(m.entries("One")?, ["Venus"]);
+        // `A` adds what the filter lists, in the order listed.
+        m.chars("/talkie");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.names(), ["Cherry Blossom Girl", "Venus"]);
+        m.app
+            .handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        m.pick_new("Listed");
+        assert_eq!(m.entries("Listed")?, m.names());
+        // `A` on a group level does nothing.
+        m.keys(&[KeyCode::Backspace]);
+        m.app
+            .handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        Ok(())
+    }
+
+    // --- Saved artist and album sources (task 5.3) ---
+
+    impl Lib {
+        /// Installs a real state store on `state` (a file path).
+        fn restore_from(&mut self, state: &Path) {
+            let store = FsStateStore::new(state.to_path_buf(), &self.root);
+            self.app.restore(Box::new(store), &self.root);
+        }
+
+        /// Quits (`shutdown`, then the final save), and starts kasset again
+        /// on `tracks`, restoring from `state`.
+        fn restart(&mut self, tracks: Vec<Track>, state: &Path) -> Result<()> {
+            self.app.shutdown();
+            if let Some(err) = self.app.save_final() {
+                bail!("save failed: {err}");
+            }
+            self.start(tracks, state);
+            Ok(())
+        }
+
+        /// Starts kasset on `tracks`, restoring from `state`.
+        fn start(&mut self, tracks: Vec<Track>, state: &Path) {
+            let mut tracks = tracks;
+            sort_tracks(&mut tracks);
+            self.app = App::new(
+                tracks,
+                SilentAudio::default(),
+                Box::new(FsStore::new(&self.root)),
+                self.root.display().to_string(),
+                None,
+            );
+            self.restore_from(state);
+        }
+
+        fn tracks(&self) -> Vec<Track> {
+            self.app.playback().tracks().to_vec()
+        }
+
+        /// The resume point saved for this folder in `state`.
+        fn saved_resume(&self, state: &Path) -> Result<Option<Resume>> {
+            let Parsed::Valid(file) = parse(&fs::read(state)?) else {
+                bail!("state file not valid");
+            };
+            let key = RootKey::new(&self.root).context("root key")?;
+            Ok(file
+                .folders
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, entry)| entry.resume))
+        }
+
+        /// A resume point at `Air/Moon Safari/Sexy Boy.mp3`.
+        fn sexy_boy(item: Option<usize>, source: SavedSource) -> Resume {
+            Resume {
+                track: RelPath::new(Path::new("Air/Moon Safari/Sexy Boy.mp3"))
+                    .unwrap_or_else(|| unreachable!("a valid relative path")),
+                item,
+                position: Duration::from_millis(1_500),
+                source,
+            }
+        }
+
+        /// Writes a state file at `state` resuming at `resume`.
+        fn write_state(&self, state: &Path, resume: Resume) -> Result<()> {
+            let file = StateFile {
+                settings: None,
+                folders: vec![(
+                    RootKey::new(&self.root).context("root key")?,
+                    FolderEntry {
+                        resume: Some(resume),
+                        open: None,
+                    },
+                )],
+            };
+            if let Some(dir) = state.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            fs::write(state, render(&file))?;
+            Ok(())
+        }
+    }
+
+    fn moon_safari() -> SavedSource {
+        SavedSource::Album {
+            artist: "Air".to_owned(),
+            title: "Moon Safari".to_owned(),
+        }
+    }
+
+    /// A state file path in its own temporary folder.
+    fn state_file() -> Result<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kasset/state");
+        Ok((dir, path))
+    }
+
+    /// Spec *Album source remembered* and *Resumed in its album*.
+    #[test]
+    fn resumed_in_its_album() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.play(SidebarEntry::Albums, &["Moon Safari", "Sexy Boy"])?;
+        let tracks = m.tracks();
+        m.restart(tracks, &state)?;
+        let saved = m.saved_resume(&state)?;
+        assert_eq!(
+            saved.as_ref().map(|r| (&r.track, r.item, &r.source)),
+            Some((
+                &Lib::sexy_boy(None, moon_safari()).track,
+                Some(1),
+                &moon_safari()
+            ))
+        );
+
+        assert_eq!(
+            m.app.main_view(),
+            MainView::Library,
+            "location not restored"
+        );
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.current_title().as_deref(), Some("Sexy Boy"));
+        assert_eq!(m.app.playback().state(), PlayState::Paused);
+        assert_eq!(
+            m.album("Moon Safari").map(Source::Album).as_ref(),
+            Some(m.app.playback().source())
+        );
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Albums.value());
+        m.keys(&[KeyCode::Char('n')]);
+        assert_eq!(m.current_title().as_deref(), Some("Kelly Watch the Stars"));
+        m.keys(&[KeyCode::Char('p'), KeyCode::Char('p')]);
+        assert_eq!(m.current_title().as_deref(), Some("La Femme d'Argent"));
+        Ok(())
+    }
+
+    /// The artist equivalent of spec *Resumed in its album*.
+    #[test]
+    fn resumed_in_its_artist() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.play(
+            SidebarEntry::Artists,
+            &["Air", "All tracks", "Kelly Watch the Stars"],
+        )?;
+        let tracks = m.tracks();
+        m.restart(tracks, &state)?;
+        assert_eq!(
+            m.saved_resume(&state)?.map(|r| (r.item, r.source)),
+            Some((Some(2), SavedSource::Artist("Air".to_owned())))
+        );
+        assert_eq!(m.current_title().as_deref(), Some("Kelly Watch the Stars"));
+        assert_eq!(
+            m.artist("Air").map(Source::Artist).as_ref(),
+            Some(m.app.playback().source())
+        );
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Artists.value());
+        m.keys(&[KeyCode::Char('n')]);
+        assert_eq!(
+            m.current_title().as_deref(),
+            Some("Cherry Blossom Girl"),
+            "next spans Air's albums"
+        );
+        Ok(())
+    }
+
+    /// Spec *Album no longer holds the track*.
+    #[test]
+    fn album_no_longer_holds_the_track() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.play(SidebarEntry::Albums, &["Moon Safari", "Sexy Boy"])?;
+        let mut tracks = m.tracks();
+        for track in tracks.iter_mut().filter(|t| t.title == "Sexy Boy") {
+            track.album = "Premiers Symptômes".to_owned();
+        }
+        m.restart(tracks, &state)?;
+        assert_eq!(m.current_title().as_deref(), Some("Sexy Boy"));
+        assert_eq!(*m.app.playback().source(), Source::Library);
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Library.value());
+        Ok(())
+    }
+
+    /// Spec *Unknown album source*, and an unknown artist.
+    #[test]
+    fn unknown_album_or_artist_source_resumes_from_the_library() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        let tracks = m.tracks();
+        let unknown = [
+            SavedSource::Album {
+                artist: "Nobody".to_owned(),
+                title: "Moon Safari".to_owned(),
+            },
+            SavedSource::Album {
+                artist: "Air".to_owned(),
+                title: "Talkie Walkie".to_owned(),
+            },
+            SavedSource::Artist("Sexy Boy".to_owned()),
+            SavedSource::Artist("Various Artists".to_owned()),
+        ];
+        for source in unknown {
+            m.write_state(&state, Lib::sexy_boy(Some(1), source.clone()))?;
+            m.start(tracks.clone(), &state);
+            assert_eq!(m.current_title().as_deref(), Some("Sexy Boy"), "{source:?}");
+            assert_eq!(*m.app.playback().source(), Source::Library, "{source:?}");
+            let library_index = tracks.iter().position(|t| t.title == "Sexy Boy");
+            assert_eq!(m.app.playback().current_item(), library_index, "{source:?}");
+            m.app.tick(Instant::now());
+            assert_eq!(m.app.status(Instant::now()), None, "{source:?}: no error");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn saved_names_match_ignoring_case_and_a_stale_item_is_found_again() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        let tracks = m.tracks();
+        let shouting = SavedSource::Album {
+            artist: "AIR".to_owned(),
+            title: "moon SAFARI".to_owned(),
+        };
+        // Item 0 is another track now, and 99 is past the album.
+        for item in [Some(1), Some(0), Some(99), None] {
+            m.write_state(&state, Lib::sexy_boy(item, shouting.clone()))?;
+            m.start(tracks.clone(), &state);
+            assert_eq!(m.current_title().as_deref(), Some("Sexy Boy"), "{item:?}");
+            assert_eq!(m.app.playback().current_item(), Some(1), "{item:?}");
+            assert_eq!(
+                m.album("Moon Safari").map(Source::Album).as_ref(),
+                Some(m.app.playback().source()),
+                "{item:?}"
+            );
+        }
+        m.write_state(
+            &state,
+            Lib::sexy_boy(Some(0), SavedSource::Artist("aIr".to_owned())),
+        )?;
+        m.start(tracks, &state);
+        assert_eq!(m.app.playback().current_item(), Some(1));
+        assert_eq!(
+            m.artist("Air").map(Source::Artist).as_ref(),
+            Some(m.app.playback().source())
+        );
         Ok(())
     }
 }
