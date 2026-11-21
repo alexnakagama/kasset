@@ -6,20 +6,35 @@
 //! keyboard focus ([`Focus`]); `Tab` / Shift+Tab move it. Keys act on the
 //! focused pane only ([`App::view`]).
 //!
-//! - The sidebar lists a fixed "Library" row (value 0), then the saved
-//!   playlists (value `i + 1` for `playlists[i]`). The "Library" row is
-//!   never filtered out, so the sidebar is never empty. `Enter` shows the
-//!   selected entry in the main pane and focuses it.
-//! - The main pane shows the open playlist if there is one, else the
-//!   library ([`MainView`]). Only `Enter` on a sidebar playlist opens one; it
-//!   is closed by `Enter` on "Library", by deleting it, and when its file
+//! - The sidebar lists [`FIXED_ROWS`] fixed rows, "Library", "Artists" and
+//!   "Albums" (values 0, 1, 2), then the saved playlists (value
+//!   `i + FIXED_ROWS` for `playlists[i]`). Values are only ever turned into
+//!   entries through [`SidebarEntry`]. The fixed rows are never filtered
+//!   out, so the sidebar is never empty. `Enter` shows the selected entry in
+//!   the main pane and focuses it.
+//! - The main pane shows the open playlist, a browse stack, or else the
+//!   library ([`MainView`]). `open` (the playlist) and `browse` are never
+//!   both set; only `show_library`, `show_playlist` and `show_browse` set
+//!   them. Only `Enter` on a sidebar playlist opens a playlist; it is closed
+//!   by `Enter` on another sidebar entry, by deleting it, and when its file
 //!   disappears.
+//! - "Artists" and "Albums" each have a browse stack of levels
+//!   ([`BrowseKind`]) over the [`Catalog`] built once in [`App::new`]: the
+//!   artist list → an artist's albums ("All tracks" first) → tracks, and the
+//!   album list → tracks. `Enter` on a group row pushes a level; `Backspace`
+//!   pops one (never the bottom level), and `Esc` does too once the filter
+//!   is cleared; at the bottom level `Esc` focuses the sidebar on the entry.
+//!   The stacks are kept while something else is shown, so `Enter` on
+//!   "Artists" comes back to the same place. Catalog indices are only valid
+//!   for the run and are never saved.
 //!
-//! Each list (library, sidebar, open playlist) keeps its own filter and
-//! selection. The playlists are listed in [`App::new`], so the sidebar is
-//! filled on the first frame, again whenever the sidebar gains focus, and
-//! after rename and delete. The app's own edits (add, create, `d`/`J`/`K`,
-//! reloads) update the edited playlist's sidebar entry in place.
+//! Each list (library, sidebar, open playlist, every browse level) keeps
+//! its own filter and selection; going back leaves the parent level as it
+//! was, with the opened entry selected. The playlists are listed in
+//! [`App::new`], so the sidebar is filled on the first frame, again whenever
+//! the sidebar gains focus, and after rename and delete. The app's own
+//! edits (add, create, `d`/`J`/`K`, reloads) update the edited playlist's
+//! sidebar entry in place.
 //!
 //! `?` opens the help overlay ([`Mode::Help`]). Its scroll is bounded by the
 //! number of help lines the last frame showed ([`App::set_help_rows`], fed
@@ -80,6 +95,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::browse::Catalog;
 use crate::keys;
 use crate::library::Track;
 use crate::lyrics::{self, Lyrics};
@@ -196,10 +212,15 @@ impl NameInput {
 pub enum View {
     /// The main pane, showing the library.
     Library,
-    /// The sidebar ("Library" and the playlists).
+    /// The sidebar (its fixed rows and the playlists).
     Playlists,
     /// The main pane, showing the open playlist.
     Playlist,
+    /// The main pane, browsing a list of artists or albums (an artist's
+    /// albums included, with its "All tracks" row).
+    Groups,
+    /// The main pane, browsing the tracks of an album or of an artist.
+    Tracks,
 }
 
 /// The pane with keyboard focus.
@@ -215,14 +236,104 @@ pub enum MainView {
     Library,
     /// The open playlist ([`App::open_playlist`]).
     Playlist,
+    /// A browse level ([`App::browse_tracks`] holds a track level's tracks).
+    Browse(BrowseKind),
+}
+
+/// Which sidebar entry a browse stack starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseRoot {
+    /// The artist list and what is opened from it.
+    Artists,
+    /// The album list and what is opened from it.
+    Albums,
+}
+
+/// One browse level, by catalog index ([`App::catalog`]; valid for the run
+/// only). Rows of each level's list ([`App::main_list`]) are:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseKind {
+    /// Every artist: rows are artist indices.
+    Artists,
+    /// An artist's albums: row value 0 is "All tracks" ([`ALL_TRACKS_VALUE`]),
+    /// `i + 1` is the artist's `albums()[i]` (see [`artist_album_of_value`]).
+    ArtistAlbums(usize),
+    /// Every album: rows are album indices.
+    Albums,
+    /// An album's tracks: rows are positions in [`App::browse_tracks`].
+    Album(usize),
+    /// All of an artist's tracks, album by album: rows are positions in
+    /// [`App::browse_tracks`].
+    ArtistTracks(usize),
+}
+
+impl BrowseKind {
+    /// Whether the level lists tracks (else artists or albums).
+    #[must_use]
+    pub const fn is_tracks(self) -> bool {
+        matches!(self, Self::Album(_) | Self::ArtistTracks(_))
+    }
+}
+
+/// Row value of "All tracks" in an artist's albums.
+pub const ALL_TRACKS_VALUE: usize = 0;
+
+/// The position in an artist's `albums()` of row value `value` of its
+/// albums list; `None` for "All tracks".
+#[must_use]
+pub const fn artist_album_of_value(value: usize) -> Option<usize> {
+    value.checked_sub(ALL_TRACKS_VALUE + 1)
+}
+
+/// How many fixed rows the sidebar has above the playlists: "Library",
+/// "Artists" and "Albums" (D3 of add-artist-album-browsing).
+pub const FIXED_ROWS: usize = 3;
+
+/// One sidebar row, named from its value ([`App::sidebar_list`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarEntry {
+    /// Value 0.
+    Library,
+    /// Value 1.
+    Artists,
+    /// Value 2.
+    Albums,
+    /// Value `i + FIXED_ROWS`: [`App::playlists`]`[i]`.
+    Playlist(usize),
+}
+
+impl SidebarEntry {
+    /// The entry with sidebar value `value`. The only place that maps a
+    /// value to a playlist index.
+    #[must_use]
+    pub const fn of_value(value: usize) -> Self {
+        match value {
+            0 => Self::Library,
+            1 => Self::Artists,
+            2 => Self::Albums,
+            _ => Self::Playlist(value - FIXED_ROWS),
+        }
+    }
+
+    /// The sidebar value of this entry; the only place that maps a playlist
+    /// index to a value. `None` for an index too large to have one.
+    #[must_use]
+    pub const fn value(self) -> Option<usize> {
+        match self {
+            Self::Library => Some(0),
+            Self::Artists => Some(1),
+            Self::Albums => Some(2),
+            Self::Playlist(i) => i.checked_add(FIXED_ROWS),
+        }
+    }
 }
 
 /// One list as drawn: its rows, the selected row and its filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListView<'a> {
     /// Values of the rows listed, in order: library indices, sidebar values
-    /// (0 is "Library", `i + 1` is [`App::playlists`]`[i]`), or positions in
-    /// [`OpenPlaylist::items`].
+    /// (see [`SidebarEntry`]), positions in [`OpenPlaylist::items`], or the
+    /// rows of a browse level (see [`BrowseKind`]).
     pub rows: &'a [usize],
     /// Index into `rows` of the selection, if anything is listed.
     pub selected: Option<usize>,
@@ -234,13 +345,24 @@ pub struct ListView<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarPick {
     Library,
+    Artists,
+    Albums,
     Playlist(String),
 }
 
+impl From<BrowseRoot> for SidebarPick {
+    fn from(root: BrowseRoot) -> Self {
+        match root {
+            BrowseRoot::Artists => Self::Artists,
+            BrowseRoot::Albums => Self::Albums,
+        }
+    }
+}
+
 /// Rows, selection and filter of one list. Rows are values naming entries of
-/// the list's full contents: library indices, sidebar values (0 is
-/// "Library", `i + 1` is `playlists[i]`: never index `playlists` with a raw
-/// row value) or positions in the open playlist's items.
+/// the list's full contents: library indices, sidebar values (never index
+/// `playlists` with a raw row value: go through [`SidebarEntry`]), positions
+/// in the open playlist's items, or a browse level's rows ([`BrowseKind`]).
 #[derive(Debug, Clone, Default)]
 struct ListState {
     /// Positions of the rows shown, in list order.
@@ -346,6 +468,108 @@ impl OpenPlaylist {
     }
 }
 
+/// One level of a browse stack: what it lists and its own filter and
+/// selection. Its parent level is never touched while it is shown, so
+/// going back reselects the entry that was opened.
+#[derive(Debug)]
+struct BrowseLevel {
+    kind: BrowseKind,
+    /// A track level's tracks (library indices, in album or artist order):
+    /// the play order's items when it plays. Empty for artist and album
+    /// lists.
+    tracks: Vec<usize>,
+    list: ListState,
+}
+
+impl BrowseLevel {
+    /// `kind` listed whole from `catalog`, first row selected. A track
+    /// level's tracks are copied out of the catalog here, once.
+    fn new(kind: BrowseKind, catalog: &Catalog) -> Self {
+        let tracks = match kind {
+            BrowseKind::Album(b) => catalog.album(b).map(|a| a.tracks().to_vec()),
+            BrowseKind::ArtistTracks(a) => Some(catalog.artist_tracks(a)),
+            BrowseKind::Artists | BrowseKind::ArtistAlbums(_) | BrowseKind::Albums => None,
+        }
+        .unwrap_or_default();
+        let mut level = Self {
+            kind,
+            tracks,
+            list: ListState::default(),
+        };
+        level.list = ListState::all(level.len(catalog));
+        level
+    }
+
+    /// How many entries the level lists unfiltered.
+    fn len(&self, catalog: &Catalog) -> usize {
+        match self.kind {
+            BrowseKind::Artists => catalog.artists().len(),
+            BrowseKind::ArtistAlbums(a) => catalog
+                .artist(a)
+                // Its albums and the "All tracks" row.
+                .map_or(0, |artist| artist.albums().len() + 1),
+            BrowseKind::Albums => catalog.albums().len(),
+            BrowseKind::Album(_) | BrowseKind::ArtistTracks(_) => self.tracks.len(),
+        }
+    }
+
+    /// Recomputes the rows for the query (`keys`: the library's search
+    /// keys): artists by name, albums by title or artist, tracks as in the
+    /// library. "All tracks" always stays. The selection is not moved.
+    fn refilter(&mut self, catalog: &Catalog, keys: &[String]) {
+        let len = self.len(catalog);
+        let tracks = &self.tracks;
+        let album_matches = |b: usize, q: &str| {
+            catalog
+                .album(b)
+                .is_some_and(|al| al.search_key().contains(q))
+        };
+        match self.kind {
+            BrowseKind::Artists => self.list.refilter(len, |a, q| {
+                catalog
+                    .artist(a)
+                    .is_some_and(|artist| artist.search_key().contains(q))
+            }),
+            BrowseKind::ArtistAlbums(a) => {
+                let albums = catalog.artist(a).map_or(&[][..], |artist| artist.albums());
+                self.list.refilter(len, |value, q| {
+                    artist_album_of_value(value)
+                        .is_none_or(|i| albums.get(i).is_some_and(|&b| album_matches(b, q)))
+                });
+            }
+            BrowseKind::Albums => self.list.refilter(len, album_matches),
+            BrowseKind::Album(_) | BrowseKind::ArtistTracks(_) => {
+                self.list.refilter(len, |i, q| {
+                    tracks
+                        .get(i)
+                        .and_then(|&t| keys.get(t))
+                        .is_some_and(|k| k.contains(q))
+                });
+            }
+        }
+    }
+
+    /// The level opened by `Enter` on the selected row, if it opens one.
+    fn child(&self, catalog: &Catalog) -> Option<BrowseKind> {
+        let value = self.list.selected_value()?;
+        match self.kind {
+            BrowseKind::Artists => catalog
+                .artist(value)
+                .map(|_| BrowseKind::ArtistAlbums(value)),
+            BrowseKind::ArtistAlbums(a) => match artist_album_of_value(value) {
+                None => Some(BrowseKind::ArtistTracks(a)),
+                Some(i) => catalog
+                    .artist(a)?
+                    .albums()
+                    .get(i)
+                    .map(|&b| BrowseKind::Album(b)),
+            },
+            BrowseKind::Albums => catalog.album(value).map(|_| BrowseKind::Album(value)),
+            BrowseKind::Album(_) | BrowseKind::ArtistTracks(_) => None,
+        }
+    }
+}
+
 /// Everything the UI shows and the user can change.
 #[derive(Debug)]
 pub struct App<A: Audio> {
@@ -363,10 +587,24 @@ pub struct App<A: Audio> {
     /// The playlists as last listed (and updated by the app's own edits),
     /// sorted by name ignoring case.
     playlists: Vec<PlaylistInfo>,
-    /// The sidebar: value 0 is "Library", `i + 1` is `playlists[i]`.
+    /// The sidebar: values as in [`SidebarEntry`] (the fixed rows, then
+    /// `playlists[i]` at `i + FIXED_ROWS`).
     playlist_list: ListState,
-    /// The playlist shown in the main pane, if any (else the library is).
+    /// The playlist shown in the main pane, if any. Never set together with
+    /// `browse`; with neither, the library is shown. Only
+    /// [`App::show_library`], [`App::show_playlist`] and [`App::show_browse`]
+    /// set the two.
     open: Option<OpenPlaylist>,
+    /// The artists and albums, grouped once from the tracks.
+    catalog: Catalog,
+    /// The browse stack shown in the main pane, if any.
+    browse: Option<BrowseRoot>,
+    /// What "Artists" shows: its bottom level is always the artist list, and
+    /// it is kept while something else is shown, so `Enter` on "Artists"
+    /// comes back to the same place.
+    artists_nav: Vec<BrowseLevel>,
+    /// What "Albums" shows, like `artists_nav`: the album list at the bottom.
+    albums_nav: Vec<BrowseLevel>,
     mode: Mode,
     /// Transient message and when it expires.
     status: Option<(Notice, Instant)>,
@@ -636,6 +874,9 @@ impl<A: Audio> App<A> {
             .map(|t| format!("{}\n{}\n{}", t.title, t.artist, t.album).to_lowercase())
             .collect();
         let library = ListState::all(tracks.len());
+        let catalog = Catalog::build(&tracks);
+        let artists_nav = vec![BrowseLevel::new(BrowseKind::Artists, &catalog)];
+        let albums_nav = vec![BrowseLevel::new(BrowseKind::Albums, &catalog)];
         let mut app = Self {
             playback: Playback::new(tracks, audio),
             store,
@@ -647,6 +888,10 @@ impl<A: Audio> App<A> {
             playlists: Vec::new(),
             playlist_list: ListState::default(),
             open: None,
+            catalog,
+            browse: None,
+            artists_nav,
+            albums_nav,
             mode: Mode::Normal,
             status: None,
             pending: notice,
@@ -680,11 +925,13 @@ impl<A: Audio> App<A> {
 
     /// Which list keys act on: the focused pane, and what it shows.
     #[must_use]
-    pub const fn view(&self) -> View {
-        match (self.focus, &self.open) {
+    pub fn view(&self) -> View {
+        match (self.focus, self.main_view()) {
             (Focus::Sidebar, _) => View::Playlists,
-            (Focus::Main, None) => View::Library,
-            (Focus::Main, Some(_)) => View::Playlist,
+            (Focus::Main, MainView::Library) => View::Library,
+            (Focus::Main, MainView::Playlist) => View::Playlist,
+            (Focus::Main, MainView::Browse(kind)) if kind.is_tracks() => View::Tracks,
+            (Focus::Main, MainView::Browse(_)) => View::Groups,
         }
     }
 
@@ -696,31 +943,83 @@ impl<A: Audio> App<A> {
 
     /// What the main pane shows, whichever pane has focus.
     #[must_use]
-    pub const fn main_view(&self) -> MainView {
+    pub fn main_view(&self) -> MainView {
+        debug_assert!(
+            self.open.is_none() || self.browse.is_none(),
+            "a playlist and a browse level are never both shown"
+        );
         if self.open.is_some() {
             MainView::Playlist
+        } else if let Some(level) = self.browse_level() {
+            MainView::Browse(level.kind)
         } else {
             MainView::Library
         }
     }
 
-    /// The sidebar list: value 0 is "Library", `i + 1` is
-    /// [`App::playlists`]`[i]`.
+    /// The artists and albums of the library, for the browse levels.
+    #[must_use]
+    pub const fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// How many levels deep the shown browse stack is: 1 on the artist or
+    /// album list, 0 when nothing is browsed.
+    #[must_use]
+    pub fn browse_depth(&self) -> usize {
+        self.browse_nav().map_or(0, Vec::len)
+    }
+
+    /// The tracks (library indices, in album or artist order) of the shown
+    /// browse level when it lists tracks; empty otherwise. Its rows
+    /// ([`App::main_list`]) are positions in it.
+    #[must_use]
+    pub fn browse_tracks(&self) -> &[usize] {
+        self.browse_level().map_or(&[], |level| &level.tracks)
+    }
+
+    /// The browse stack shown in the main pane, if any.
+    fn browse_nav(&self) -> Option<&Vec<BrowseLevel>> {
+        match self.browse? {
+            BrowseRoot::Artists => Some(&self.artists_nav),
+            BrowseRoot::Albums => Some(&self.albums_nav),
+        }
+    }
+
+    /// The browse level shown in the main pane, if any: the top of its stack.
+    fn browse_level(&self) -> Option<&BrowseLevel> {
+        self.browse_nav()?.last()
+    }
+
+    /// The sidebar list: values as in [`SidebarEntry`].
     #[must_use]
     pub fn sidebar_list(&self) -> ListView<'_> {
         self.playlist_list.view()
     }
 
-    /// The main pane's list: library indices, or positions in
-    /// [`OpenPlaylist::items`] when a playlist is shown.
+    /// The main pane's list: library indices, positions in
+    /// [`OpenPlaylist::items`] when a playlist is shown, or a browse level's
+    /// rows ([`BrowseKind`]).
     #[must_use]
     pub fn main_list(&self) -> ListView<'_> {
-        self.open.as_ref().map_or(&self.library, |o| &o.list).view()
+        self.main_list_state().view()
+    }
+
+    /// The list state of what the main pane shows.
+    fn main_list_state(&self) -> &ListState {
+        if let Some(open) = &self.open {
+            &open.list
+        } else if let Some(level) = self.browse_level() {
+            &level.list
+        } else {
+            &self.library
+        }
     }
 
     /// The listed rows of the focused list: library indices in the library,
-    /// sidebar values in the sidebar (see [`App::sidebar_list`]), and
-    /// positions in [`OpenPlaylist::items`] in an open playlist.
+    /// sidebar values in the sidebar (see [`App::sidebar_list`]), positions
+    /// in [`OpenPlaylist::items`] in an open playlist, and a browse level's
+    /// rows when browsing (see [`BrowseKind`]).
     #[must_use]
     #[cfg_attr(not(test), expect(dead_code, reason = "used by key-handling tests"))]
     pub fn visible(&self) -> &[usize] {
@@ -734,16 +1033,20 @@ impl<A: Audio> App<A> {
         self.list().selected_row()
     }
 
-    /// Library index of the selected track, in the library or an open playlist.
+    /// Library index of the selected track, in the library, an open
+    /// playlist or a browsed track list.
     #[must_use]
     pub fn selected_track(&self) -> Option<usize> {
         match self.view() {
             View::Library => self.library.selected_value(),
-            View::Playlists => None,
+            View::Playlists | View::Groups => None,
             View::Playlist => self
                 .open
                 .as_ref()
                 .and_then(|o| o.items.get(o.list.selected_value()?).copied()),
+            View::Tracks => self
+                .browse_level()
+                .and_then(|level| level.tracks.get(level.list.selected_value()?).copied()),
         }
     }
 
@@ -759,24 +1062,27 @@ impl<A: Audio> App<A> {
         &self.playlists
     }
 
-    /// The playlist selected in the sidebar; `None` on the "Library" row.
+    /// The playlist selected in the sidebar; `None` on a fixed row.
     #[must_use]
     pub fn selected_playlist(&self) -> Option<&PlaylistInfo> {
         let value = self.playlist_list.selected_value()?;
-        self.playlists.get(value.checked_sub(1)?)
+        match SidebarEntry::of_value(value) {
+            SidebarEntry::Playlist(i) => self.playlists.get(i),
+            SidebarEntry::Library | SidebarEntry::Artists | SidebarEntry::Albums => None,
+        }
     }
 
-    /// The sidebar value of the entry that is the play order (0 for
-    /// "Library"), while a track is loaded. `None` before anything was
-    /// played, and while a deleted playlist plays on (no entry is its order).
+    /// The sidebar value of the entry that is the play order (see
+    /// [`SidebarEntry`]), while a track is loaded. `None` before anything
+    /// was played, and while a deleted playlist plays on (no entry is its
+    /// order).
     #[must_use]
     pub fn sidebar_playing(&self) -> Option<usize> {
         self.playback.current_track()?;
         match self.playback.source() {
-            // Artist and album sources mark "Library" until the sidebar
-            // lists "Artists" and "Albums" (task 5.1 of
-            // add-artist-album-browsing).
-            Source::Library | Source::Artist(_) | Source::Album(_) => Some(0),
+            // Artist and album sources mark "Library" until task 5.1 of
+            // add-artist-album-browsing marks "Artists" and "Albums".
+            Source::Library | Source::Artist(_) | Source::Album(_) => SidebarEntry::Library.value(),
             Source::Playlist(name) => self.sidebar_value_of(name),
             Source::Detached => None,
         }
@@ -784,10 +1090,8 @@ impl<A: Audio> App<A> {
 
     /// The sidebar value of playlist `name`, if it is listed.
     fn sidebar_value_of(&self, name: &str) -> Option<usize> {
-        self.playlists
-            .iter()
-            .position(|info| info.name == name)
-            .map(|i| i + 1)
+        let index = self.playlists.iter().position(|info| info.name == name)?;
+        SidebarEntry::Playlist(index).value()
     }
 
     /// The playlist shown in the main pane, if any.
@@ -1071,16 +1375,65 @@ impl<A: Audio> App<A> {
             KeyCode::Char('l') => self.toggle_lyrics(),
             KeyCode::Char('/') => self.mode = Mode::Search,
             KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
-            KeyCode::Esc => {
-                if !self.query().is_empty() {
-                    self.clear_filter();
-                } else if let (Focus::Main, Some(open)) = (self.focus, &self.open) {
-                    let name = open.name().to_owned();
-                    self.focus_sidebar(Some(&name));
-                }
+            KeyCode::Esc => self.escape(),
+            // Search and the name prompt take Backspace before this.
+            KeyCode::Backspace if self.focus == Focus::Main => {
+                self.browse_back();
             }
             _ => {}
         }
+    }
+
+    /// `Esc` in Normal mode: clears the focused list's filter; else, in the
+    /// main pane, goes back one browse level; else, from a shown playlist or
+    /// the top browse level, focuses the sidebar with that entry selected
+    /// (the main pane keeps showing it).
+    fn escape(&mut self) {
+        if !self.query().is_empty() {
+            self.clear_filter();
+            return;
+        }
+        if self.focus != Focus::Main || self.browse_back() {
+            return;
+        }
+        let pick = match (&self.open, self.browse) {
+            (Some(open), _) => SidebarPick::Playlist(open.name().to_owned()),
+            (None, Some(root)) => root.into(),
+            (None, None) => return,
+        };
+        self.focus_sidebar(Some(pick));
+    }
+
+    /// Goes back one browse level, dropping the shown one with its filter
+    /// and selection; the parent level was never touched, so it shows the
+    /// entry that was opened, selected. Returns whether a level was left:
+    /// the bottom (artist or album) list is never left this way.
+    fn browse_back(&mut self) -> bool {
+        let nav = match self.browse {
+            Some(BrowseRoot::Artists) => &mut self.artists_nav,
+            Some(BrowseRoot::Albums) => &mut self.albums_nav,
+            None => return false,
+        };
+        if nav.len() <= 1 {
+            return false;
+        }
+        nav.pop();
+        true
+    }
+
+    /// `Enter` on an artist, album or "All tracks" row: opens the selected
+    /// entry as a new level on top of the shown one.
+    fn browse_into(&mut self) {
+        let catalog = &self.catalog;
+        let nav = match self.browse {
+            Some(BrowseRoot::Artists) => &mut self.artists_nav,
+            Some(BrowseRoot::Albums) => &mut self.albums_nav,
+            None => return,
+        };
+        let Some(kind) = nav.last().and_then(|level| level.child(catalog)) else {
+            return;
+        };
+        nav.push(BrowseLevel::new(kind, catalog));
     }
 
     /// `v`: turns the visualizer off or on. When the terminal is too short
@@ -1250,66 +1603,115 @@ impl<A: Audio> App<A> {
     }
 
     /// The list state of the focused list.
-    const fn list(&self) -> &ListState {
-        match (self.focus, &self.open) {
-            (Focus::Sidebar, _) => &self.playlist_list,
-            (Focus::Main, None) => &self.library,
-            (Focus::Main, Some(open)) => &open.list,
+    fn list(&self) -> &ListState {
+        match self.focus {
+            Focus::Sidebar => &self.playlist_list,
+            Focus::Main => self.main_list_state(),
         }
     }
 
-    const fn list_mut(&mut self) -> &mut ListState {
-        match (self.focus, &mut self.open) {
-            (Focus::Sidebar, _) => &mut self.playlist_list,
-            (Focus::Main, None) => &mut self.library,
-            (Focus::Main, Some(open)) => &mut open.list,
+    fn list_mut(&mut self) -> &mut ListState {
+        if self.focus == Focus::Sidebar {
+            return &mut self.playlist_list;
+        }
+        if let Some(open) = &mut self.open {
+            return &mut open.list;
+        }
+        let nav = match self.browse {
+            Some(BrowseRoot::Artists) => &mut self.artists_nav,
+            Some(BrowseRoot::Albums) => &mut self.albums_nav,
+            None => return &mut self.library,
+        };
+        match nav.last_mut() {
+            Some(level) => &mut level.list,
+            // A stack is never empty; the library is a harmless fallback.
+            None => &mut self.library,
         }
     }
 
     /// Recomputes the focused list for its query and selects the first
-    /// match: in the sidebar, the first matching playlist rather than the
-    /// "Library" row, which always matches.
+    /// match. With a query, rows that always stay listed are skipped when
+    /// anything else matches: the sidebar's fixed rows (the first matching playlist is
+    /// selected) and an artist's "All tracks" row (the first matching album).
     fn apply_filter(&mut self) {
         self.refilter_current();
-        let first = usize::from(self.focus == Focus::Sidebar && self.playlist_list.rows.len() > 1);
-        self.list_mut().select_row(first);
+        let always = match self.view() {
+            View::Playlists => FIXED_ROWS,
+            View::Groups
+                if matches!(
+                    self.browse_level().map(|level| level.kind),
+                    Some(BrowseKind::ArtistAlbums(_))
+                ) =>
+            {
+                ALL_TRACKS_VALUE + 1
+            }
+            View::Library | View::Playlist | View::Groups | View::Tracks => 0,
+        };
+        // An emptied query is no filter: the top row, not the first match.
+        let skip = if self.query().is_empty() { 0 } else { always };
+        let list = self.list_mut();
+        let first = list.rows.iter().position(|&v| v >= skip).unwrap_or(0);
+        list.select_row(first);
     }
 
     /// Recomputes the rows of the focused list; the selection is not moved.
     fn refilter_current(&mut self) {
+        if self.focus == Focus::Sidebar {
+            self.refilter_sidebar();
+            return;
+        }
         let keys = &self.search_keys;
-        match (self.focus, &mut self.open) {
-            (Focus::Sidebar, _) => self.refilter_sidebar(),
-            (Focus::Main, None) => self
-                .library
-                .refilter(keys.len(), |i, q| keys[i].contains(q)),
-            (Focus::Main, Some(open)) => {
-                let items = &open.items;
-                open.list.refilter(items.len(), |i, q| {
-                    keys.get(items[i]).is_some_and(|k| k.contains(q))
-                });
+        if let Some(open) = &mut self.open {
+            let items = &open.items;
+            open.list.refilter(items.len(), |i, q| {
+                keys.get(items[i]).is_some_and(|k| k.contains(q))
+            });
+            return;
+        }
+        let catalog = &self.catalog;
+        let level = match self.browse {
+            Some(BrowseRoot::Artists) => self.artists_nav.last_mut(),
+            Some(BrowseRoot::Albums) => self.albums_nav.last_mut(),
+            None => {
+                self.library
+                    .refilter(keys.len(), |i, q| keys[i].contains(q));
+                return;
             }
+        };
+        if let Some(level) = level {
+            level.refilter(catalog, keys);
         }
     }
 
-    /// Recomputes the sidebar rows for its query; "Library" (value 0)
-    /// always stays. The selection is not moved.
+    /// Recomputes the sidebar rows for its query; the fixed rows always
+    /// stay. The selection is not moved.
     fn refilter_sidebar(&mut self) {
         let infos = &self.playlists;
-        self.playlist_list.refilter(infos.len() + 1, |value, q| {
-            value
-                .checked_sub(1)
-                .and_then(|i| infos.get(i))
-                .is_none_or(|info| info.name.to_lowercase().contains(q))
-        });
+        self.playlist_list
+            .refilter(
+                infos.len() + FIXED_ROWS,
+                |value, q| match SidebarEntry::of_value(value) {
+                    SidebarEntry::Playlist(i) => infos
+                        .get(i)
+                        .is_none_or(|info| info.name.to_lowercase().contains(q)),
+                    SidebarEntry::Library | SidebarEntry::Artists | SidebarEntry::Albums => true,
+                },
+            );
     }
 
     /// Lists the whole focused list again, keeping the selected entry selected.
     fn clear_filter(&mut self) {
-        let len = match (self.focus, &self.open) {
-            (Focus::Sidebar, _) => self.playlists.len() + 1,
-            (Focus::Main, None) => self.search_keys.len(),
-            (Focus::Main, Some(open)) => open.items.len(),
+        let len = match self.focus {
+            Focus::Sidebar => self.playlists.len() + FIXED_ROWS,
+            Focus::Main => {
+                if let Some(open) = &self.open {
+                    open.items.len()
+                } else if let Some(level) = self.browse_level() {
+                    level.len(&self.catalog)
+                } else {
+                    self.search_keys.len()
+                }
+            }
         };
         self.list_mut().clear_filter(len);
     }
@@ -1328,6 +1730,10 @@ impl<A: Audio> App<A> {
                 }
             }
             View::Playlists => self.show_selected(),
+            View::Groups => self.browse_into(),
+            // Playing a browsed track comes with task 5.1 of
+            // add-artist-album-browsing.
+            View::Tracks => {}
             View::Playlist => {
                 let Some(open) = &self.open else {
                     return;
@@ -1345,20 +1751,31 @@ impl<A: Audio> App<A> {
         }
     }
 
-    /// `Enter` in the sidebar: "Library" shows the library; a playlist is
-    /// opened (or, if already shown, reloaded only if its file changed, so
-    /// it keeps its filter and selection). The main pane gets the focus,
-    /// unless the playlist could not be read: then focus and the main pane
-    /// stay as they were.
+    /// `Enter` in the sidebar: "Library" shows the library, "Artists" and
+    /// "Albums" their browse stack as it was left; a playlist is opened (or,
+    /// if already shown, reloaded only if its file changed, so it keeps its
+    /// filter and selection). The main pane gets the focus, unless the
+    /// playlist could not be read: then focus and the main pane stay as they
+    /// were.
     fn show_selected(&mut self) {
         let Some(value) = self.playlist_list.selected_value() else {
             return;
         };
-        let Some(index) = value.checked_sub(1) else {
-            // "Library".
-            self.open = None;
-            self.focus = Focus::Main;
-            return;
+        let index = match SidebarEntry::of_value(value) {
+            SidebarEntry::Library => {
+                self.show_library();
+                self.focus = Focus::Main;
+                return;
+            }
+            SidebarEntry::Artists => {
+                self.show_browse(BrowseRoot::Artists);
+                return;
+            }
+            SidebarEntry::Albums => {
+                self.show_browse(BrowseRoot::Albums);
+                return;
+            }
+            SidebarEntry::Playlist(index) => index,
         };
         let Some(info) = self.playlists.get(index) else {
             return;
@@ -1375,10 +1792,32 @@ impl<A: Audio> App<A> {
         }
     }
 
+    /// Shows the library in the main pane, closing a shown playlist or
+    /// browse stack (the stacks themselves are kept). Focus is not moved.
+    fn show_library(&mut self) {
+        self.open = None;
+        self.browse = None;
+    }
+
+    /// Shows `open` in the main pane in place of what it showed. Focus is
+    /// not moved.
+    fn show_playlist(&mut self, open: OpenPlaylist) {
+        self.browse = None;
+        self.open = Some(open);
+    }
+
+    /// Shows the browse stack of `root` as it was left and focuses the main
+    /// pane, closing a shown playlist.
+    fn show_browse(&mut self, root: BrowseRoot) {
+        self.open = None;
+        self.browse = Some(root);
+        self.focus = Focus::Main;
+    }
+
     /// Moves focus to the sidebar and lists the playlists again, keeping
-    /// the sidebar selection unless `select` names a listed playlist (see
+    /// the sidebar selection unless `select` is listed (see
     /// [`Self::refresh_playlists`]).
-    fn focus_sidebar(&mut self, select: Option<&str>) {
+    fn focus_sidebar(&mut self, select: Option<SidebarPick>) {
         self.focus = Focus::Sidebar;
         self.refresh_playlists(select);
     }
@@ -1393,30 +1832,38 @@ impl<A: Audio> App<A> {
 
     /// The sidebar entry selected now.
     fn sidebar_pick(&self) -> Option<SidebarPick> {
-        match self.playlist_list.selected_value()? {
-            0 => Some(SidebarPick::Library),
-            _ => self
+        match SidebarEntry::of_value(self.playlist_list.selected_value()?) {
+            SidebarEntry::Library => Some(SidebarPick::Library),
+            SidebarEntry::Artists => Some(SidebarPick::Artists),
+            SidebarEntry::Albums => Some(SidebarPick::Albums),
+            SidebarEntry::Playlist(_) => self
                 .selected_playlist()
                 .map(|info| SidebarPick::Playlist(info.name.clone())),
+        }
+    }
+
+    /// The sidebar value of `pick`, if it is listed (fixed rows always are).
+    fn pick_value(&self, pick: &SidebarPick) -> Option<usize> {
+        match pick {
+            SidebarPick::Library => SidebarEntry::Library.value(),
+            SidebarPick::Artists => SidebarEntry::Artists.value(),
+            SidebarPick::Albums => SidebarEntry::Albums.value(),
+            SidebarPick::Playlist(name) => self.sidebar_value_of(name),
         }
     }
 
     /// Selects `pick` in the sidebar if it is listed, else keeps the
     /// selected row (clamped).
     fn restore_sidebar(&mut self, pick: Option<SidebarPick>) {
-        let value = match pick {
-            Some(SidebarPick::Library) => Some(0),
-            Some(SidebarPick::Playlist(name)) => self.sidebar_value_of(&name),
-            None => None,
-        };
+        let value = pick.and_then(|pick| self.pick_value(&pick));
         self.playlist_list.select_value(value);
     }
 
     /// Lists the playlists again, keeping the sidebar filter and the
-    /// selected entry, or selecting playlist `select` if given and listed.
+    /// selected entry, or selecting entry `select` if given and listed.
     /// When the sidebar filter hides `select`, the filter is cleared, so
-    /// the selection never lands on another playlist instead.
-    fn refresh_playlists(&mut self, select: Option<&str>) {
+    /// the selection never lands on another entry instead.
+    fn refresh_playlists(&mut self, select: Option<SidebarPick>) {
         let keep = self.sidebar_pick();
         match self.store.list(self.resolver()) {
             Ok(infos) => self.playlists = infos,
@@ -1426,16 +1873,14 @@ impl<A: Audio> App<A> {
             }
         }
         self.refilter_sidebar();
-        let listed = select.filter(|name| self.sidebar_value_of(name).is_some());
-        if let Some(value) = listed.and_then(|name| self.sidebar_value_of(name))
+        let listed = select.filter(|pick| self.pick_value(pick).is_some());
+        if let Some(value) = listed.as_ref().and_then(|pick| self.pick_value(pick))
             && !self.playlist_list.rows.contains(&value)
         {
             self.playlist_list.query.clear();
             self.refilter_sidebar();
         }
-        self.restore_sidebar(
-            listed.map_or(keep, |name| Some(SidebarPick::Playlist(name.to_owned()))),
-        );
+        self.restore_sidebar(listed.or(keep));
     }
 
     /// Writes the sidebar entry of `playlist`, just saved or read by the
@@ -1508,7 +1953,7 @@ impl<A: Audio> App<A> {
         let read_only = playlist.editable().err();
         let items = playlist.tracks();
         self.follow_reload(name, &items);
-        self.open = Some(OpenPlaylist {
+        self.show_playlist(OpenPlaylist {
             list: ListState::all(items.len()),
             playlist,
             items,
@@ -1556,7 +2001,7 @@ impl<A: Audio> App<A> {
     /// from it.
     fn playlist_gone(&mut self, name: &str) {
         if self.open.as_ref().is_some_and(|o| o.name() == name) {
-            self.open = None;
+            self.show_library();
         }
         self.playback.playlist_deleted(name);
         self.refresh_playlists(None);
@@ -2243,12 +2688,12 @@ impl<A: Audio> App<A> {
                     match self.store.load(&new, self.resolver()) {
                         Ok(playlist) => self.replace_open(playlist),
                         Err(err) => {
-                            self.open = None;
+                            self.show_library();
                             self.notify(store_error(&new, &err));
                         }
                     }
                 }
-                self.refresh_playlists(Some(&new));
+                self.refresh_playlists(Some(SidebarPick::Playlist(new)));
                 Ok(())
             }
             Err(StoreError::Name(err)) => Err(err.to_string()),
@@ -2279,7 +2724,7 @@ impl<A: Audio> App<A> {
             Ok(()) => {
                 self.playback.playlist_deleted(name);
                 if self.open.as_ref().is_some_and(|o| o.name() == name) {
-                    self.open = None;
+                    self.show_library();
                 }
                 self.refresh_playlists(None);
                 self.notify(Notice::info(format!(
@@ -2927,7 +3372,7 @@ mod playlist_tests {
     #[test]
     fn open_playlists_view_without_folder_writes_nothing() -> Result<()> {
         let mut m = abcd()?;
-        assert_eq!(m.app.sidebar_list().rows, [0], "only \"Library\"");
+        assert_eq!(m.app.sidebar_list().rows, [0, 1, 2], "only the fixed rows");
         m.keys(&[KeyCode::Tab]);
         assert_eq!(m.app.view(), View::Playlists);
         assert_eq!(m.app.playlists(), []);
@@ -3020,15 +3465,17 @@ mod playlist_tests {
             );
         }
 
-        /// Names in the sidebar rows, "Library" included.
+        /// Names in the sidebar rows, the fixed rows included.
         fn sidebar_rows(&self) -> Vec<String> {
             self.app
                 .sidebar_list()
                 .rows
                 .iter()
-                .map(|&v| match v.checked_sub(1) {
-                    None => "Library".to_owned(),
-                    Some(i) => self
+                .map(|&v| match SidebarEntry::of_value(v) {
+                    SidebarEntry::Library => "Library".to_owned(),
+                    SidebarEntry::Artists => "Artists".to_owned(),
+                    SidebarEntry::Albums => "Albums".to_owned(),
+                    SidebarEntry::Playlist(i) => self
                         .app
                         .playlists()
                         .get(i)
@@ -3055,14 +3502,24 @@ mod playlist_tests {
         m.write("Long run", &["B"])?;
         m.write("Running", &["C"])?;
         m.keys(&[KeyCode::Tab]);
-        assert_eq!(m.sidebar_rows(), ["Library", "Gym", "Long run", "Running"]);
+        assert_eq!(
+            m.sidebar_rows(),
+            ["Library", "Artists", "Albums", "Gym", "Long run", "Running"]
+        );
         m.chars("/run");
-        assert_eq!(m.sidebar_rows(), ["Library", "Long run", "Running"]);
+        assert_eq!(
+            m.sidebar_rows(),
+            ["Library", "Artists", "Albums", "Long run", "Running"]
+        );
         assert_eq!(m.selected_playlist_name().as_deref(), Some("Long run"));
         m.chars("ning");
         assert_eq!(m.selected_playlist_name().as_deref(), Some("Running"));
         m.chars("zzz");
-        assert_eq!(m.sidebar_rows(), ["Library"], "never filtered out");
+        assert_eq!(
+            m.sidebar_rows(),
+            ["Library", "Artists", "Albums"],
+            "never filtered out"
+        );
         assert_eq!(m.app.selected(), Some(0));
         Ok(())
     }
@@ -3093,7 +3550,10 @@ mod playlist_tests {
         m.write("Running", &["A"])?;
         m.write("Gym", &["B", "C"])?;
         m.restart(None);
-        assert_eq!(m.sidebar_rows(), ["Library", "Gym", "Running"]);
+        assert_eq!(
+            m.sidebar_rows(),
+            ["Library", "Artists", "Albums", "Gym", "Running"]
+        );
         assert_eq!(m.info("Gym").and_then(|i| i.tracks), Some(2));
         Ok(())
     }
@@ -3103,7 +3563,7 @@ mod playlist_tests {
     fn no_folder_lists_only_library_and_writes_nothing() -> Result<()> {
         let mut m = abcd()?;
         m.restart(None);
-        assert_eq!(m.sidebar_rows(), ["Library"]);
+        assert_eq!(m.sidebar_rows(), ["Library", "Artists", "Albums"]);
         assert_eq!(m.status(), "");
         assert!(!m.dir().exists());
         Ok(())
@@ -3132,7 +3592,7 @@ mod playlist_tests {
         assert!(text.starts_with("Cannot list playlists"), "{text}");
         assert!(text.ends_with("; 3 entries skipped"), "{text}");
         assert_eq!(notice.map(|n| n.level), Some(Level::Error));
-        assert_eq!(m.sidebar_rows(), ["Library"]);
+        assert_eq!(m.sidebar_rows(), ["Library", "Artists", "Albums"]);
         Ok(())
     }
 
@@ -3237,7 +3697,10 @@ mod playlist_tests {
         m.write("Gym", &["A"])?;
         m.write("Running", &["B"])?;
         m.keys(&[KeyCode::Tab]);
-        assert_eq!(m.sidebar_rows(), ["Library", "Gym", "Running"]);
+        assert_eq!(
+            m.sidebar_rows(),
+            ["Library", "Artists", "Albums", "Gym", "Running"]
+        );
         assert_eq!(m.app.main_view(), MainView::Library);
         m.chars("j");
         assert_eq!(m.app.sidebar_list().selected, Some(1));
@@ -6243,6 +6706,17 @@ mod state_tests {
             self.app.open_playlist().map(OpenPlaylist::name)
         }
 
+        /// From the main pane: `Tab`, then `Enter` on the first playlist
+        /// (the row after the sidebar's fixed rows).
+        fn open_first_playlist(&mut self) {
+            self.key(KeyCode::Tab);
+            self.key(KeyCode::Home);
+            for _ in 0..FIXED_ROWS {
+                self.key(KeyCode::Down);
+            }
+            self.key(KeyCode::Enter);
+        }
+
         fn key(&mut self, code: KeyCode) {
             self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
         }
@@ -6450,9 +6924,7 @@ mod state_tests {
         lib.write("Running", &["D", "B", "C"])?;
         let disk = Disk::default();
         lib.start_on(&disk)?;
-        lib.key(KeyCode::Tab);
-        lib.key(KeyCode::Down);
-        lib.key(KeyCode::Enter);
+        lib.open_first_playlist();
         assert_eq!(lib.shown(), Some("Running"));
         lib.key(KeyCode::Down);
         lib.key(KeyCode::Enter);
@@ -6472,7 +6944,7 @@ mod state_tests {
             *lib.app.playback().source(),
             Source::Playlist("Running".to_owned())
         );
-        assert_eq!(lib.app.sidebar_playing(), Some(1));
+        assert_eq!(lib.app.sidebar_playing(), SidebarEntry::Playlist(0).value());
         lib.key(KeyCode::Char('n'));
         assert_eq!(
             lib.current_title().as_deref(),
@@ -6546,9 +7018,7 @@ mod state_tests {
         lib.write("Gym", &["D", "C", "A"])?;
         let disk = Disk::default();
         lib.start_on(&disk)?;
-        lib.key(KeyCode::Tab);
-        lib.key(KeyCode::Down);
-        lib.key(KeyCode::Enter);
+        lib.open_first_playlist();
         lib.key(KeyCode::Down);
         lib.key(KeyCode::Enter);
         assert_eq!(lib.current_title().as_deref(), Some("C"));
@@ -6643,9 +7113,7 @@ mod state_tests {
         let state = tempfile::tempdir()?;
         let file = state.path().join("kasset/state");
         lib.start(Box::new(FsStateStore::new(file.clone(), &lib.root)));
-        lib.key(KeyCode::Tab);
-        lib.key(KeyCode::Down);
-        lib.key(KeyCode::Enter);
+        lib.open_first_playlist();
         assert_eq!(lib.quit(), None);
         let Parsed::Valid(saved) = parse(&fs::read(&file)?) else {
             anyhow::bail!("the saved file does not parse");
@@ -6926,6 +7394,754 @@ mod state_tests {
         disk.set_failing(true);
         let error = lib.quit().context("an error")?;
         assert!(error.starts_with("cannot save state to /state/kasset/state"));
+        Ok(())
+    }
+}
+
+/// Key sequences for browsing by artist and album (tasks 4.1–4.3 of
+/// add-artist-album-browsing).
+#[cfg(test)]
+mod browse_tests {
+    use super::*;
+    use crate::library::sort_tracks;
+    use crate::playlist::FsStore;
+    use crate::test_support::SilentAudio;
+    use anyhow::{Result, bail};
+    use std::fs;
+
+    struct Lib {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        app: App<SilentAudio>,
+    }
+
+    /// `(title, artist, album, number, album artist)` of every track.
+    type Spec<'a> = (&'a str, &'a str, &'a str, u32, Option<&'a str>);
+
+    /// Air with "Moon Safari" (3 tracks) and "Talkie Walkie" (2, listed
+    /// in the wrong order), Björk with "Debut" (2), and the compilation
+    /// "Hits" by "Various Artists" with guests "A" and "B".
+    const MUSIC: &[Spec<'static>] = &[
+        ("Venus", "Air", "Talkie Walkie", 2, None),
+        ("Cherry Blossom Girl", "Air", "Talkie Walkie", 1, None),
+        ("La Femme d'Argent", "Air", "Moon Safari", 1, None),
+        ("Sexy Boy", "Air", "Moon Safari", 2, None),
+        ("Kelly Watch the Stars", "Air", "Moon Safari", 3, None),
+        ("Human Behaviour", "Björk", "Debut", 1, None),
+        ("Crying", "Björk", "Debut", 2, None),
+        ("First Hit", "A", "Hits", 1, Some("Various Artists")),
+        ("Second Hit", "B", "Hits", 2, Some("Various Artists")),
+    ];
+
+    fn lib(specs: &[Spec<'_>]) -> Result<Lib> {
+        let tmp = tempfile::tempdir()?;
+        let root = fs::canonicalize(tmp.path())?;
+        let mut tracks: Vec<Track> = specs
+            .iter()
+            .map(|&(title, artist, album, number, album_artist)| Track {
+                path: root.join(format!("{artist}/{album}/{title}.mp3")),
+                title: title.to_owned(),
+                artist: artist.to_owned(),
+                album: album.to_owned(),
+                number: Some(number),
+                album_artist: album_artist.map(str::to_owned),
+                disc: None,
+                duration: Some(Duration::from_secs(200)),
+            })
+            .collect();
+        sort_tracks(&mut tracks);
+        let app = App::new(
+            tracks,
+            SilentAudio::default(),
+            Box::new(FsStore::new(&root)),
+            root.display().to_string(),
+            None,
+        );
+        Ok(Lib {
+            _tmp: tmp,
+            root,
+            app,
+        })
+    }
+
+    fn music() -> Result<Lib> {
+        lib(MUSIC)
+    }
+
+    impl Lib {
+        fn keys(&mut self, keys: &[KeyCode]) {
+            for &code in keys {
+                self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+        }
+
+        fn chars(&mut self, text: &str) {
+            for c in text.chars() {
+                self.app
+                    .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+        }
+
+        /// Writes playlist `name` listing tracks `(artist, album, title)`.
+        fn write(&self, name: &str, entries: &[(&str, &str, &str)]) -> Result<()> {
+            let dir = self.root.join("Playlists");
+            fs::create_dir_all(&dir)?;
+            let lines: Vec<String> = entries
+                .iter()
+                .map(|(artist, album, title)| format!("../{artist}/{album}/{title}.mp3\n"))
+                .collect();
+            let lines = lines.concat();
+            fs::write(dir.join(format!("{name}.m3u8")), lines)?;
+            Ok(())
+        }
+
+        /// Focuses the sidebar if needed and selects `entry` in it.
+        fn select_in_sidebar(&mut self, entry: SidebarEntry) -> Result<()> {
+            if self.app.focus() == Focus::Main {
+                self.keys(&[KeyCode::Tab]);
+            }
+            let Some(value) = entry.value() else {
+                bail!("{entry:?} has no value");
+            };
+            let Some(row) = self.app.visible().iter().position(|&v| v == value) else {
+                bail!("{entry:?} not listed");
+            };
+            self.keys(&[KeyCode::Home]);
+            for _ in 0..row {
+                self.keys(&[KeyCode::Down]);
+            }
+            Ok(())
+        }
+
+        /// `Enter` on "Artists" (or "Albums") in the sidebar.
+        fn show(&mut self, entry: SidebarEntry) -> Result<()> {
+            self.select_in_sidebar(entry)?;
+            self.keys(&[KeyCode::Enter]);
+            Ok(())
+        }
+
+        /// The names of the main pane's rows as listed: artist names, album
+        /// titles (an artist's albums with "All tracks" first), or track
+        /// titles.
+        fn names(&self) -> Vec<String> {
+            let catalog = self.app.catalog();
+            let list = self.app.main_list();
+            let tracks = self.app.playback().tracks();
+            let browsed = self.app.browse_tracks();
+            list.rows
+                .iter()
+                .map(|&value| match self.app.main_view() {
+                    MainView::Browse(BrowseKind::Artists) => {
+                        catalog.artist(value).map(|a| a.name().to_owned())
+                    }
+                    MainView::Browse(BrowseKind::ArtistAlbums(a)) => {
+                        match artist_album_of_value(value) {
+                            None => Some("All tracks".to_owned()),
+                            Some(i) => catalog
+                                .artist(a)
+                                .and_then(|artist| artist.albums().get(i))
+                                .and_then(|&b| catalog.album(b))
+                                .map(|album| album.title().to_owned()),
+                        }
+                    }
+                    MainView::Browse(BrowseKind::Albums) => {
+                        catalog.album(value).map(|album| album.title().to_owned())
+                    }
+                    MainView::Browse(BrowseKind::Album(_) | BrowseKind::ArtistTracks(_)) => browsed
+                        .get(value)
+                        .and_then(|&t| tracks.get(t))
+                        .map(|t| t.title.clone()),
+                    MainView::Library => tracks.get(value).map(|t| t.title.clone()),
+                    MainView::Playlist => None,
+                })
+                .map(|name| name.unwrap_or_else(|| "<missing>".to_owned()))
+                .collect()
+        }
+
+        /// The name of the selected row of the main pane.
+        fn selected_name(&self) -> Option<String> {
+            let row = self.app.main_list().selected?;
+            self.names().get(row).cloned()
+        }
+
+        /// Selects the main pane's row named `name` (focused, no filter
+        /// needed: rows as listed).
+        fn select(&mut self, name: &str) -> Result<()> {
+            let Some(row) = self.names().iter().position(|n| n == name) else {
+                bail!("{name} not listed in {:?}", self.names());
+            };
+            self.keys(&[KeyCode::Home]);
+            for _ in 0..row {
+                self.keys(&[KeyCode::Down]);
+            }
+            Ok(())
+        }
+
+        /// Selects `name` in the main pane and opens it with `Enter`.
+        fn open(&mut self, name: &str) -> Result<()> {
+            self.select(name)?;
+            self.keys(&[KeyCode::Enter]);
+            Ok(())
+        }
+
+        fn album(&self, title: &str) -> Option<usize> {
+            self.app
+                .catalog()
+                .albums()
+                .iter()
+                .position(|album| album.title() == title)
+        }
+
+        fn artist(&self, name: &str) -> Option<usize> {
+            self.app
+                .catalog()
+                .artists()
+                .iter()
+                .position(|artist| artist.name() == name)
+        }
+    }
+
+    // --- Sidebar fixed rows (task 4.1) ---
+
+    #[test]
+    fn fixed_rows_come_first_and_playlists_after_them() -> Result<()> {
+        let mut m = music()?;
+        m.write("Gym", &[("Air", "Moon Safari", "Sexy Boy")])?;
+        m.keys(&[KeyCode::Tab]);
+        assert_eq!(m.app.visible(), [0, 1, 2, 3]);
+        let entries: Vec<SidebarEntry> = m
+            .app
+            .visible()
+            .iter()
+            .map(|&v| SidebarEntry::of_value(v))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                SidebarEntry::Library,
+                SidebarEntry::Artists,
+                SidebarEntry::Albums,
+                SidebarEntry::Playlist(0)
+            ]
+        );
+        for row in 0..FIXED_ROWS {
+            m.keys(&[KeyCode::Home]);
+            for _ in 0..row {
+                m.keys(&[KeyCode::Down]);
+            }
+            assert_eq!(m.app.selected_playlist(), None, "row {row}");
+        }
+        m.keys(&[KeyCode::End]);
+        assert_eq!(
+            m.app.selected_playlist().map(|p| p.name.as_str()),
+            Some("Gym")
+        );
+        // `R` and `D` do nothing on the fixed rows.
+        m.select_in_sidebar(SidebarEntry::Artists)?;
+        m.app
+            .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        m.app
+            .handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_entry_values_round_trip() {
+        for value in 0..10 {
+            assert_eq!(SidebarEntry::of_value(value).value(), Some(value));
+        }
+        assert_eq!(SidebarEntry::Playlist(usize::MAX).value(), None);
+        assert_eq!(
+            SidebarEntry::of_value(usize::MAX),
+            SidebarEntry::Playlist(usize::MAX - FIXED_ROWS)
+        );
+    }
+
+    #[test]
+    fn sidebar_filter_with_no_playlist_match_keeps_the_fixed_rows() -> Result<()> {
+        let mut m = music()?;
+        m.write("Gym", &[])?;
+        m.keys(&[KeyCode::Tab]);
+        m.chars("/zzz");
+        assert_eq!(m.app.visible(), [0, 1, 2]);
+        assert_eq!(m.app.selected(), Some(0));
+        m.keys(&[KeyCode::Esc, KeyCode::Esc]);
+        assert_eq!(m.app.visible(), [0, 1, 2, 3]);
+        // A match selects the first matching playlist, not a fixed row.
+        m.chars("/gy");
+        assert_eq!(m.app.visible(), [0, 1, 2, 3]);
+        assert_eq!(
+            m.app.selected_playlist().map(|p| p.name.as_str()),
+            Some("Gym")
+        );
+        Ok(())
+    }
+
+    // --- Browse state (task 4.2) ---
+
+    /// Spec *Open the artist list*.
+    #[test]
+    fn open_the_artist_list() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.app.view(), View::Groups);
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Artists));
+        assert_eq!(m.app.browse_depth(), 1);
+        assert_eq!(m.names(), ["Air", "Björk", "Various Artists"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Air"));
+        assert_eq!(m.app.selected_track(), None);
+
+        m.show(SidebarEntry::Albums)?;
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Albums));
+        assert_eq!(m.names(), ["Moon Safari", "Talkie Walkie", "Debut", "Hits"]);
+        Ok(())
+    }
+
+    /// Spec *Open an artist* and *Album tracks* (album order).
+    #[test]
+    fn open_an_artist_then_an_album() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.open("Air")?;
+        let air = m.artist("Air");
+        assert_eq!(
+            Some(m.app.main_view()),
+            air.map(|a| MainView::Browse(BrowseKind::ArtistAlbums(a)))
+        );
+        assert_eq!(m.app.view(), View::Groups);
+        assert_eq!(m.app.browse_depth(), 2);
+        assert_eq!(m.names(), ["All tracks", "Moon Safari", "Talkie Walkie"]);
+        assert_eq!(m.selected_name().as_deref(), Some("All tracks"));
+
+        m.open("Talkie Walkie")?;
+        assert_eq!(
+            Some(m.app.main_view()),
+            m.album("Talkie Walkie")
+                .map(|b| MainView::Browse(BrowseKind::Album(b)))
+        );
+        assert_eq!(m.app.view(), View::Tracks);
+        assert_eq!(m.app.browse_depth(), 3);
+        assert_eq!(m.names(), ["Cherry Blossom Girl", "Venus"], "by number");
+        let venus = m
+            .app
+            .playback()
+            .tracks()
+            .iter()
+            .position(|t| t.title == "Venus");
+        m.keys(&[KeyCode::Down]);
+        assert_eq!(m.app.selected_track(), venus);
+        // A track level opens nothing.
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.app.browse_depth(), 3);
+        Ok(())
+    }
+
+    /// Spec *All tracks*.
+    #[test]
+    fn all_tracks_lists_the_artist_album_by_album() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.open("Air")?;
+        m.open("All tracks")?;
+        assert_eq!(
+            Some(m.app.main_view()),
+            m.artist("Air")
+                .map(|a| MainView::Browse(BrowseKind::ArtistTracks(a)))
+        );
+        assert_eq!(m.app.view(), View::Tracks);
+        assert_eq!(
+            m.names(),
+            [
+                "La Femme d'Argent",
+                "Sexy Boy",
+                "Kelly Watch the Stars",
+                "Cherry Blossom Girl",
+                "Venus"
+            ]
+        );
+        Ok(())
+    }
+
+    /// Spec *Back to the same place*: the stack and each level's selection
+    /// survive showing something else.
+    #[test]
+    fn back_to_the_same_place() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.open("Air")?;
+        m.open("Moon Safari")?;
+        m.select("Sexy Boy")?;
+        m.show(SidebarEntry::Library)?;
+        assert_eq!(m.app.main_view(), MainView::Library);
+        m.show(SidebarEntry::Albums)?;
+        m.select("Debut")?;
+        m.show(SidebarEntry::Artists)?;
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(
+            Some(m.app.main_view()),
+            m.album("Moon Safari")
+                .map(|b| MainView::Browse(BrowseKind::Album(b)))
+        );
+        assert_eq!(m.selected_name().as_deref(), Some("Sexy Boy"));
+        m.show(SidebarEntry::Albums)?;
+        assert_eq!(m.selected_name().as_deref(), Some("Debut"));
+
+        // `Enter` on "Artists" while it is shown only focuses the main pane.
+        m.show(SidebarEntry::Artists)?;
+        m.show(SidebarEntry::Artists)?;
+        assert_eq!(m.app.browse_depth(), 3);
+        assert_eq!(m.selected_name().as_deref(), Some("Sexy Boy"));
+        Ok(())
+    }
+
+    /// Spec *Library after browsing*.
+    #[test]
+    fn library_after_browsing() -> Result<()> {
+        let mut m = music()?;
+        m.chars("/air");
+        m.keys(&[KeyCode::Enter, KeyCode::Down]);
+        let before = format!("{:?}", m.app.main_list());
+        m.show(SidebarEntry::Albums)?;
+        m.open("Moon Safari")?;
+        m.show(SidebarEntry::Library)?;
+        assert_eq!(m.app.main_view(), MainView::Library);
+        assert_eq!(m.app.view(), View::Library);
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.app.browse_depth(), 0);
+        assert_eq!(format!("{:?}", m.app.main_list()), before, "kept as left");
+        Ok(())
+    }
+
+    /// Spec *Playlist after browsing*, and opening a playlist then "Albums"
+    /// closes the playlist.
+    #[test]
+    fn playlists_and_browsing_replace_each_other() -> Result<()> {
+        let mut m = music()?;
+        m.write("Gym", &[("Air", "Moon Safari", "Sexy Boy")])?;
+        m.show(SidebarEntry::Artists)?;
+        m.show(SidebarEntry::Playlist(0))?;
+        assert_eq!(m.app.main_view(), MainView::Playlist);
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.app.open_playlist().map(OpenPlaylist::name), Some("Gym"));
+        assert_eq!(m.app.browse_depth(), 0);
+
+        m.show(SidebarEntry::Albums)?;
+        assert!(m.app.open_playlist().is_none());
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Albums));
+        assert_eq!(m.app.focus(), Focus::Main);
+        // Tab and back keeps the album list (no playlist to check).
+        m.keys(&[KeyCode::Tab, KeyCode::Tab]);
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Albums));
+        Ok(())
+    }
+
+    /// Spec *Empty library*.
+    #[test]
+    fn empty_library_browses_nothing_harmlessly() -> Result<()> {
+        let mut m = lib(&[])?;
+        for entry in [SidebarEntry::Artists, SidebarEntry::Albums] {
+            m.show(entry)?;
+            assert_eq!(m.app.view(), View::Groups);
+            assert_eq!(m.app.visible(), [] as [usize; 0]);
+            assert_eq!(m.app.selected(), None);
+            m.keys(&[
+                KeyCode::Enter,
+                KeyCode::Down,
+                KeyCode::End,
+                KeyCode::PageDown,
+                KeyCode::Char('j'),
+                KeyCode::Char('G'),
+                KeyCode::Char('a'),
+                KeyCode::Char('A'),
+                KeyCode::Backspace,
+                KeyCode::Enter,
+            ]);
+            assert_eq!(*m.app.mode(), Mode::Normal);
+            assert_eq!(m.app.browse_depth(), 1);
+            assert_eq!(m.app.selected(), None);
+            m.chars("/x");
+            assert_eq!(m.app.visible(), [] as [usize; 0]);
+            m.keys(&[KeyCode::Esc, KeyCode::Esc]);
+            assert_eq!(m.app.focus(), Focus::Sidebar);
+        }
+        Ok(())
+    }
+
+    // --- Going back (task 4.3) ---
+
+    /// Spec *Back from an album*.
+    #[test]
+    fn back_from_an_album() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.open("Air")?;
+        m.open("Talkie Walkie")?;
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.app.browse_depth(), 2);
+        assert_eq!(m.names(), ["All tracks", "Moon Safari", "Talkie Walkie"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Talkie Walkie"));
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Artists));
+        assert_eq!(m.selected_name().as_deref(), Some("Air"));
+
+        // `Esc` goes back the same way.
+        m.open("Air")?;
+        m.open("Moon Safari")?;
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.selected_name().as_deref(), Some("Moon Safari"));
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Artists));
+        assert_eq!(m.app.focus(), Focus::Main);
+
+        // Through "Albums", one level.
+        m.show(SidebarEntry::Albums)?;
+        m.open("Debut")?;
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Albums));
+        assert_eq!(m.selected_name().as_deref(), Some("Debut"));
+        Ok(())
+    }
+
+    /// Spec *Back to the sidebar*.
+    #[test]
+    fn back_to_the_sidebar() -> Result<()> {
+        let mut m = music()?;
+        m.write("Gym", &[])?;
+        for (entry, kind) in [
+            (SidebarEntry::Artists, BrowseKind::Artists),
+            (SidebarEntry::Albums, BrowseKind::Albums),
+        ] {
+            m.show(entry)?;
+            m.keys(&[KeyCode::Down]);
+            m.keys(&[KeyCode::Esc]);
+            assert_eq!(m.app.focus(), Focus::Sidebar);
+            assert_eq!(m.app.main_view(), MainView::Browse(kind), "still shown");
+            assert_eq!(
+                m.app.sidebar_list().selected.and_then(|row| m
+                    .app
+                    .sidebar_list()
+                    .rows
+                    .get(row)
+                    .copied()),
+                entry.value()
+            );
+            // Tab comes back to the same row.
+            m.keys(&[KeyCode::Tab]);
+            assert_eq!(m.app.main_list().selected, Some(1));
+        }
+        Ok(())
+    }
+
+    /// `Esc` from the artist list selects "Artists" even when the sidebar
+    /// filter hides every playlist.
+    #[test]
+    fn back_to_a_filtered_sidebar() -> Result<()> {
+        let mut m = music()?;
+        m.write("Gym", &[])?;
+        m.keys(&[KeyCode::Tab]);
+        m.chars("/gym");
+        m.keys(&[KeyCode::Enter]);
+        m.show(SidebarEntry::Artists)?;
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.app.query(), "gym", "the sidebar keeps its filter");
+        assert_eq!(
+            m.app.sidebar_list().selected.and_then(|row| m
+                .app
+                .sidebar_list()
+                .rows
+                .get(row)
+                .copied()),
+            SidebarEntry::Artists.value()
+        );
+        Ok(())
+    }
+
+    /// Spec *Esc clears the filter first*.
+    #[test]
+    fn esc_clears_the_filter_first() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Albums)?;
+        m.open("Moon Safari")?;
+        m.chars("/sexy");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.names(), ["Sexy Boy"]);
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.app.query(), "");
+        assert_eq!(m.app.browse_depth(), 2, "the album is still shown");
+        assert_eq!(m.names().len(), 3);
+        assert_eq!(m.selected_name().as_deref(), Some("Sexy Boy"), "kept");
+        Ok(())
+    }
+
+    /// Spec *Backspace goes back through a filter*.
+    #[test]
+    fn backspace_goes_back_through_a_filter() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Albums)?;
+        m.open("Moon Safari")?;
+        m.chars("/sexy");
+        m.keys(&[KeyCode::Enter, KeyCode::Backspace]);
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Albums));
+        assert_eq!(m.selected_name().as_deref(), Some("Moon Safari"));
+        assert_eq!(m.app.query(), "");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.app.query(), "", "opened afresh");
+        assert_eq!(m.names().len(), 3, "unfiltered");
+        assert_eq!(m.app.selected(), Some(0));
+        Ok(())
+    }
+
+    /// Spec *Filter artists*.
+    #[test]
+    fn filter_artists() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.chars("/BJ");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.names(), ["Björk"]);
+        // A guest track artist is not an artist entry; titles do not match.
+        m.chars("/");
+        m.keys(&[KeyCode::Backspace, KeyCode::Backspace]);
+        m.chars("venus");
+        assert_eq!(m.names(), [] as [String; 0]);
+        Ok(())
+    }
+
+    /// Albums filter by title or album artist.
+    #[test]
+    fn filter_albums_by_title_or_artist() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Albums)?;
+        m.chars("/various");
+        assert_eq!(m.names(), ["Hits"]);
+        m.keys(&[KeyCode::Esc]);
+        m.chars("/safari");
+        assert_eq!(m.names(), ["Moon Safari"]);
+        // Never across the two fields.
+        m.keys(&[KeyCode::Esc]);
+        m.chars("/safari air");
+        assert_eq!(m.names(), [] as [String; 0]);
+        assert_eq!(m.app.selected(), None);
+        Ok(())
+    }
+
+    /// Spec *Filter an artist's albums*.
+    #[test]
+    fn filter_an_artists_albums() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.open("Air")?;
+        m.chars("/talk");
+        assert_eq!(m.names(), ["All tracks", "Talkie Walkie"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Talkie Walkie"));
+        m.chars("zzz");
+        assert_eq!(m.names(), ["All tracks"], "never filtered out");
+        assert_eq!(m.selected_name().as_deref(), Some("All tracks"));
+        m.keys(&[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(m.names().len(), 5, "All tracks opens unfiltered");
+        Ok(())
+    }
+
+    /// Emptying the query with Backspace selects the top row again, not
+    /// the first album (or, in the sidebar, the first playlist).
+    #[test]
+    fn emptied_query_selects_the_top_row() -> Result<()> {
+        let mut m = music()?;
+        m.write("Gym", &[])?;
+        m.show(SidebarEntry::Artists)?;
+        m.open("Air")?;
+        m.chars("/x");
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.app.query(), "");
+        assert_eq!(m.selected_name().as_deref(), Some("All tracks"));
+        m.keys(&[KeyCode::Esc, KeyCode::Tab]);
+        m.chars("/x");
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.app.selected(), Some(0), "\"Library\"");
+        Ok(())
+    }
+
+    /// Tracks filter as in the library: title, artist or album.
+    #[test]
+    fn filter_browsed_tracks() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Albums)?;
+        m.open("Hits")?;
+        m.chars("/second");
+        assert_eq!(m.names(), ["Second Hit"]);
+        m.keys(&[KeyCode::Esc]);
+        m.chars("/hits");
+        assert_eq!(m.names(), ["First Hit", "Second Hit"], "by album");
+        Ok(())
+    }
+
+    /// Spec *Filter kept while going deeper*.
+    #[test]
+    fn filter_kept_while_going_deeper() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.chars("/a");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.names(), ["Air", "Various Artists"]);
+        m.open("Various Artists")?;
+        assert_eq!(m.app.query(), "", "a new level has no filter");
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(m.app.query(), "a");
+        assert_eq!(m.names(), ["Air", "Various Artists"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Various Artists"));
+        Ok(())
+    }
+
+    /// `Backspace` at the top level, in the library and in the sidebar does
+    /// nothing.
+    #[test]
+    fn backspace_at_the_top_does_nothing() -> Result<()> {
+        let mut m = music()?;
+        m.keys(&[KeyCode::Down, KeyCode::Backspace]);
+        assert_eq!(m.app.view(), View::Library);
+        assert_eq!(m.app.selected(), Some(1));
+        m.show(SidebarEntry::Artists)?;
+        m.keys(&[KeyCode::Down, KeyCode::Backspace]);
+        assert_eq!(m.app.browse_depth(), 1);
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.selected_name().as_deref(), Some("Björk"));
+        m.open("Björk")?;
+        m.keys(&[KeyCode::Tab, KeyCode::Backspace]);
+        assert_eq!(m.app.focus(), Focus::Sidebar);
+        assert_eq!(m.app.browse_depth(), 2, "not from the sidebar");
+        Ok(())
+    }
+
+    /// Backspace typed in Search and in the name prompt edits the text.
+    #[test]
+    fn backspace_still_edits_typed_text() -> Result<()> {
+        let mut m = music()?;
+        m.write("Gym", &[])?;
+        m.show(SidebarEntry::Albums)?;
+        m.open("Moon Safari")?;
+        m.chars("/sexyx");
+        m.keys(&[KeyCode::Backspace]);
+        assert_eq!(*m.app.mode(), Mode::Search);
+        assert_eq!(m.app.query(), "sexy");
+        assert_eq!(m.app.browse_depth(), 2);
+        m.keys(&[KeyCode::Backspace; 5]);
+        assert_eq!(m.app.query(), "");
+        assert_eq!(m.app.browse_depth(), 2, "an empty query stays put");
+        m.keys(&[KeyCode::Enter]);
+
+        m.select_in_sidebar(SidebarEntry::Playlist(0))?;
+        m.app
+            .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        m.keys(&[KeyCode::Backspace]);
+        let Mode::NameInput(input) = m.app.mode() else {
+            bail!("no name prompt");
+        };
+        assert_eq!(input.text(), "Gy");
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.app.main_view(), MainView::Browse(BrowseKind::Album(0)));
+        assert_eq!(m.app.browse_depth(), 2);
         Ok(())
     }
 }

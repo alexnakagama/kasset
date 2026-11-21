@@ -10,13 +10,6 @@
 
 mod app;
 mod bounded_read;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the app from task 4.2 of add-artist-album-browsing"
-    )
-)]
 mod browse;
 mod cli;
 mod keys;

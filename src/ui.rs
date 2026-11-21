@@ -5,13 +5,17 @@
 //! Layout, top to bottom: the body, the now-playing area (a top rule, then
 //! the track line with the shuffle, repeat and volume indicators at its
 //! right end, then the progress line), the status line and the key bar. The
-//! body is two panes side by side, the sidebar ("Library" and the
-//! playlists) and the main pane (the library or the open playlist), when
-//! the terminal is at least [`TWO_PANE_MIN_WIDTH`] columns wide; below that
+//! body is two panes side by side, the sidebar (the fixed rows "Library",
+//! "Artists" and "Albums", a separator, then the playlists) and the main
+//! pane (the library, the open playlist or a browse level), when the
+//! terminal is at least [`TWO_PANE_MIN_WIDTH`] columns wide; below that
 //! only the focused pane is drawn, at full width. The focused pane has the
 //! focused border and the strong selection style ([`theme`]); each pane
 //! keeps its own scroll offset, and the page size fed back to the app is the
-//! focused pane's. With the visualizer on and the terminal at least
+//! focused pane's. The sidebar's fixed rows stay on top (in a short pane
+//! they are cut from the bottom), its separator is drawn only with a
+//! playlist row below it, and only its playlist rows scroll and count as its
+//! page. With the visualizer on and the terminal at least
 //! [`SPECTRUM_MIN_HEIGHT`] rows tall, the bottom [`SPECTRUM_HEIGHT`] rows of
 //! the body are the spectrum strip, across the full width below the panes:
 //! one bar per level, 1 column wide with a 1-column gap, filled from the
@@ -63,7 +67,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, Focus, ListView, MainView, Mode, NameInput, NamePurpose, Picker, View as Screen,
+    App, BrowseKind, FIXED_ROWS, Focus, ListView, MainView, Mode, NameInput, NamePurpose, Picker,
+    SidebarEntry, View as Screen, artist_album_of_value,
 };
 use crate::keys::{self, BarContext, HelpLine};
 use crate::lyrics::Lyrics;
@@ -139,8 +144,11 @@ const LIBRARY_TITLE: &str = " Library ";
 /// The sidebar's title.
 const SIDEBAR_TITLE: &str = " kasset ";
 
-/// Name of the sidebar's first row.
-const LIBRARY_ROW: &str = "Library";
+/// Names of the sidebar's fixed rows, top down (values 0, 1 and 2).
+const FIXED_ROW_NAMES: [&str; FIXED_ROWS] = ["Library", "Artists", "Albums"];
+
+/// The first row of an artist's albums.
+const ALL_TRACKS_ROW: &str = "All tracks";
 
 /// Added to a read-only playlist's name in the main pane's title.
 const READ_ONLY_SUFFIX: &str = " · read-only";
@@ -242,7 +250,7 @@ fn shown_name(name: &str) -> String {
 /// What rendering remembers between frames.
 #[derive(Debug, Default)]
 pub struct View {
-    /// First playlist row on screen in the sidebar ("Library" is always
+    /// First playlist row on screen in the sidebar (its fixed rows are always
     /// drawn above them).
     sidebar_offset: usize,
     /// First row on screen in the main pane.
@@ -320,6 +328,10 @@ fn bar_context<A: Audio>(app: &App<A>) -> BarContext {
             Screen::Library => BarContext::Library,
             Screen::Playlists => BarContext::Sidebar,
             Screen::Playlist => BarContext::Playlist,
+            // The artist or album list, where `Esc` goes to the sidebar.
+            Screen::Groups if app.browse_depth() <= 1 => BarContext::BrowseTop,
+            Screen::Groups => BarContext::BrowseGroups,
+            Screen::Tracks => BarContext::BrowseTracks,
         },
     }
 }
@@ -363,10 +375,7 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
 /// first one that does not fit whole, and in the Normal-mode contexts
 /// [`keys::HELP_HINT`] at the right end, which always keeps its place.
 fn render_key_bar(frame: &mut Frame, context: BarContext, area: Rect) {
-    let hint = matches!(
-        context,
-        BarContext::Library | BarContext::Playlist | BarContext::Sidebar
-    );
+    let hint = context.is_normal();
     let room = if hint {
         usize::from(area.width).saturating_sub(width(keys::HELP_HINT) + GAP)
     } else {
@@ -829,7 +838,141 @@ fn render_main<A: Audio>(
     match app.main_view() {
         MainView::Library => render_library(frame, app, offset, area, focused),
         MainView::Playlist => render_open_playlist(frame, app, offset, area, focused),
+        MainView::Browse(kind) => render_browse(frame, app, offset, area, focused, kind),
     }
+}
+
+/// A pane title ` text ` cut at the end to fit `room` columns (nothing when
+/// not even a few characters fit).
+fn plain_title(text: &str, room: usize) -> String {
+    if room >= 4 {
+        format!(" {} ", elide_end(text, room - 2))
+    } else {
+        String::new()
+    }
+}
+
+/// Draws a browse level: the artist or album list, an artist's albums, or a
+/// list of tracks (with the library's columns). Names come from the
+/// catalog, whose text is the library's sanitised tag text.
+///
+/// Interim rendering (task 4.2 of add-artist-album-browsing): group levels
+/// list names only; task 6.1 draws the full tables and playing markers.
+fn render_browse<A: Audio>(
+    frame: &mut Frame,
+    app: &App<A>,
+    offset: &mut usize,
+    area: Rect,
+    focused: bool,
+    kind: BrowseKind,
+) -> usize {
+    let catalog = app.catalog();
+    let list = app.main_list();
+    let artist_name = |a: usize| catalog.artist(a).map_or("", |artist| artist.name());
+    let album_title = |b: usize| catalog.album(b).map_or("", |album| album.title());
+    let (title, total, noun) = match kind {
+        BrowseKind::Artists => ("Artists".to_owned(), catalog.artists().len(), "artists"),
+        BrowseKind::ArtistAlbums(a) => (
+            artist_name(a).to_owned(),
+            catalog.artist(a).map_or(0, |artist| artist.albums().len()),
+            "albums",
+        ),
+        BrowseKind::Albums => ("Albums".to_owned(), catalog.albums().len(), "albums"),
+        BrowseKind::Album(b) => (
+            format!(
+                "{} · {}",
+                album_title(b),
+                catalog
+                    .album(b)
+                    .map_or("", |album| artist_name(album.artist()))
+            ),
+            app.browse_tracks().len(),
+            "tracks",
+        ),
+        BrowseKind::ArtistTracks(a) => (
+            format!("{} · {ALL_TRACKS_ROW}", artist_name(a)),
+            app.browse_tracks().len(),
+            "tracks",
+        ),
+    };
+    // An artist's "All tracks" row is listed but not counted.
+    let shown = match kind {
+        BrowseKind::ArtistAlbums(_) => list
+            .rows
+            .iter()
+            .filter(|&&v| artist_album_of_value(v).is_some())
+            .count(),
+        _ => list.rows.len(),
+    };
+    let count = pane_count(&list, shown, total, noun, area.width);
+    let block = pane_block(area, focused, |room| plain_title(&title, room), count);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if list.rows.is_empty() {
+        let message = if total == 0 {
+            format!("No {noun}")
+        } else {
+            format!("No {noun} match '{}'", list.query)
+        };
+        return render_empty(frame, offset, inner, message);
+    }
+    match kind {
+        BrowseKind::Album(_) | BrowseKind::ArtistTracks(_) => {
+            let items = app.browse_tracks();
+            render_tracks(frame, app, &list, offset, inner, focused, |item| {
+                (items.get(item).copied().unwrap_or(usize::MAX), false)
+            })
+        }
+        BrowseKind::Artists => render_names(frame, &list, offset, inner, focused, |a| {
+            artist_name(a).to_owned()
+        }),
+        BrowseKind::ArtistAlbums(a) => {
+            let albums = catalog.artist(a).map_or(&[][..], |artist| artist.albums());
+            render_names(
+                frame,
+                &list,
+                offset,
+                inner,
+                focused,
+                |value| match artist_album_of_value(value) {
+                    None => ALL_TRACKS_ROW.to_owned(),
+                    Some(i) => albums.get(i).map_or("", |&b| album_title(b)).to_owned(),
+                },
+            )
+        }
+        BrowseKind::Albums => render_names(frame, &list, offset, inner, focused, |b| {
+            let artist = catalog
+                .album(b)
+                .map_or("", |album| artist_name(album.artist()));
+            format!("{} · {artist}", album_title(b))
+        }),
+    }
+}
+
+/// Draws the rows of a list of names, `name(value)` for each row, scrolled
+/// to keep the selection on screen. Returns the rows that fit.
+fn render_names(
+    frame: &mut Frame,
+    list: &ListView,
+    offset: &mut usize,
+    inner: Rect,
+    focused: bool,
+    name: impl Fn(usize) -> String,
+) -> usize {
+    let shown = list.rows.len();
+    let rows = usize::from(inner.height);
+    let selected = list.selected.unwrap_or(0);
+    *offset = scroll(*offset, selected, rows, shown);
+    let end = offset.saturating_add(rows).min(shown);
+    let body = list.rows[*offset..end]
+        .iter()
+        .map(|&value| Row::new([Cell::from(name(value))]));
+    let table =
+        Table::new(body, [Constraint::Fill(1)]).row_highlight_style(theme::selected(focused));
+    let mut state = TableState::new().with_selected(Some(selected - *offset));
+    frame.render_stateful_widget(table, inner, &mut state);
+    rows
 }
 
 fn render_library<A: Audio>(
@@ -997,7 +1140,7 @@ fn sidebar_line<'a>(
     ])
 }
 
-/// What the sidebar says below "Library" when no playlist is listed.
+/// What the sidebar says below its fixed rows when no playlist is listed.
 fn sidebar_hint(no_playlists: bool, query: &str) -> Paragraph<'static> {
     let message = if no_playlists {
         "No playlists yet. In the library, press a (selected track) or A (all listed \
@@ -1011,10 +1154,24 @@ fn sidebar_hint(no_playlists: bool, query: &str) -> Paragraph<'static> {
         .wrap(Wrap { trim: false })
 }
 
-/// Draws the sidebar: the "Library" row, a separator when there is room,
-/// then the playlists, or a hint when none is listed. "Library" stays on
-/// top; only the playlists scroll (`offset` counts playlist rows). Returns
-/// the rows that fit.
+/// `(row in list.rows, sidebar value, index in App::playlists)` of each
+/// playlist row of the sidebar `list`, in order.
+fn sidebar_playlist_rows(list: &ListView) -> Vec<(usize, usize, usize)> {
+    list.rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row, &value)| match SidebarEntry::of_value(value) {
+            SidebarEntry::Playlist(i) => Some((row, value, i)),
+            SidebarEntry::Library | SidebarEntry::Artists | SidebarEntry::Albums => None,
+        })
+        .collect()
+}
+
+/// Draws the sidebar: the fixed rows ("Library", "Artists", "Albums"), a
+/// separator when a playlist row fits below it, then the playlists, or a
+/// hint when none is listed. The fixed rows stay on top (in a short pane
+/// they are cut from the bottom); only the playlists scroll (`offset` counts
+/// playlist rows). Returns the playlist rows that fit.
 fn render_sidebar<A: Audio>(
     frame: &mut Frame,
     app: &App<A>,
@@ -1025,14 +1182,7 @@ fn render_sidebar<A: Audio>(
     let focused = focus == Focus::Sidebar;
     let list = app.sidebar_list();
     let infos = app.playlists();
-    // (row in `list.rows`, index in `infos`) of each playlist row; value 0
-    // is the "Library" row.
-    let playlist_rows: Vec<(usize, usize)> = list
-        .rows
-        .iter()
-        .enumerate()
-        .filter_map(|(row, &value)| Some((row, value.checked_sub(1)?)))
-        .collect();
+    let playlist_rows = sidebar_playlist_rows(&list);
     let count = pane_count(
         &list,
         playlist_rows.len(),
@@ -1082,13 +1232,24 @@ fn render_sidebar<A: Audio>(
         }
     };
 
-    let library_count = playback.tracks().len().to_string();
-    draw_row(frame, 0, LIBRARY_ROW, Style::new(), &library_count, inner.y);
-
-    // A separator under "Library" when at least one row fits below it.
+    let catalog = app.catalog();
+    let fixed_counts = [
+        playback.tracks().len(),
+        catalog.artists().len(),
+        catalog.albums().len(),
+    ];
+    // The fixed rows, top down, as many as fit.
     let mut rest = inner;
-    rest.y += 1;
-    rest.height -= 1;
+    for (value, (name, count)) in FIXED_ROW_NAMES.iter().zip(fixed_counts).enumerate() {
+        if rest.height == 0 {
+            break;
+        }
+        draw_row(frame, value, name, Style::new(), &count.to_string(), rest.y);
+        rest.y += 1;
+        rest.height -= 1;
+    }
+
+    // A separator under the fixed rows when a playlist row fits below it.
     if rest.height >= 2 {
         frame.render_widget(
             Line::styled("─".repeat(columns), theme::DIM),
@@ -1105,14 +1266,14 @@ fn render_sidebar<A: Audio>(
         return rows;
     }
 
-    // With "Library" selected the playlists keep their scroll position.
+    // With a fixed row selected the playlists keep their scroll position.
     let selected = list
         .selected
-        .and_then(|row| playlist_rows.iter().position(|&(r, _)| r == row))
+        .and_then(|row| playlist_rows.iter().position(|&(r, _, _)| r == row))
         .unwrap_or(*offset);
     *offset = scroll(*offset, selected, rows, playlist_rows.len());
     let end = offset.saturating_add(rows).min(playlist_rows.len());
-    for (y, &(_, i)) in (rest.y..).zip(&playlist_rows[*offset..end]) {
+    for (y, &(_, value, i)) in (rest.y..).zip(&playlist_rows[*offset..end]) {
         let Some(info) = infos.get(i) else {
             continue;
         };
@@ -1124,7 +1285,7 @@ fn render_sidebar<A: Audio>(
         } else {
             Style::new()
         };
-        draw_row(frame, i + 1, &shown_name(&info.name), name_style, &count, y);
+        draw_row(frame, value, &shown_name(&info.name), name_style, &count, y);
     }
     rows
 }
@@ -1534,6 +1695,10 @@ mod tests {
         app.set_lyrics_on(false);
         app
     }
+
+    /// In the sidebar: selects the first playlist, below the fixed rows.
+    const FIRST_PLAYLIST: [KeyCode; 1 + FIXED_ROWS] =
+        [KeyCode::Home, KeyCode::Down, KeyCode::Down, KeyCode::Down];
 
     fn press(app: &mut App<SilentAudio>, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -2133,7 +2298,9 @@ mod tests {
     #[test]
     fn open_playlist_help_bar_shows_the_edit_keys() -> anyhow::Result<()> {
         let (_tmp, mut app) = with_playlists()?;
-        keys(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST);
+        press(&mut app, KeyCode::Enter);
         // Narrow enough that the bar is cut: the edit keys come first.
         let screen = draw(&app, &mut View::default(), 60, 20);
         let bar = key_bar(&screen);
@@ -2163,7 +2330,8 @@ mod tests {
         assert!(!bar.contains("? help"), "{bar}");
 
         press(&mut app, KeyCode::Esc);
-        keys(&mut app, &[KeyCode::Tab, KeyCode::Down]);
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST);
         app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
         let screen = draw(&app, &mut View::default(), 200, 20);
         let bar = key_bar(&screen);
@@ -2394,7 +2562,8 @@ mod tests {
     #[test]
     fn delete_confirmation_names_the_playlist() -> anyhow::Result<()> {
         let (_tmp, mut app) = with_playlists()?;
-        keys(&mut app, &[KeyCode::Tab, KeyCode::Down]);
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST);
         app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
         let screen = draw(&app, &mut View::default(), 80, 24);
         assert!(screen_contains(&screen, " Delete playlist "), "{screen:#?}");
@@ -2699,8 +2868,8 @@ mod tests {
         draw(&app, &mut view, 100, 20);
         keys(&mut app, &[KeyCode::Tab, KeyCode::End]);
         let screen = draw(&app, &mut view, 100, 20);
-        // The sidebar's rows below "Library" and its separator.
-        assert_eq!(view.page_size(), 11, "the sidebar's page");
+        // The sidebar's rows below its fixed rows and separator.
+        assert_eq!(view.page_size(), 9, "the sidebar's page");
         assert!(screen_contains(&screen, "P29"), "{screen:#?}");
         assert!(!screen_contains(&screen, "P00"), "{screen:#?}");
         assert!(
@@ -2874,11 +3043,10 @@ mod tests {
             tmp.path().join("Playlists/Old.m3u8"),
             b"../Band/LP/A.mp3\n# caf\xe9\n",
         )?;
-        // Sidebar rows: "Library", "Gym", "Old", "Running".
-        keys(
-            &mut app,
-            &[KeyCode::Tab, KeyCode::Down, KeyCode::Down, KeyCode::Enter],
-        );
+        // Sidebar rows: the fixed rows, "Gym", "Old", "Running".
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST);
+        keys(&mut app, &[KeyCode::Down, KeyCode::Enter]);
         let screen = draw(&app, &mut View::default(), 100, 20);
         assert!(screen[0].contains(" Old · read-only "), "{screen:#?}");
         Ok(())
@@ -3283,6 +3451,176 @@ mod tests {
             press(&mut app, KeyCode::Tab);
         }
         Ok(())
+    }
+
+    // --- Sidebar fixed rows and browse levels (group 4 of
+    // add-artist-album-browsing) ---
+
+    /// Spec *Both panes visible*: "Library", "Artists", "Albums" with their
+    /// counts, then the separator and the playlists.
+    #[test]
+    fn sidebar_lists_the_fixed_rows_then_the_playlists() -> anyhow::Result<()> {
+        let (_tmp, app) = many(3, 2)?;
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        let sidebar = columns(&screen, 0, usize::from(MAIN_X));
+        let expected = [
+            ("Library", "3"),
+            ("Artists", "1"),
+            ("Albums", "1"),
+            ("─", "─"),
+            ("P00", "0"),
+            ("P01", "0"),
+        ];
+        for (row, (name, count)) in expected.iter().enumerate() {
+            let line = sidebar[row + 1].trim_end_matches('│').trim_end();
+            assert!(
+                line.starts_with(&format!("│   {name}")) || *name == "─",
+                "{screen:#?}"
+            );
+            assert!(line.contains(name) && line.ends_with(count), "{screen:#?}");
+        }
+        Ok(())
+    }
+
+    /// Short sidebars: the fixed rows are cut from the bottom, the separator
+    /// needs a playlist row below it, and the page counts playlist rows only.
+    #[test]
+    fn short_sidebar_keeps_the_fixed_rows_first() -> anyhow::Result<()> {
+        let (_tmp, mut app) = many(3, 5)?;
+        press(&mut app, KeyCode::Tab);
+        // Inner height = terminal height - 3 (now playing) - 2 (status, keys)
+        // - 2 (borders); narrow, so the sidebar is drawn alone.
+        let cases: [(u16, &[&str], usize); 4] = [
+            (2, &["Library", "Artists"], 0),
+            (3, &["Library", "Artists", "Albums"], 0),
+            (4, &["Library", "Artists", "Albums", "P00"], 1),
+            (5, &["Library", "Artists", "Albums", "─", "P00"], 1),
+        ];
+        for (inner, rows, page) in cases {
+            let mut view = View::default();
+            let screen = draw(&app, &mut view, 60, inner + 7);
+            for (y, name) in rows.iter().enumerate() {
+                assert!(screen[y + 1].contains(name), "{inner}: {screen:#?}");
+            }
+            let body = &screen[1..=usize::from(inner)];
+            let separators = body.iter().filter(|l| l.contains("──")).count();
+            assert_eq!(
+                separators,
+                usize::from(rows.contains(&"─")),
+                "{inner}: {screen:#?}"
+            );
+            assert!(
+                screen[usize::from(inner) + 1].starts_with('└'),
+                "{screen:#?}"
+            );
+            assert_eq!(view.page_size, page, "{inner}");
+        }
+        Ok(())
+    }
+
+    /// Scrolling the playlists keeps every fixed row on top.
+    #[test]
+    fn scrolled_sidebar_keeps_the_fixed_rows_on_top() -> anyhow::Result<()> {
+        let (_tmp, mut app) = many(3, 30)?;
+        keys(&mut app, &[KeyCode::Tab, KeyCode::End]);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        for (y, name) in FIXED_ROW_NAMES.iter().enumerate() {
+            assert!(screen[y + 1].contains(name), "{screen:#?}");
+        }
+        assert!(screen[4].contains("──"), "{screen:#?}");
+        assert!(screen_contains(&screen, "P29"), "{screen:#?}");
+        assert!(!screen_contains(&screen, "P00"), "{screen:#?}");
+        Ok(())
+    }
+
+    /// The key bar on each browse level: specs *Artist list bar* and *Album
+    /// tracks bar*, and `Esc back` on an artist's albums.
+    #[test]
+    fn browse_levels_have_their_own_key_bars() {
+        let mut app = library(3);
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST[..2]);
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        let bar = key_bar(&screen);
+        assert!(bar.starts_with("Enter open · Esc sidebar"), "{bar}");
+        assert!(bar.contains("a add") && !bar.contains("Esc back"), "{bar}");
+        assert!(bar.ends_with("? help"), "{bar}");
+
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        let bar = key_bar(&screen);
+        assert!(bar.starts_with("Enter open"), "{bar}");
+        assert!(bar.contains("Esc back") && bar.contains("a add"), "{bar}");
+        assert!(!bar.contains("Esc sidebar"), "{bar}");
+
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        let bar = key_bar(&screen);
+        assert!(bar.starts_with("Enter play · a/A add"), "{bar}");
+        assert!(bar.contains("Esc back"), "{bar}");
+        assert!(bar.ends_with("? help"), "{bar}");
+    }
+
+    /// The browse levels as drawn for now (task 6.1 draws the full tables):
+    /// names, titles naming the level, and the messages of an empty list.
+    #[test]
+    fn browse_levels_list_their_entries() {
+        let mut app = library(3);
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST[..2]);
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        assert!(screen[0].contains(" Artists "), "{screen:#?}");
+        assert!(screen[0].contains(" 1 artists "), "{screen:#?}");
+        assert!(screen_contains(&screen, "Band"), "{screen:#?}");
+
+        keys(&mut app, &[KeyCode::Enter, KeyCode::Down, KeyCode::Enter]);
+        // Narrow: only the main pane, titled with the album and its artist.
+        let screen = draw(&app, &mut View::default(), 60, 20);
+        assert!(screen[0].starts_with("┌ LP · Band "), "{screen:#?}");
+        assert!(screen_contains(&screen, "Song 02"), "{screen:#?}");
+
+        press(&mut app, KeyCode::Char('/'));
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let screen = draw(&app, &mut View::default(), 60, 20);
+        assert!(
+            screen_contains(&screen, "No tracks match 'zzz'"),
+            "{screen:#?}"
+        );
+
+        // A long title is cut inside the pane, never drawn over its border.
+        let long = "Ω".repeat(200);
+        let mut wide = App::new(
+            vec![track("Song", "Band", &long)],
+            SilentAudio::default(),
+            no_store(),
+            "/music".to_owned(),
+            None,
+        );
+        wide.set_lyrics_on(false);
+        keys(&mut wide, &[KeyCode::Tab]);
+        keys(&mut wide, &FIRST_PLAYLIST[..3]);
+        press(&mut wide, KeyCode::Enter);
+        let screen = draw(&wide, &mut View::default(), 40, 12);
+        // The body is 12 - 5 rows: now playing, status and keys below it.
+        for line in &screen[..7] {
+            assert!(line.starts_with(['┌', '│', '└']), "{screen:#?}");
+            assert!(line.ends_with(['┐', '│', '┘']), "{screen:#?}");
+        }
+        assert!(screen_contains(&screen, "ΩΩΩ"), "{screen:#?}");
+
+        let mut empty = library(0);
+        keys(&mut empty, &[KeyCode::Tab]);
+        keys(&mut empty, &FIRST_PLAYLIST[..2]);
+        press(&mut empty, KeyCode::Enter);
+        let screen = draw(&empty, &mut View::default(), 100, 20);
+        assert!(screen_contains(&screen, "No artists"), "{screen:#?}");
+        keys(&mut empty, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
+        let screen = draw(&empty, &mut View::default(), 100, 20);
+        assert!(screen_contains(&screen, "No albums"), "{screen:#?}");
     }
 }
 

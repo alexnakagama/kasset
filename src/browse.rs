@@ -83,6 +83,10 @@ impl Artist {
     }
 
     /// Number of tracks over all of this artist's albums.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "drawn from task 6.1 of add-artist-album-browsing")
+    )]
     pub const fn track_count(&self) -> usize {
         self.track_count
     }
