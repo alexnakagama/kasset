@@ -416,6 +416,7 @@ mod tests {
             item: Some(2),
             position: Duration::from_millis(position_ms),
             source: SavedSource::Playlist("Running".to_owned()),
+            queued: None,
         }
     }
 
@@ -425,6 +426,7 @@ mod tests {
             folder: FolderEntry {
                 resume: track.map(|t| resume(t, 135_000)),
                 open: Some("Running".to_owned()),
+                ..FolderEntry::default()
             },
         }
     }

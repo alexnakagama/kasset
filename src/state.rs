@@ -2,7 +2,8 @@
 //!
 //! kasset remembers the player [`Settings`] (shared by every library folder)
 //! and, per library folder, a [`FolderEntry`]: the [`Resume`] point (track,
-//! queue item, position, play source) and the playlist shown in the main pane.
+//! play order item, position, play source, and the queued track playing after
+//! it, if any), the playlist shown in the main pane and the up-next queue.
 //! [`parse`] reads the state file, [`render`] writes it and [`merge`] folds one
 //! run's [`Session`] into what is on disk. Reading and writing the file itself
 //! is the job of [`store`]; this module is pure.
@@ -21,7 +22,10 @@
 //! item 3
 //! position-ms 135000
 //! source playlist Running
+//! queued-track Other/Single.mp3
 //! open Running
+//! queue Other/Single.mp3
+//! queue Band/LP/02%20Next.flac
 //! folder /mnt/other
 //! ```
 //!
@@ -38,6 +42,15 @@
 //!   an artist or album source still reads as a library source in a version
 //!   that predates them (which then saves it back as `library`), and
 //!   [`FORMAT_VERSION`] did not change for them.
+//! - `queue <path>` lines (D9 of the `add-play-queue` design) list the up-next
+//!   queue in order, duplicates allowed. Each is read on its own (an invalid
+//!   one is skipped) and at most [`MAX_UP_NEXT`] are kept; further ones are
+//!   ignored. `queued-track <path>` names the queued track that was playing:
+//!   `track`, `item` and `source` are then the play order's track it was
+//!   played after, and `position-ms` is the queued track's position. It only
+//!   counts with a `track`. Versions without the queue ignore both keys and
+//!   resume `track` at `position-ms`, so [`FORMAT_VERSION`] did not change
+//!   for them either.
 //! - Paths and names are percent-encoded: every byte outside `0x21..=0x7E`,
 //!   and `%`, is written `%XX`, so any value fits on one printable line. On
 //!   Unix paths are encoded from their raw bytes; elsewhere from UTF-8, and a
@@ -51,9 +64,10 @@
 //!   already seen is ignored. Parsing is linear in the input, every number is
 //!   parsed with checked arithmetic, and at most [`MAX_FOLDERS`] entries are
 //!   kept, so crafted input can never panic, wrap or stall;
-//! - a resume point names its track only as a [`RelPath`]: plain components
-//!   relative to the library root, never empty, `.`, `..`, a root or a
-//!   prefix, and never containing a separator. It is only ever compared with
+//! - a resume point, its queued track and every queued entry name their track
+//!   only as a [`RelPath`]: plain components relative to the library root,
+//!   never empty, `.`, `..`, a root or a prefix, and never containing a
+//!   separator. It is only ever compared with
 //!   the relative paths of scanned tracks, never joined onto a path;
 //! - playlist names (`open`, `source playlist`) are UTF-8 of at most
 //!   [`MAX_NAME_BYTES`] bytes that could be one file name component (see
@@ -70,15 +84,20 @@
 //! - a [`RootKey`] is the canonical root's bytes and is compared exactly;
 //! - [`render`] never returns more than [`MAX_STATE_BYTES`], the read cap, and
 //!   only writes values [`parse`] accepts, so what is written is always read
-//!   back whole: an entry that does not fit is left out and later (older)
-//!   ones that still fit are kept, and a first entry too large on its own
-//!   loses its resume point, then its playlist, then is left out entirely.
+//!   back whole. An entry that does not fit first loses queued tracks from
+//!   the end of its queue (keeping the longest prefix that fits, possibly
+//!   none). If it does not fit even without its queue, an older entry is left
+//!   out (later, older ones that still fit are kept), while the first
+//!   (current) entry is written without its queue (it is never restored
+//!   once the resume point goes) and loses its resume point, then its
+//!   playlist, then is left out entirely.
 
 pub mod store;
 
 use std::path::{Component, Path};
 use std::time::Duration;
 
+use crate::playback::MAX_UP_NEXT;
 use crate::player::Volume;
 use crate::queue::Repeat;
 
@@ -154,6 +173,10 @@ pub struct Resume {
     pub position: Duration,
     /// What the play order was built from.
     pub source: SavedSource,
+    /// The queued track that was playing after `track`, if any. With it,
+    /// `track`, `item` and `source` are the play order's position and
+    /// `position` is the queued track's.
+    pub queued: Option<RelPath>,
 }
 
 /// What is remembered for one library folder.
@@ -163,6 +186,9 @@ pub struct FolderEntry {
     pub resume: Option<Resume>,
     /// The playlist shown in the main pane, if any.
     pub open: Option<String>,
+    /// The up-next queue, in play order, duplicates allowed; at most
+    /// [`MAX_UP_NEXT`] entries are written or read.
+    pub queue: Vec<RelPath>,
 }
 
 /// What one run saves: the settings, and the entry for its own folder.
@@ -435,7 +461,9 @@ struct PartialEntry {
     item: Option<usize>,
     position: Option<Duration>,
     source: Option<SavedSource>,
+    queued: Option<RelPath>,
     open: Option<String>,
+    queue: Vec<RelPath>,
 }
 
 impl PartialEntry {
@@ -451,12 +479,20 @@ impl PartialEntry {
                     .filter(|position| *position <= MAX_POSITION)
             }),
             b"source" => fill(&mut self.source, || parse_source(value)),
+            b"queued-track" => fill(&mut self.queued, || RelPath::decode(value)),
             b"open" => fill(&mut self.open, || decode_name(value)),
+            // Once full, further lines are not even decoded.
+            b"queue" if self.queue.len() < MAX_UP_NEXT => {
+                if let Some(track) = RelPath::decode(value) {
+                    self.queue.push(track);
+                }
+            }
             _ => {}
         }
     }
 
-    /// The entry; item, position and source only count with a track.
+    /// The entry; item, position, source and the queued track only count
+    /// with a track.
     fn finish(self) -> FolderEntry {
         FolderEntry {
             resume: self.track.map(|track| Resume {
@@ -464,8 +500,10 @@ impl PartialEntry {
                 item: self.item,
                 position: self.position.unwrap_or_default(),
                 source: self.source.unwrap_or_default(),
+                queued: self.queued,
             }),
             open: self.open,
+            queue: self.queue,
         }
     }
 }
@@ -616,13 +654,17 @@ pub fn render(file: &StateFile) -> Vec<u8> {
         render_settings(&mut out, settings);
     }
     for (index, (root, entry)) in file.folders.iter().take(MAX_FOLDERS).enumerate() {
-        let full = render_entry(root, entry.resume.as_ref(), entry.open.as_deref());
-        if fits(&out, &full) {
-            out.push_str(&full);
+        let head = render_entry(root, entry.resume.as_ref(), entry.open.as_deref());
+        if fits(&out, &head) {
+            out.push_str(&head);
+            // Queued tracks are dropped from the end first: whatever does not
+            // fit is cut, never the entry itself.
+            push_queue(&mut out, &entry.queue);
             continue;
         }
         if index == 0 {
-            // The current folder alone is too large: keep as much of it as fits.
+            // The current folder is too large even without its queue: keep as
+            // much of it as fits.
             let fallback = [
                 render_entry(root, None, entry.open.as_deref()),
                 render_entry(root, None, None),
@@ -636,6 +678,22 @@ pub fn render(file: &StateFile) -> Vec<u8> {
         // An older, smaller entry may still fit.
     }
     out.into_bytes()
+}
+
+/// Appends a `queue` line for each of the first (at most [`MAX_UP_NEXT`])
+/// tracks of `queue`, stopping at the first one that does not fit, so what is
+/// written is always a prefix of the queue, in order.
+fn push_queue(out: &mut String, queue: &[RelPath]) {
+    let mut line = String::new();
+    for track in queue.iter().take(MAX_UP_NEXT) {
+        line.clear();
+        // Components never hold `/`, which `encode` keeps as is.
+        push_line(&mut line, "queue", &encode(&track.0));
+        if !fits(out, &line) {
+            break;
+        }
+        out.push_str(&line);
+    }
 }
 
 /// Whether `extra` can follow `out` within [`MAX_STATE_BYTES`].
@@ -660,6 +718,8 @@ fn render_settings(out: &mut String, settings: Settings) {
     push_line(out, "lyrics", switch(settings.lyrics));
 }
 
+/// The entry's `folder` line, its resume lines (`queued-track` last) and its
+/// `open` line; the `queue` lines follow it (see [`push_queue`]).
 fn render_entry(root: &RootKey, resume: Option<&Resume>, open: Option<&str>) -> String {
     let mut out = String::new();
     push_line(&mut out, "folder", &encode(&root.0));
@@ -701,6 +761,9 @@ fn render_entry(root: &RootKey, resume: Option<&Resume>, open: Option<&str>) -> 
                 push_line(&mut out, "source", "library");
             }
         }
+        if let Some(queued) = &resume.queued {
+            push_line(&mut out, "queued-track", &encode(&queued.0));
+        }
     }
     if let Some(open) = open.filter(|name| valid_name(name)) {
         push_line(&mut out, "open", &encode(open.as_bytes()));
@@ -713,7 +776,8 @@ fn render_entry(root: &RootKey, resume: Option<&Resume>, open: Option<&str>) -> 
 /// other entries keep their order, and the list is cut to [`MAX_FOLDERS`].
 ///
 /// When the session has no resume point, `keep` (a resume point loaded at
-/// start that could not be resumed) is saved in its place.
+/// start that could not be resumed) is saved in its place. `keep` covers the
+/// resume point only: the queue and `open` always come from the session.
 #[must_use]
 pub fn merge(
     mut file: StateFile,
@@ -766,6 +830,7 @@ mod tests {
             item: Some(3),
             position: Duration::from_millis(position_ms),
             source: SavedSource::Playlist("Running".to_owned()),
+            queued: None,
         }
     }
 
@@ -781,6 +846,7 @@ mod tests {
             folder: FolderEntry {
                 resume: track.map(|t| resume(t, 135_000)),
                 open: open.map(str::to_owned),
+                ..FolderEntry::default()
             },
         }
     }
@@ -794,6 +860,7 @@ mod tests {
                     FolderEntry {
                         resume: Some(resume("Band/LP/01 Song.flac", 135_000)),
                         open: Some("Running".to_owned()),
+                        ..FolderEntry::default()
                     },
                 ),
                 (root("/mnt/other"), FolderEntry::default()),
@@ -834,8 +901,10 @@ mod tests {
                         item: None,
                         position: Duration::ZERO,
                         source: SavedSource::Playlist(awkward.to_owned()),
+                        queued: None,
                     }),
                     open: Some(awkward.to_owned()),
+                    ..FolderEntry::default()
                 },
             )],
         };
@@ -866,8 +935,10 @@ mod tests {
                         item: Some(0),
                         position: Duration::from_millis(1),
                         source: SavedSource::Library,
+                        queued: None,
                     }),
                     open: None,
+                    ..FolderEntry::default()
                 },
             )],
         };
@@ -944,8 +1015,10 @@ mod tests {
                             item: None,
                             position: Duration::ZERO,
                             source: SavedSource::Playlist(name.to_owned()),
+                            queued: None,
                         }),
                         open: Some(name.to_owned()),
+                        ..FolderEntry::default()
                     },
                 )],
             };
@@ -984,8 +1057,10 @@ mod tests {
                             item: None,
                             position: Duration::ZERO,
                             source: SavedSource::Library,
+                            queued: None,
                         }),
                         open: None,
+                        ..FolderEntry::default()
                     }
                 ),
                 (root("/b"), FolderEntry::default()),
@@ -1007,8 +1082,10 @@ mod tests {
                         item: Some(2),
                         position: Duration::from_millis(1_500),
                         source,
+                        queued: None,
                     }),
                     open: None,
+                    ..FolderEntry::default()
                 },
             )],
         }
@@ -1167,6 +1244,7 @@ mod tests {
             item: None,
             position: Duration::ZERO,
             source: SavedSource::Library,
+            queued: None,
         });
         assert_eq!(file, expected);
         assert_eq!(render(&file), old.to_vec(), "written back byte for byte");
@@ -1192,6 +1270,240 @@ mod tests {
             file.folders.starts_with(&parsed.folders),
             "only whole folders, newest first"
         );
+    }
+
+    // --- the up-next queue ---
+
+    /// A one-folder file resuming `a.mp3` (with `queued` playing after it)
+    /// and queueing `queue`.
+    fn with_queue(queued: Option<&str>, queue: &[&str]) -> StateFile {
+        StateFile {
+            settings: None,
+            folders: vec![(
+                root("/m"),
+                FolderEntry {
+                    resume: Some(Resume {
+                        track: rel("a.mp3"),
+                        item: Some(4),
+                        position: Duration::from_secs(80),
+                        source: album("Air", "Moon Safari"),
+                        queued: queued.map(rel),
+                    }),
+                    open: None,
+                    queue: queue.iter().copied().map(rel).collect(),
+                },
+            )],
+        }
+    }
+
+    /// The queue parsed from a one-folder file holding `lines` after its
+    /// `folder` line.
+    fn queue_of(lines: &str) -> Vec<RelPath> {
+        let text = format!("kasset-state 1\nfolder /m\n{lines}");
+        valid(text.as_bytes())
+            .folders
+            .into_iter()
+            .next()
+            .map(|(_, entry)| entry.queue)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn queue_round_trips_in_order_with_duplicates() {
+        let file = with_queue(None, &["x/One.mp3", "Two Words.flac", "x/One.mp3"]);
+        let text = String::from_utf8(render(&file)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            text.ends_with(
+                "\nsource album Air Moon%20Safari\n\
+                 queue x/One.mp3\nqueue Two%20Words.flac\nqueue x/One.mp3\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("queued-track"), "{text}");
+        assert_eq!(valid(text.as_bytes()), file);
+    }
+
+    #[test]
+    fn queued_track_round_trips() {
+        let file = with_queue(Some("Other/Single 1.mp3"), &["b.mp3"]);
+        let text = String::from_utf8(render(&file)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            text.ends_with(
+                "\nposition-ms 80000\nsource album Air Moon%20Safari\n\
+                 queued-track Other/Single%201.mp3\nqueue b.mp3\n"
+            ),
+            "{text}"
+        );
+        assert!(text.starts_with("kasset-state 1\n"));
+        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(valid(text.as_bytes()), file);
+
+        // `open` sits between the resume lines and the queue.
+        let mut file = file;
+        file.folders[0].1.open = Some("Gym".to_owned());
+        let text = String::from_utf8(render(&file)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            text.ends_with("\nqueued-track Other/Single%201.mp3\nopen Gym\nqueue b.mp3\n"),
+            "{text}"
+        );
+        assert_eq!(valid(text.as_bytes()), file);
+    }
+
+    #[test]
+    fn queue_round_trips_awkward_paths() {
+        let file = with_queue(
+            Some("Ünïcode dir/a b%c/\u{7f}\u{1}name\n.mp3"),
+            &["%41 100%/\u{1b}[31m.mp3", "日本語/x .mp3"],
+        );
+        let rendered = render(&file);
+        assert!(
+            rendered
+                .iter()
+                .all(|&b| b == b'\n' || (0x21..=0x7E).contains(&b) || b == b' ')
+        );
+        assert_eq!(valid(&rendered), file);
+    }
+
+    #[test]
+    fn bad_queue_lines_are_skipped_one_by_one() {
+        let queue = queue_of(
+            "queue a.mp3\n\
+             queue ../x\n\
+             queue ../../etc/passwd\n\
+             queue /etc/passwd\n\
+             queue %2F\n\
+             queue a%2Fb\n\
+             queue %2E%2E/x\n\
+             queue a/./b\n\
+             queue a//b\n\
+             queue a/\n\
+             queue a%00b\n\
+             queue \n\
+             queue\n\
+             queue a%2\n\
+             queue a%zz.mp3\n\
+             queue a%\n\
+             queue a b.mp3\n\
+             queue a\u{e9}.mp3\n\
+             Queue c.mp3\n\
+             queue  c.mp3\n\
+             queue b%20c.mp3\n\
+             queue a.mp3\n",
+        );
+        assert_eq!(queue, [rel("a.mp3"), rel("b c.mp3"), rel("a.mp3")]);
+    }
+
+    #[test]
+    fn at_most_max_up_next_queue_lines_are_kept() {
+        // Invalid lines do not count towards the limit.
+        let mut lines = String::from("queue ../bad\n");
+        for i in 0..=MAX_UP_NEXT {
+            let _ = writeln!(lines, "queue t{i}.mp3");
+        }
+        let queue = queue_of(&lines);
+        assert_eq!(queue.len(), MAX_UP_NEXT);
+        assert_eq!(queue.first(), Some(&rel("t0.mp3")));
+        assert_eq!(
+            queue.last(),
+            Some(&rel(&format!("t{}.mp3", MAX_UP_NEXT - 1))),
+            "the {}st line is ignored",
+            MAX_UP_NEXT + 1
+        );
+
+        // Nor are more ever written.
+        let mut file = with_queue(None, &[]);
+        file.folders[0].1.queue = (0..=MAX_UP_NEXT)
+            .map(|i| rel(&format!("t{i}.mp3")))
+            .collect();
+        let parsed = valid(&render(&file));
+        assert_eq!(parsed.folders[0].1.queue, queue);
+    }
+
+    #[test]
+    fn queued_track_needs_a_track() {
+        let file = valid(b"kasset-state 1\nfolder /m\nqueued-track x.mp3\nqueue y.mp3\n");
+        assert_eq!(
+            file.folders,
+            [(
+                root("/m"),
+                FolderEntry {
+                    resume: None,
+                    open: None,
+                    queue: vec![rel("y.mp3")],
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn queued_track_keeps_its_first_valid_value() {
+        let file = valid(
+            b"kasset-state 1\nfolder /m\nqueued-track ../../etc/passwd\nqueued-track a%2Fb\n\
+              queued-track \nqueued-track x.mp3\ntrack a.mp3\nqueued-track y.mp3\n",
+        );
+        let resume = file.folders[0].1.resume.as_ref();
+        assert_eq!(resume.and_then(|r| r.queued.clone()), Some(rel("x.mp3")));
+
+        let file = valid(b"kasset-state 1\nfolder /m\ntrack a.mp3\nqueued-track ../x\n");
+        let resume = file.folders[0].1.resume.as_ref();
+        assert_eq!(resume.map(|r| r.queued.clone()), Some(None));
+    }
+
+    #[test]
+    fn queue_lines_belong_to_their_folder() {
+        let file = valid(
+            b"kasset-state 1\nqueue s.mp3\nfolder /a\nqueue a.mp3\nfolder /b\nfolder /a\n\
+              queue again.mp3\nfolder /c\nqueue c.mp3\n",
+        );
+        let queues: Vec<(&RootKey, &[RelPath])> = file
+            .folders
+            .iter()
+            .map(|(r, e)| (r, e.queue.as_slice()))
+            .collect();
+        assert_eq!(
+            queues,
+            [
+                (&root("/a"), &[rel("a.mp3")][..]),
+                (&root("/b"), &[][..]),
+                (&root("/c"), &[rel("c.mp3")][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_from_0_7_0_parses_unchanged() {
+        // Written by kasset 0.7.0 (artist and album sources, no queue).
+        let old = b"kasset-state 1\nvolume 60\nshuffle on\nrepeat all\nvisualizer off\n\
+                    lyrics on\nfolder /home/user/M%C3%BAsica\ntrack Air/Moon%20Safari/A.mp3\n\
+                    item 0\nposition-ms 80000\nsource album Air Moon%20Safari\nopen Running\n\
+                    folder /mnt/other\ntrack x.mp3\nposition-ms 0\nsource artist Daft%20Punk\n";
+        let file = valid(old);
+        assert!(
+            file.folders.iter().all(|(_, e)| e.queue.is_empty()
+                && e.resume.as_ref().is_some_and(|r| r.queued.is_none()))
+        );
+        assert_eq!(
+            file.folders[0].1.resume.as_ref().map(|r| &r.source),
+            Some(&album("Air", "Moon Safari"))
+        );
+        assert_eq!(render(&file), old.to_vec(), "written back byte for byte");
+    }
+
+    #[test]
+    fn older_versions_skip_the_queue_keys() {
+        // What a version without the queue sees: the same file with the
+        // unknown keys ignored resumes the play order's track.
+        let text = String::from_utf8(render(&with_queue(Some("q.mp3"), &["b.mp3"])))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut without = String::new();
+        for line in text
+            .lines()
+            .filter(|line| !line.starts_with("queue ") && !line.starts_with("queued-track "))
+        {
+            without.push_str(line);
+            without.push('\n');
+        }
+        assert_eq!(valid(without.as_bytes()), with_queue(None, &[]));
     }
 
     // --- forgiving parsing ---
@@ -1316,6 +1628,7 @@ mod tests {
                 item: Some(1),
                 position: Duration::from_millis(5),
                 source: SavedSource::Library,
+                queued: None,
             })
         );
         assert_eq!(entry.open.as_deref(), Some("A"));
@@ -1350,6 +1663,7 @@ mod tests {
                 FolderEntry {
                     resume: None,
                     open: Some("X".to_owned()),
+                    ..FolderEntry::default()
                 }
             )]
         );
@@ -1517,12 +1831,44 @@ mod tests {
             FolderEntry {
                 resume: Some(kept.clone()),
                 open: Some("Gym".to_owned()),
+                ..FolderEntry::default()
             }
         );
 
         let new = session(Some("new.mp3"), None);
         let merged = merge(StateFile::default(), &root("/m"), &new, Some(&kept));
         assert_eq!(merged.folders[0].1, new.folder);
+    }
+
+    #[test]
+    fn merge_keeps_an_unresumed_point_beside_the_session_queue() {
+        let mut kept = resume("old.mp3", 42_000);
+        kept.queued = Some(rel("q.mp3"));
+        let mut new = session(None, None);
+        new.folder.queue = vec![rel("x.mp3"), rel("y.mp3")];
+        let on_disk = StateFile {
+            settings: None,
+            folders: vec![(
+                root("/m"),
+                FolderEntry {
+                    queue: vec![rel("stale.mp3")],
+                    ..FolderEntry::default()
+                },
+            )],
+        };
+        let merged = merge(on_disk, &root("/m"), &new, Some(&kept));
+        assert_eq!(
+            merged.folders,
+            [(
+                root("/m"),
+                FolderEntry {
+                    resume: Some(kept),
+                    open: None,
+                    queue: vec![rel("x.mp3"), rel("y.mp3")],
+                }
+            )],
+            "the queue always comes from the session"
+        );
     }
 
     // --- size limits ---
@@ -1553,8 +1899,10 @@ mod tests {
                             item: Some(i),
                             position: Duration::from_millis(1000),
                             source: SavedSource::Library,
+                            queued: None,
                         }),
                         open: Some(format!("Playlist {i}")),
+                        ..FolderEntry::default()
                     };
                     (root(&long_path(&format!("/{i}/"), 4096)), entry)
                 })
@@ -1577,8 +1925,10 @@ mod tests {
                 item: None,
                 position: Duration::ZERO,
                 source: SavedSource::Library,
+                queued: None,
             }),
             open: Some("Gym".to_owned()),
+            ..FolderEntry::default()
         };
         let file = StateFile {
             settings: Some(Settings::default()),
@@ -1599,6 +1949,7 @@ mod tests {
                     FolderEntry {
                         resume: None,
                         open: Some("Gym".to_owned()),
+                        ..FolderEntry::default()
                     }
                 ),
                 (root("/other"), FolderEntry::default())
@@ -1643,8 +1994,10 @@ mod tests {
                         item: None,
                         position: Duration::ZERO,
                         source: SavedSource::Library,
+                        queued: None,
                     }),
                     open: Some("p".repeat(200)),
+                    ..FolderEntry::default()
                 },
             )],
         };
@@ -1684,6 +2037,167 @@ mod tests {
         );
     }
 
+    /// The length of the `queue` line `render` writes for `track`.
+    fn queue_line_len(track: &RelPath) -> usize {
+        "queue \n".len() + encode(&track.0).len()
+    }
+
+    /// `MAX_UP_NEXT` distinct paths of about 300 bytes (900 encoded).
+    fn long_queue(tag: &str) -> Vec<RelPath> {
+        (0..MAX_UP_NEXT)
+            .map(|i| rel(&long_path(&format!("{tag}{i}/"), 300)))
+            .collect()
+    }
+
+    #[test]
+    fn a_long_queue_keeps_the_prefix_that_fits() {
+        let mut file = sample_file();
+        let queue = long_queue("q");
+        file.folders[0].1.queue.clone_from(&queue);
+        if let Some(resume) = file.folders[0].1.resume.as_mut() {
+            resume.queued = Some(rel("Single.mp3"));
+        }
+
+        let rendered = render(&file);
+        assert!(rendered.len() <= MAX_STATE_BYTES, "{}", rendered.len());
+        let parsed = valid(&rendered);
+        let (_, entry) = &parsed.folders[0];
+        let expected = &file.folders[0].1;
+        assert_eq!(entry.resume, expected.resume, "the resume point is kept");
+        assert_eq!(entry.open, expected.open, "the playlist is kept");
+        let kept = entry.queue.len();
+        assert!(kept > 0 && kept < MAX_UP_NEXT, "{kept}");
+        assert_eq!(entry.queue[..], queue[..kept], "a prefix, in order");
+        // An older folder small enough still fits after the cut queue.
+        assert_eq!(parsed.folders[1..], file.folders[1..]);
+        let tail = "folder /mnt/other\n".len();
+        assert!(
+            rendered.len() - tail + queue_line_len(&queue[kept]) > MAX_STATE_BYTES,
+            "the longest prefix that fits"
+        );
+        // What was kept is read back whole and written back the same.
+        assert_eq!(render(&parsed), rendered);
+    }
+
+    #[test]
+    fn a_long_queue_in_another_folder_is_cut_not_dropped() {
+        let other = long_queue("o");
+        let mut file = StateFile {
+            settings: Some(Settings::default()),
+            folders: vec![
+                (
+                    root("/home/user/Music"),
+                    with_queue(None, &["x.mp3"]).folders[0].1.clone(),
+                ),
+                (
+                    root("/mnt/other"),
+                    FolderEntry {
+                        resume: Some(resume("Band/LP/02.flac", 9_000)),
+                        open: Some("Gym".to_owned()),
+                        queue: other.clone(),
+                    },
+                ),
+                (root("/mnt/third"), FolderEntry::default()),
+            ],
+        };
+        let rendered = render(&file);
+        assert!(rendered.len() <= MAX_STATE_BYTES, "{}", rendered.len());
+        let parsed = valid(&rendered);
+        assert_eq!(
+            parsed.folders[0], file.folders[0],
+            "the current folder whole"
+        );
+        let (key, entry) = &parsed.folders[1];
+        assert_eq!(key, &root("/mnt/other"));
+        assert_eq!(entry.resume, file.folders[1].1.resume);
+        assert_eq!(entry.open, file.folders[1].1.open);
+        let kept = entry.queue.len();
+        assert!(kept > 0 && kept < MAX_UP_NEXT, "{kept}");
+        assert_eq!(entry.queue[..], other[..kept], "a prefix, in order");
+        assert_eq!(
+            parsed.folders[2..],
+            file.folders[2..],
+            "a small older folder still fits"
+        );
+
+        // Saving again in the current folder keeps the cut queue as it is.
+        file = merge(
+            parsed.clone(),
+            &root("/home/user/Music"),
+            &Session {
+                settings: Settings::default(),
+                folder: parsed.folders[0].1.clone(),
+            },
+            None,
+        );
+        assert_eq!(valid(&render(&file)), parsed);
+    }
+
+    #[test]
+    fn a_folder_too_large_without_its_queue_is_left_out() {
+        let file = StateFile {
+            settings: Some(Settings::default()),
+            folders: vec![
+                (root("/current"), FolderEntry::default()),
+                (
+                    root(&long_path("/big/", 30_000)),
+                    FolderEntry {
+                        queue: vec![rel("a.mp3")],
+                        ..FolderEntry::default()
+                    },
+                ),
+                (
+                    root("/small"),
+                    FolderEntry {
+                        queue: vec![rel("b.mp3")],
+                        ..FolderEntry::default()
+                    },
+                ),
+            ],
+        };
+        let parsed = valid(&render(&file));
+        assert_eq!(
+            parsed.folders,
+            [file.folders[0].clone(), file.folders[2].clone()]
+        );
+    }
+
+    #[test]
+    fn the_queue_goes_before_the_resume_point() {
+        // The current entry's resume point cannot fit: its queue (which would
+        // fit on its own) is dropped first, then the resume point.
+        let file = StateFile {
+            settings: Some(Settings::default()),
+            folders: vec![(
+                root("/music"),
+                FolderEntry {
+                    resume: Some(Resume {
+                        track: rel(&long_path("", 30_000)),
+                        item: None,
+                        position: Duration::ZERO,
+                        source: SavedSource::Library,
+                        queued: Some(rel("q.mp3")),
+                    }),
+                    open: Some("Gym".to_owned()),
+                    queue: vec![rel("a.mp3"), rel("b.mp3")],
+                },
+            )],
+        };
+        let rendered = render(&file);
+        assert!(rendered.len() <= MAX_STATE_BYTES);
+        assert_eq!(
+            valid(&rendered).folders,
+            [(
+                root("/music"),
+                FolderEntry {
+                    resume: None,
+                    open: Some("Gym".to_owned()),
+                    queue: Vec::new(),
+                }
+            )]
+        );
+    }
+
     #[test]
     fn hostile_input_neither_panics_nor_stalls() {
         // A 64 KiB file of very long lines.
@@ -1705,6 +2219,14 @@ mod tests {
         // 100 000 repeats of one folder.
         let same = format!("kasset-state 1\n{}", "folder /x\n".repeat(100_000));
         assert_eq!(valid(same.as_bytes()).folders.len(), 1);
+
+        // 100 000 queue lines in one folder.
+        let queue = format!(
+            "kasset-state 1\nfolder /m\n{}",
+            "queue a/b/c.mp3\n".repeat(100_000)
+        );
+        let file = valid(queue.as_bytes());
+        assert_eq!(file.folders[0].1.queue.len(), MAX_UP_NEXT);
 
         // A 40-digit number anywhere.
         let digits = "9".repeat(40);

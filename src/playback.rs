@@ -55,11 +55,7 @@ const EARLY_END_TOLERANCE: Duration = Duration::from_secs(2);
 /// [`Playback::tick`], so a run of unplayable files cannot freeze the UI.
 const MAX_ATTEMPTS_PER_CALL: usize = 16;
 
-/// Most tracks the up-next queue holds.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used from group 3 of add-play-queue")
-)]
+/// Most tracks the up-next queue holds (and the state file keeps per folder).
 pub const MAX_UP_NEXT: usize = 1000;
 
 /// Transport state shown to the user.
