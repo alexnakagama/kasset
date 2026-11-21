@@ -6,18 +6,18 @@
 //! keyboard focus ([`Focus`]); `Tab` / Shift+Tab move it. Keys act on the
 //! focused pane only ([`App::view`]).
 //!
-//! - The sidebar lists [`FIXED_ROWS`] fixed rows, "Library", "Artists" and
-//!   "Albums" (values 0, 1, 2), then the saved playlists (value
-//!   `i + FIXED_ROWS` for `playlists[i]`). Values are only ever turned into
-//!   entries through [`SidebarEntry`]. The fixed rows are never filtered
-//!   out, so the sidebar is never empty. `Enter` shows the selected entry in
-//!   the main pane and focuses it.
-//! - The main pane shows the open playlist, a browse stack, or else the
-//!   library ([`MainView`]). `open` (the playlist) and `browse` are never
-//!   both set; only `show_library`, `show_playlist` and `show_browse` set
-//!   them. Only `Enter` on a sidebar playlist opens a playlist; it is closed
-//!   by `Enter` on another sidebar entry, by deleting it, and when its file
-//!   disappears.
+//! - The sidebar lists [`FIXED_ROWS`] fixed rows, "Library", "Artists",
+//!   "Albums" and "Queue" (values 0, 1, 2, 3), then the saved playlists
+//!   (value `i + FIXED_ROWS` for `playlists[i]`). Values are only ever
+//!   turned into entries through [`SidebarEntry`]. The fixed rows are never
+//!   filtered out, so the sidebar is never empty. `Enter` shows the selected
+//!   entry in the main pane and focuses it.
+//! - The main pane shows the open playlist, a browse stack, the up-next
+//!   queue, or else the library ([`MainView`]). At most one of `open` (the
+//!   playlist), `browse` and `queue_shown` is set; only `show_library`,
+//!   `show_playlist`, `show_browse` and `show_queue` set them. Only `Enter`
+//!   on a sidebar playlist opens a playlist; it is closed by `Enter` on
+//!   another sidebar entry, by deleting it, and when its file disappears.
 //! - "Artists" and "Albums" each have a browse stack of levels
 //!   ([`BrowseKind`]) over the [`Catalog`] built once in [`App::new`]: the
 //!   artist list → an artist's albums ("All tracks" first) → tracks, and the
@@ -35,6 +35,22 @@
 //!   artist, album or "All tracks" row offers all its tracks, in the order
 //!   they are listed when opened; in a track list `a` / `A` add the selected
 //!   or the listed tracks, as in the library.
+//! - The up-next queue ([`Playback::up_next`]): `e` / `E` add the selected
+//!   track (in the library, a playlist or a browsed track list), or all the
+//!   tracks `a` would add on an artist, album or "All tracks" row, to its
+//!   end / front, with a notice. The queue view lists it with the library's
+//!   columns; its rows are positions in the queue, recomputed by
+//!   [`App::sync_queue_view`] at the start and end of every key and every
+//!   tick (so a key never acts on positions from an older queue), with the
+//!   selection following its entry as tracks are taken from the front.
+//!   There, `Enter` plays the selected entry now, `d` removes it, `J` / `K`
+//!   move it (not while filtered), `a` / `A` add to a playlist, and `Esc`
+//!   focuses "Queue" in the sidebar. `D` on "Queue" asks
+//!   ([`Mode::ConfirmClearQueue`]) and `y` empties it; a queued track that
+//!   is playing keeps playing.
+//! - While a queued track is current, the sidebar marks "Queue" and no
+//!   playlist entry or browse row is marked (the play order only waits);
+//!   the library still marks the playing track.
 //!
 //! Each list (library, sidebar, open playlist, every browse level) keeps
 //! its own filter and selection; going back leaves the parent level as it
@@ -109,7 +125,7 @@ use crate::browse::Catalog;
 use crate::keys;
 use crate::library::Track;
 use crate::lyrics::{self, Lyrics};
-use crate::playback::{Edit, Level, Notice, PlayState, Playback, Source};
+use crate::playback::{Edit, Level, MAX_UP_NEXT, Notice, PlayState, Playback, Source};
 use crate::player::Audio;
 use crate::playlist::{
     AddOutcome, Playlist, PlaylistInfo, PlaylistStore, Resolver, SaveOutcome, StoreError,
@@ -141,6 +157,9 @@ pub enum Mode {
     /// Asking whether to delete the named playlist: `y` deletes, any other
     /// key cancels.
     ConfirmDelete(String),
+    /// Asking whether to empty the up-next queue (`D` on "Queue"): `y`
+    /// clears it, any other key cancels.
+    ConfirmClearQueue,
     /// The help overlay, listing [`keys::help_lines`] from line `scroll`.
     /// Scroll keys move it; any other key closes it and does nothing else.
     Help {
@@ -231,6 +250,8 @@ pub enum View {
     Groups,
     /// The main pane, browsing the tracks of an album or of an artist.
     Tracks,
+    /// The main pane, showing the up-next queue.
+    Queue,
 }
 
 /// The pane with keyboard focus.
@@ -248,6 +269,9 @@ pub enum MainView {
     Playlist,
     /// A browse level ([`App::browse_tracks`] holds a track level's tracks).
     Browse(BrowseKind),
+    /// The up-next queue ([`App::main_list`] rows are positions in
+    /// [`Playback::up_next`]).
+    Queue,
 }
 
 /// Which sidebar entry a browse stack starts from.
@@ -296,8 +320,9 @@ pub const fn artist_album_of_value(value: usize) -> Option<usize> {
 }
 
 /// How many fixed rows the sidebar has above the playlists: "Library",
-/// "Artists" and "Albums" (D3 of add-artist-album-browsing).
-pub const FIXED_ROWS: usize = 3;
+/// "Artists", "Albums" (D3 of add-artist-album-browsing) and "Queue" (D5 of
+/// add-play-queue).
+pub const FIXED_ROWS: usize = 4;
 
 /// One sidebar row, named from its value ([`App::sidebar_list`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +333,8 @@ pub enum SidebarEntry {
     Artists,
     /// Value 2.
     Albums,
+    /// Value 3: the up-next queue.
+    Queue,
     /// Value `i + FIXED_ROWS`: [`App::playlists`]`[i]`.
     Playlist(usize),
 }
@@ -321,6 +348,7 @@ impl SidebarEntry {
             0 => Self::Library,
             1 => Self::Artists,
             2 => Self::Albums,
+            3 => Self::Queue,
             _ => Self::Playlist(value - FIXED_ROWS),
         }
     }
@@ -333,6 +361,7 @@ impl SidebarEntry {
             Self::Library => Some(0),
             Self::Artists => Some(1),
             Self::Albums => Some(2),
+            Self::Queue => Some(3),
             Self::Playlist(i) => i.checked_add(FIXED_ROWS),
         }
     }
@@ -357,6 +386,7 @@ enum SidebarPick {
     Library,
     Artists,
     Albums,
+    Queue,
     Playlist(String),
 }
 
@@ -615,6 +645,16 @@ pub struct App<A: Audio> {
     artists_nav: Vec<BrowseLevel>,
     /// What "Albums" shows, like `artists_nav`: the album list at the bottom.
     albums_nav: Vec<BrowseLevel>,
+    /// Whether the main pane shows the up-next queue. Never set together
+    /// with `open` or `browse`; only the `show_*` methods change it.
+    queue_shown: bool,
+    /// The queue view: rows are positions in [`Playback::up_next`], valid
+    /// only for the queue generation in `queue_seen` (see
+    /// [`App::sync_queue_view`]). Kept, with its filter, while hidden.
+    queue_list: ListState,
+    /// `(up_next_generation, up_next_taken)` that `queue_list` was last
+    /// computed for.
+    queue_seen: (u64, u64),
     mode: Mode,
     /// Transient message and when it expires.
     status: Option<(Notice, Instant)>,
@@ -887,8 +927,10 @@ impl<A: Audio> App<A> {
         let catalog = Catalog::build(&tracks);
         let artists_nav = vec![BrowseLevel::new(BrowseKind::Artists, &catalog)];
         let albums_nav = vec![BrowseLevel::new(BrowseKind::Albums, &catalog)];
+        let playback = Playback::new(tracks, audio);
+        let queue_seen = (playback.up_next_generation(), playback.up_next_taken());
         let mut app = Self {
-            playback: Playback::new(tracks, audio),
+            playback,
             store,
             resolver: OnceCell::new(),
             root,
@@ -902,6 +944,9 @@ impl<A: Audio> App<A> {
             browse: None,
             artists_nav,
             albums_nav,
+            queue_shown: false,
+            queue_list: ListState::default(),
+            queue_seen,
             mode: Mode::Normal,
             status: None,
             pending: notice,
@@ -942,6 +987,7 @@ impl<A: Audio> App<A> {
             (Focus::Main, MainView::Playlist) => View::Playlist,
             (Focus::Main, MainView::Browse(kind)) if kind.is_tracks() => View::Tracks,
             (Focus::Main, MainView::Browse(_)) => View::Groups,
+            (Focus::Main, MainView::Queue) => View::Queue,
         }
     }
 
@@ -955,10 +1001,15 @@ impl<A: Audio> App<A> {
     #[must_use]
     pub fn main_view(&self) -> MainView {
         debug_assert!(
-            self.open.is_none() || self.browse.is_none(),
-            "a playlist and a browse level are never both shown"
+            usize::from(self.open.is_some())
+                + usize::from(self.browse.is_some())
+                + usize::from(self.queue_shown)
+                <= 1,
+            "at most one of a playlist, a browse level and the queue is shown"
         );
-        if self.open.is_some() {
+        if self.queue_shown {
+            MainView::Queue
+        } else if self.open.is_some() {
             MainView::Playlist
         } else if let Some(level) = self.browse_level() {
             MainView::Browse(level.kind)
@@ -997,9 +1048,12 @@ impl<A: Audio> App<A> {
     /// - a track row (a position in the level's tracks) only when the
     ///   level's own album or artist is the play order and the row is its
     ///   current item, so a track played from elsewhere is never marked.
+    ///
+    /// No row is marked while a queued track is current (D8 of
+    /// add-play-queue): the play order is only waiting then.
     #[must_use]
     pub fn browse_row_playing(&self, kind: BrowseKind, value: usize) -> bool {
-        if self.playback.current_track().is_none() {
+        if self.playback.current_track().is_none() || self.playback.playing_queued() {
             return false;
         }
         let source = self.playback.source();
@@ -1046,8 +1100,9 @@ impl<A: Audio> App<A> {
     }
 
     /// The main pane's list: library indices, positions in
-    /// [`OpenPlaylist::items`] when a playlist is shown, or a browse level's
-    /// rows ([`BrowseKind`]).
+    /// [`OpenPlaylist::items`] when a playlist is shown, a browse level's
+    /// rows ([`BrowseKind`]), or positions in [`Playback::up_next`] when the
+    /// queue is shown.
     #[must_use]
     pub fn main_list(&self) -> ListView<'_> {
         self.main_list_state().view()
@@ -1055,7 +1110,9 @@ impl<A: Audio> App<A> {
 
     /// The list state of what the main pane shows.
     fn main_list_state(&self) -> &ListState {
-        if let Some(open) = &self.open {
+        if self.queue_shown {
+            &self.queue_list
+        } else if let Some(open) = &self.open {
             &open.list
         } else if let Some(level) = self.browse_level() {
             &level.list
@@ -1082,7 +1139,7 @@ impl<A: Audio> App<A> {
     }
 
     /// Library index of the selected track, in the library, an open
-    /// playlist or a browsed track list.
+    /// playlist, a browsed track list or the queue.
     #[must_use]
     pub fn selected_track(&self) -> Option<usize> {
         match self.view() {
@@ -1095,6 +1152,11 @@ impl<A: Audio> App<A> {
             View::Tracks => self
                 .browse_level()
                 .and_then(|level| level.tracks.get(level.list.selected_value()?).copied()),
+            View::Queue => self
+                .playback
+                .up_next()
+                .get(self.queue_list.selected_value()?)
+                .copied(),
         }
     }
 
@@ -1116,18 +1178,24 @@ impl<A: Audio> App<A> {
         let value = self.playlist_list.selected_value()?;
         match SidebarEntry::of_value(value) {
             SidebarEntry::Playlist(i) => self.playlists.get(i),
-            SidebarEntry::Library | SidebarEntry::Artists | SidebarEntry::Albums => None,
+            SidebarEntry::Library
+            | SidebarEntry::Artists
+            | SidebarEntry::Albums
+            | SidebarEntry::Queue => None,
         }
     }
 
     /// The sidebar value of the entry that is the play order (see
     /// [`SidebarEntry`]), while a track is loaded: "Library", the playlist,
-    /// "Artists" for an artist or "Albums" for an album. `None` before
-    /// anything was played, and while a deleted playlist plays on (no entry
-    /// is its order).
+    /// "Artists" for an artist or "Albums" for an album; "Queue" while a
+    /// queued track is current. `None` before anything was played, and while
+    /// a deleted playlist plays on (no entry is its order).
     #[must_use]
     pub fn sidebar_playing(&self) -> Option<usize> {
         self.playback.current_track()?;
+        if self.playback.playing_queued() {
+            return SidebarEntry::Queue.value();
+        }
         match self.playback.source() {
             Source::Library => SidebarEntry::Library.value(),
             // The source does not record the route: an album reached
@@ -1273,6 +1341,7 @@ impl<A: Audio> App<A> {
         }
         self.update_visualizer(now);
         self.update_lyrics();
+        self.sync_queue_view();
     }
 
     /// Reads the current track's lyrics when the pane is shown and the
@@ -1360,14 +1429,18 @@ impl<A: Audio> App<A> {
         }
         // Notices of this key press are combined only with each other.
         self.pending_fresh = false;
+        // Queue view positions are only valid for the queue as it is now.
+        self.sync_queue_view();
         match &self.mode {
             Mode::Normal => self.normal_key(key),
             Mode::Search => self.search_key(key),
             Mode::Picker(_) => self.picker_key(key),
             Mode::NameInput(_) => self.name_key(key),
             Mode::ConfirmDelete(_) => self.confirm_delete_key(key),
+            Mode::ConfirmClearQueue => self.confirm_clear_queue_key(key),
             Mode::Help { .. } => self.help_key(key),
         }
+        self.sync_queue_view();
     }
 
     fn normal_key(&mut self, key: KeyEvent) {
@@ -1393,7 +1466,9 @@ impl<A: Audio> App<A> {
                 Focus::Main => self.focus_sidebar(None),
                 Focus::Sidebar => self.focus_main(),
             },
-            KeyCode::Char('a') if matches!(self.view(), View::Library | View::Tracks) => {
+            KeyCode::Char('a')
+                if matches!(self.view(), View::Library | View::Tracks | View::Queue) =>
+            {
                 let tracks = self.selected_track().into_iter().collect();
                 self.open_picker(tracks);
             }
@@ -1411,9 +1486,17 @@ impl<A: Audio> App<A> {
                 let tracks = self.listed_browse_tracks();
                 self.open_picker(tracks);
             }
+            KeyCode::Char('A') if self.view() == View::Queue => {
+                let tracks = self.listed_queue_tracks();
+                self.open_picker(tracks);
+            }
+            KeyCode::Char(c @ ('e' | 'E')) => self.enqueue_selected(c == 'E'),
             KeyCode::Char('d') if self.view() == View::Playlist => self.remove_selected(),
             KeyCode::Char('J') if self.view() == View::Playlist => self.move_selected(true),
             KeyCode::Char('K') if self.view() == View::Playlist => self.move_selected(false),
+            KeyCode::Char('d') if self.view() == View::Queue => self.remove_selected_queued(),
+            KeyCode::Char('J') if self.view() == View::Queue => self.move_selected_queued(true),
+            KeyCode::Char('K') if self.view() == View::Queue => self.move_selected_queued(false),
             KeyCode::Char('R') if self.view() == View::Playlists => self.start_rename(),
             KeyCode::Char('D') if self.view() == View::Playlists => self.start_delete(),
             KeyCode::Char(' ') => self.playback.toggle_pause(),
@@ -1446,9 +1529,9 @@ impl<A: Audio> App<A> {
     }
 
     /// `Esc` in Normal mode: clears the focused list's filter; else, in the
-    /// main pane, goes back one browse level; else, from a shown playlist or
-    /// the top browse level, focuses the sidebar with that entry selected
-    /// (the main pane keeps showing it).
+    /// main pane, goes back one browse level; else, from a shown playlist,
+    /// the queue or the top browse level, focuses the sidebar with that
+    /// entry selected (the main pane keeps showing it).
     fn escape(&mut self) {
         if !self.query().is_empty() {
             self.clear_filter();
@@ -1458,6 +1541,7 @@ impl<A: Audio> App<A> {
             return;
         }
         let pick = match (&self.open, self.browse) {
+            _ if self.queue_shown => SidebarPick::Queue,
             (Some(open), _) => SidebarPick::Playlist(open.name().to_owned()),
             (None, Some(root)) => root.into(),
             (None, None) => return,
@@ -1597,11 +1681,7 @@ impl<A: Audio> App<A> {
         let Mode::ConfirmDelete(name) = std::mem::replace(&mut self.mode, Mode::Normal) else {
             return;
         };
-        let yes = key.code == KeyCode::Char('y')
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        if yes {
+        if is_yes(&key) {
             self.delete_playlist(&name);
         } else {
             self.notify(Notice::info(format!("{} was not deleted", quoted(&name))));
@@ -1675,6 +1755,9 @@ impl<A: Audio> App<A> {
         if self.focus == Focus::Sidebar {
             return &mut self.playlist_list;
         }
+        if self.queue_shown {
+            return &mut self.queue_list;
+        }
         if let Some(open) = &mut self.open {
             return &mut open.list;
         }
@@ -1706,7 +1789,7 @@ impl<A: Audio> App<A> {
             {
                 ALL_TRACKS_VALUE + 1
             }
-            View::Library | View::Playlist | View::Groups | View::Tracks => 0,
+            View::Library | View::Playlist | View::Groups | View::Tracks | View::Queue => 0,
         };
         // An emptied query is no filter: the top row, not the first match.
         let skip = if self.query().is_empty() { 0 } else { always };
@@ -1719,6 +1802,10 @@ impl<A: Audio> App<A> {
     fn refilter_current(&mut self) {
         if self.focus == Focus::Sidebar {
             self.refilter_sidebar();
+            return;
+        }
+        if self.queue_shown {
+            self.refilter_queue();
             return;
         }
         let keys = &self.search_keys;
@@ -1755,7 +1842,10 @@ impl<A: Audio> App<A> {
                     SidebarEntry::Playlist(i) => infos
                         .get(i)
                         .is_none_or(|info| info.name.to_lowercase().contains(q)),
-                    SidebarEntry::Library | SidebarEntry::Artists | SidebarEntry::Albums => true,
+                    SidebarEntry::Library
+                    | SidebarEntry::Artists
+                    | SidebarEntry::Albums
+                    | SidebarEntry::Queue => true,
                 },
             );
     }
@@ -1765,7 +1855,9 @@ impl<A: Audio> App<A> {
         let len = match self.focus {
             Focus::Sidebar => self.playlists.len() + FIXED_ROWS,
             Focus::Main => {
-                if let Some(open) = &self.open {
+                if self.queue_shown {
+                    self.playback.up_next().len()
+                } else if let Some(open) = &self.open {
                     open.items.len()
                 } else if let Some(level) = self.browse_level() {
                     level.len(&self.catalog)
@@ -1793,6 +1885,7 @@ impl<A: Audio> App<A> {
             View::Playlists => self.show_selected(),
             View::Groups => self.browse_into(),
             View::Tracks => self.play_browsed(),
+            View::Queue => self.play_selected_queued(),
             View::Playlist => {
                 let Some(open) = &self.open else {
                     return;
@@ -1868,11 +1961,11 @@ impl<A: Audio> App<A> {
     }
 
     /// `Enter` in the sidebar: "Library" shows the library, "Artists" and
-    /// "Albums" their browse stack as it was left; a playlist is opened (or,
-    /// if already shown, reloaded only if its file changed, so it keeps its
-    /// filter and selection). The main pane gets the focus, unless the
-    /// playlist could not be read: then focus and the main pane stay as they
-    /// were.
+    /// "Albums" their browse stack as it was left, "Queue" the up-next
+    /// queue; a playlist is opened (or, if already shown, reloaded only if
+    /// its file changed, so it keeps its filter and selection). The main
+    /// pane gets the focus, unless the playlist could not be read: then
+    /// focus and the main pane stay as they were.
     fn show_selected(&mut self) {
         let Some(value) = self.playlist_list.selected_value() else {
             return;
@@ -1889,6 +1982,10 @@ impl<A: Audio> App<A> {
             }
             SidebarEntry::Albums => {
                 self.show_browse(BrowseRoot::Albums);
+                return;
+            }
+            SidebarEntry::Queue => {
+                self.show_queue();
                 return;
             }
             SidebarEntry::Playlist(index) => index,
@@ -1908,25 +2005,39 @@ impl<A: Audio> App<A> {
         }
     }
 
-    /// Shows the library in the main pane, closing a shown playlist or
-    /// browse stack (the stacks themselves are kept). Focus is not moved.
+    /// Shows the library in the main pane, closing a shown playlist, browse
+    /// stack or queue (the stacks and the queue view are kept). Focus is not
+    /// moved.
     fn show_library(&mut self) {
         self.open = None;
         self.browse = None;
+        self.queue_shown = false;
     }
 
     /// Shows `open` in the main pane in place of what it showed. Focus is
     /// not moved.
     fn show_playlist(&mut self, open: OpenPlaylist) {
         self.browse = None;
+        self.queue_shown = false;
         self.open = Some(open);
     }
 
     /// Shows the browse stack of `root` as it was left and focuses the main
-    /// pane, closing a shown playlist.
+    /// pane, closing a shown playlist or queue.
     fn show_browse(&mut self, root: BrowseRoot) {
         self.open = None;
+        self.queue_shown = false;
         self.browse = Some(root);
+        self.focus = Focus::Main;
+    }
+
+    /// Shows the up-next queue (with the filter and selection it was left
+    /// with) and focuses the main pane, closing a shown playlist or browse
+    /// stack.
+    fn show_queue(&mut self) {
+        self.open = None;
+        self.browse = None;
+        self.queue_shown = true;
         self.focus = Focus::Main;
     }
 
@@ -1952,6 +2063,7 @@ impl<A: Audio> App<A> {
             SidebarEntry::Library => Some(SidebarPick::Library),
             SidebarEntry::Artists => Some(SidebarPick::Artists),
             SidebarEntry::Albums => Some(SidebarPick::Albums),
+            SidebarEntry::Queue => Some(SidebarPick::Queue),
             SidebarEntry::Playlist(_) => self
                 .selected_playlist()
                 .map(|info| SidebarPick::Playlist(info.name.clone())),
@@ -1964,6 +2076,7 @@ impl<A: Audio> App<A> {
             SidebarPick::Library => SidebarEntry::Library.value(),
             SidebarPick::Artists => SidebarEntry::Artists.value(),
             SidebarPick::Albums => SidebarEntry::Albums.value(),
+            SidebarPick::Queue => SidebarEntry::Queue.value(),
             SidebarPick::Playlist(name) => self.sidebar_value_of(name),
         }
     }
@@ -2791,6 +2904,192 @@ impl<A: Audio> App<A> {
     }
 }
 
+/// The up-next queue: `e` / `E` in the track and group lists, the queue view
+/// (D6 of add-play-queue) and clearing it (D7).
+///
+/// Queue view rows are positions in [`Playback::up_next`], which change
+/// whenever the queue does (an `n`, a track's end, an edit). They are
+/// recomputed by [`App::sync_queue_view`] at the start and end of every key
+/// and every tick, so a key never acts on positions from an older queue.
+impl<A: Audio> App<A> {
+    /// Recomputes the queue view's rows when the queue changed since they
+    /// were computed. The selection follows its entry: when `k` tracks were
+    /// taken from the front to play them, it moves up `k` positions. If its
+    /// own entry was taken, it goes to the front entry when that is listed,
+    /// else stays on the same row (clamped); a position no longer listed
+    /// under a filter does the same. Otherwise the position is kept. The
+    /// callers that edit the queue (`d`, `J`/`K`, `Enter`, `E`) set the
+    /// selection themselves after calling this.
+    fn sync_queue_view(&mut self) {
+        let seen = (
+            self.playback.up_next_generation(),
+            self.playback.up_next_taken(),
+        );
+        if seen.0 == self.queue_seen.0 {
+            return;
+        }
+        let taken = usize::try_from(seen.1.wrapping_sub(self.queue_seen.1)).unwrap_or(usize::MAX);
+        self.queue_seen = seen;
+        let keep = self
+            .queue_list
+            .selected_value()
+            .map(|pos| pos.saturating_sub(taken));
+        self.refilter_queue();
+        self.queue_list.select_value(keep);
+    }
+
+    /// Recomputes the queue view's rows for its query (the library's search
+    /// keys); the selection is not moved.
+    fn refilter_queue(&mut self) {
+        let keys = &self.search_keys;
+        let up_next = self.playback.up_next();
+        self.queue_list.refilter(up_next.len(), |i, q| {
+            up_next
+                .get(i)
+                .and_then(|&t| keys.get(t))
+                .is_some_and(|k| k.contains(q))
+        });
+    }
+
+    /// The tracks the queue view lists (its filter applied), in queue order.
+    fn listed_queue_tracks(&self) -> Vec<usize> {
+        let up_next = self.playback.up_next();
+        self.queue_list
+            .rows
+            .iter()
+            .filter_map(|&pos| up_next.get(pos).copied())
+            .collect()
+    }
+
+    /// `Enter` in the queue view: takes the selected entry out of the queue
+    /// and plays it now; the play order does not move. The same row stays
+    /// selected, now showing the next entry.
+    fn play_selected_queued(&mut self) {
+        let row = self.queue_list.selected;
+        let Some(pos) = self.queue_list.selected_value() else {
+            return;
+        };
+        if self.playback.play_queued(pos) {
+            self.sync_queue_view();
+            self.queue_list.select_row(row);
+        }
+    }
+
+    /// `d` in the queue view: removes the selected entry; the same row stays
+    /// selected (clamped), now showing the next entry.
+    fn remove_selected_queued(&mut self) {
+        let row = self.queue_list.selected;
+        let Some(pos) = self.queue_list.selected_value() else {
+            return;
+        };
+        if self.playback.remove_queued(pos) {
+            self.sync_queue_view();
+            self.queue_list.select_row(row);
+        }
+    }
+
+    /// `J` / `K` in the queue view: moves the selected entry one position
+    /// down / up, keeping it selected. Refused with a filter active, like
+    /// in a playlist.
+    fn move_selected_queued(&mut self, down: bool) {
+        if !self.queue_list.query.is_empty() {
+            self.notify(Notice::info("Clear the filter (Esc) to reorder"));
+            return;
+        }
+        let Some(from) = self.queue_list.selected_value() else {
+            return;
+        };
+        let to = if down {
+            from.checked_add(1)
+        } else {
+            from.checked_sub(1)
+        };
+        // Past either end: nothing to do.
+        let Some(to) = to.filter(|&to| to < self.playback.up_next().len()) else {
+            return;
+        };
+        if self.playback.move_queued(from, to) {
+            self.sync_queue_view();
+            self.queue_list.select_value(Some(to));
+        }
+    }
+
+    /// `e` / `E` (`front`): adds the selected track, or every track of the
+    /// selected artist, album or "All tracks" row (in the order `a` adds
+    /// them), to the end / the front of the queue. Nothing in the sidebar,
+    /// the queue view or with nothing selected.
+    fn enqueue_selected(&mut self, front: bool) {
+        let tracks: Vec<usize> = match self.view() {
+            View::Library | View::Playlist | View::Tracks => {
+                self.selected_track().into_iter().collect()
+            }
+            View::Groups => self.selected_group_tracks().unwrap_or_default(),
+            View::Playlists | View::Queue => return,
+        };
+        if tracks.is_empty() {
+            return;
+        }
+        let selected = self.queue_list.selected_value();
+        let added = self.playback.enqueue(&tracks, front);
+        if front && added > 0 {
+            // Entries moved down by `added`: the queue view (shown or not)
+            // keeps its selected entry.
+            self.sync_queue_view();
+            self.queue_list
+                .select_value(selected.map(|pos| pos.saturating_add(added)));
+        }
+        let notice = if added == 0 {
+            if self.playback.up_next().len() >= MAX_UP_NEXT {
+                Notice::info(format!("The queue is full ({MAX_UP_NEXT} tracks)"))
+            } else {
+                // The tracks come from this very library, so this cannot
+                // happen; reported rather than ignored all the same.
+                Notice::error("Cannot queue: the track list does not match the library")
+            }
+        } else if added < tracks.len() {
+            Notice::info(format!(
+                "Queued {added} of {} tracks; the queue is full ({MAX_UP_NEXT})",
+                tracks.len()
+            ))
+        } else if let [track] = tracks[..] {
+            let title = self
+                .playback
+                .tracks()
+                .get(track)
+                .map_or("", |t| t.title.as_str());
+            let title = single_quoted(title);
+            Notice::info(if front {
+                format!("Playing next: {title}")
+            } else {
+                format!("Queued {title}")
+            })
+        } else if front {
+            Notice::info(format!("{added} tracks play next"))
+        } else {
+            Notice::info(format!("Queued {added} tracks"))
+        };
+        self.notify(notice);
+    }
+
+    /// A key in the clear-the-queue confirmation: `y` empties the queue (a
+    /// queued track that is playing keeps playing), anything else cancels.
+    fn confirm_clear_queue_key(&mut self, key: KeyEvent) {
+        self.mode = Mode::Normal;
+        if !is_yes(&key) {
+            self.notify(Notice::info("The queue was not cleared"));
+            return;
+        }
+        let cleared = self.playback.up_next().len();
+        // Silent when the queue emptied itself while the prompt was open.
+        if self.playback.clear_queued() {
+            self.notify(Notice::info(format!(
+                "Cleared the queue ({})",
+                count(cleared, "track", "tracks")
+            )));
+        }
+    }
+}
+
 /// Renaming and deleting playlists: `R` and `D` in the sidebar.
 impl<A: Audio> App<A> {
     /// `R`: asks for a new name for the playlist selected in the sidebar,
@@ -2865,10 +3164,19 @@ impl<A: Audio> App<A> {
         }
     }
 
-    /// `D`: asks whether to delete the playlist selected in the sidebar.
-    /// Nothing on the "Library" row.
+    /// `D`: asks whether to delete the playlist selected in the sidebar, or
+    /// on "Queue" whether to clear a non-empty queue. Nothing on the other
+    /// fixed rows.
     fn start_delete(&mut self) {
-        if let Some(name) = self.selected_playlist().map(|info| info.name.clone()) {
+        let on_queue = self
+            .playlist_list
+            .selected_value()
+            .is_some_and(|value| SidebarEntry::of_value(value) == SidebarEntry::Queue);
+        if on_queue {
+            if !self.playback.up_next().is_empty() {
+                self.mode = Mode::ConfirmClearQueue;
+            }
+        } else if let Some(name) = self.selected_playlist().map(|info| info.name.clone()) {
             self.mode = Mode::ConfirmDelete(name);
         }
     }
@@ -2927,6 +3235,19 @@ fn accepts_char(key: &KeyEvent, c: char) -> bool {
 /// A playlist name for messages: sanitised and in quotes.
 fn quoted(name: &str) -> String {
     format!("\"{}\"", sanitize(name).unwrap_or_default())
+}
+
+/// A track title for messages: sanitised and in single quotes.
+fn single_quoted(title: &str) -> String {
+    format!("'{}'", sanitize(title).unwrap_or_default())
+}
+
+/// Whether `key` answers a y/n question with yes: a plain `y`.
+fn is_yes(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('y')
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 /// `1 entry`, `2 entries`.
@@ -3529,7 +3850,11 @@ mod playlist_tests {
     #[test]
     fn open_playlists_view_without_folder_writes_nothing() -> Result<()> {
         let mut m = abcd()?;
-        assert_eq!(m.app.sidebar_list().rows, [0, 1, 2], "only the fixed rows");
+        assert_eq!(
+            m.app.sidebar_list().rows,
+            (0..FIXED_ROWS).collect::<Vec<_>>(),
+            "only the fixed rows"
+        );
         m.keys(&[KeyCode::Tab]);
         assert_eq!(m.app.view(), View::Playlists);
         assert_eq!(m.app.playlists(), []);
@@ -3632,6 +3957,7 @@ mod playlist_tests {
                     SidebarEntry::Library => "Library".to_owned(),
                     SidebarEntry::Artists => "Artists".to_owned(),
                     SidebarEntry::Albums => "Albums".to_owned(),
+                    SidebarEntry::Queue => "Queue".to_owned(),
                     SidebarEntry::Playlist(i) => self
                         .app
                         .playlists()
@@ -3661,12 +3987,16 @@ mod playlist_tests {
         m.keys(&[KeyCode::Tab]);
         assert_eq!(
             m.sidebar_rows(),
-            ["Library", "Artists", "Albums", "Gym", "Long run", "Running"]
+            [
+                "Library", "Artists", "Albums", "Queue", "Gym", "Long run", "Running"
+            ]
         );
         m.chars("/run");
         assert_eq!(
             m.sidebar_rows(),
-            ["Library", "Artists", "Albums", "Long run", "Running"]
+            [
+                "Library", "Artists", "Albums", "Queue", "Long run", "Running"
+            ]
         );
         assert_eq!(m.selected_playlist_name().as_deref(), Some("Long run"));
         m.chars("ning");
@@ -3674,7 +4004,7 @@ mod playlist_tests {
         m.chars("zzz");
         assert_eq!(
             m.sidebar_rows(),
-            ["Library", "Artists", "Albums"],
+            ["Library", "Artists", "Albums", "Queue"],
             "never filtered out"
         );
         assert_eq!(m.app.selected(), Some(0));
@@ -3709,7 +4039,7 @@ mod playlist_tests {
         m.restart(None);
         assert_eq!(
             m.sidebar_rows(),
-            ["Library", "Artists", "Albums", "Gym", "Running"]
+            ["Library", "Artists", "Albums", "Queue", "Gym", "Running"]
         );
         assert_eq!(m.info("Gym").and_then(|i| i.tracks), Some(2));
         Ok(())
@@ -3720,7 +4050,7 @@ mod playlist_tests {
     fn no_folder_lists_only_library_and_writes_nothing() -> Result<()> {
         let mut m = abcd()?;
         m.restart(None);
-        assert_eq!(m.sidebar_rows(), ["Library", "Artists", "Albums"]);
+        assert_eq!(m.sidebar_rows(), ["Library", "Artists", "Albums", "Queue"]);
         assert_eq!(m.status(), "");
         assert!(!m.dir().exists());
         Ok(())
@@ -3749,7 +4079,7 @@ mod playlist_tests {
         assert!(text.starts_with("Cannot list playlists"), "{text}");
         assert!(text.ends_with("; 3 entries skipped"), "{text}");
         assert_eq!(notice.map(|n| n.level), Some(Level::Error));
-        assert_eq!(m.sidebar_rows(), ["Library", "Artists", "Albums"]);
+        assert_eq!(m.sidebar_rows(), ["Library", "Artists", "Albums", "Queue"]);
         Ok(())
     }
 
@@ -3856,7 +4186,7 @@ mod playlist_tests {
         m.keys(&[KeyCode::Tab]);
         assert_eq!(
             m.sidebar_rows(),
-            ["Library", "Artists", "Albums", "Gym", "Running"]
+            ["Library", "Artists", "Albums", "Queue", "Gym", "Running"]
         );
         assert_eq!(m.app.main_view(), MainView::Library);
         m.chars("j");
@@ -6212,6 +6542,30 @@ mod lyrics_tests {
             .and_then(|n| n.to_str())
     }
 
+    /// A queued track is the current track: the pane reads its sidecar,
+    /// and the play order's track again once the queue is done
+    /// (`loaded_for` follows `Playback::current`).
+    #[test]
+    fn a_queued_track_gets_its_own_lyrics() -> Result<()> {
+        let mut f = Folder::shown()?;
+        let now = Instant::now();
+        f.play(now);
+        assert_eq!(first_text(&f.app).as_deref(), Some("First"));
+        // Queue "three" (plain sidecar) from the library and skip to it.
+        f.press(&[ch('j'), ch('j'), ch('e'), ch('n')]);
+        assert!(f.app.playback().playing_queued());
+        assert_eq!(file_name(&f.app), Some("three.wav"));
+        assert!(!f.app.lyrics_ready(), "not read before the tick");
+        f.app.tick(now);
+        assert_eq!(first_text(&f.app).as_deref(), Some("Just words"));
+        f.press(&[ch('n')]);
+        f.app.tick(now);
+        assert_eq!(file_name(&f.app), Some("two.wav"), "the play order goes on");
+        assert!(f.app.lyrics_ready());
+        assert_eq!(f.app.lyrics(), None);
+        Ok(())
+    }
+
     #[test]
     fn on_at_start_with_nothing_loaded() -> Result<()> {
         let mut f = Folder::new()?;
@@ -7698,7 +8052,19 @@ mod browse_tests {
                         .and_then(|&t| tracks.get(t))
                         .map(|t| t.title.clone()),
                     MainView::Library => tracks.get(value).map(|t| t.title.clone()),
-                    MainView::Playlist => None,
+                    MainView::Playlist => self
+                        .app
+                        .open_playlist()
+                        .and_then(|open| open.items().get(value))
+                        .and_then(|&t| tracks.get(t))
+                        .map(|t| t.title.clone()),
+                    MainView::Queue => self
+                        .app
+                        .playback()
+                        .up_next()
+                        .get(value)
+                        .and_then(|&t| tracks.get(t))
+                        .map(|t| t.title.clone()),
                 })
                 .map(|name| name.unwrap_or_else(|| "<missing>".to_owned()))
                 .collect()
@@ -7745,6 +8111,80 @@ mod browse_tests {
                 .iter()
                 .position(|artist| artist.name() == name)
         }
+
+        /// The library index of the track titled `title`.
+        fn track(&self, title: &str) -> Result<usize> {
+            self.app
+                .playback()
+                .tracks()
+                .iter()
+                .position(|t| t.title == title)
+                .with_context(|| format!("no track {title}"))
+        }
+
+        /// The titles of library tracks `indices`.
+        fn titles(&self, indices: &[usize]) -> Vec<String> {
+            let tracks = self.app.playback().tracks();
+            indices
+                .iter()
+                .map(|&i| tracks.get(i).map_or("<missing>", |t| t.title.as_str()))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The titles of the queued tracks, in queue order.
+        fn queue(&self) -> Vec<String> {
+            self.titles(self.app.playback().up_next())
+        }
+
+        /// The title of the current track.
+        fn current(&self) -> Option<String> {
+            self.app.playback().current_track().map(|t| t.title.clone())
+        }
+
+        /// Adds the tracks titled `titles` to the end of the queue directly.
+        fn enqueue(&mut self, titles: &[&str]) -> Result<()> {
+            let tracks = titles
+                .iter()
+                .map(|title| self.track(title))
+                .collect::<Result<Vec<_>>>()?;
+            let added = self.app.playback_mut().enqueue(&tracks, false);
+            assert_eq!(added, tracks.len());
+            Ok(())
+        }
+
+        /// The status text after a tick.
+        fn status(&mut self) -> String {
+            let now = Instant::now();
+            self.app.tick(now);
+            self.app
+                .status(now)
+                .map_or_else(String::new, |n| n.text.clone())
+        }
+
+        /// A key with Shift held (`D`, `E`, `J`, `K`).
+        fn shift(&mut self, c: char) {
+            self.app
+                .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT));
+        }
+
+        /// `Enter` on "Queue" in the sidebar.
+        fn show_queue(&mut self) -> Result<()> {
+            self.show(SidebarEntry::Queue)?;
+            assert_eq!(self.app.main_view(), MainView::Queue);
+            assert_eq!(self.app.view(), View::Queue);
+            Ok(())
+        }
+
+        /// Plays "La Femme d'Argent", the first track of "Moon Safari", with
+        /// the album as the play order, and leaves the album shown.
+        fn play_moon_safari(&mut self) -> Result<()> {
+            self.show(SidebarEntry::Albums)?;
+            self.open("Moon Safari")?;
+            self.open("La Femme d'Argent")?;
+            assert_eq!(self.current().as_deref(), Some("La Femme d'Argent"));
+            Ok(())
+        }
     }
 
     // --- Sidebar fixed rows (task 4.1) ---
@@ -7754,7 +8194,10 @@ mod browse_tests {
         let mut m = music()?;
         m.write("Gym", &[("Air", "Moon Safari", "Sexy Boy")])?;
         m.keys(&[KeyCode::Tab]);
-        assert_eq!(m.app.visible(), [0, 1, 2, 3]);
+        let gym = SidebarEntry::Playlist(0).value();
+        let mut expected: Vec<usize> = (0..FIXED_ROWS).collect();
+        expected.extend(gym);
+        assert_eq!(m.app.visible(), expected);
         let entries: Vec<SidebarEntry> = m
             .app
             .visible()
@@ -7767,6 +8210,7 @@ mod browse_tests {
                 SidebarEntry::Library,
                 SidebarEntry::Artists,
                 SidebarEntry::Albums,
+                SidebarEntry::Queue,
                 SidebarEntry::Playlist(0)
             ]
         );
@@ -7782,13 +8226,21 @@ mod browse_tests {
             m.app.selected_playlist().map(|p| p.name.as_str()),
             Some("Gym")
         );
-        // `R` and `D` do nothing on the fixed rows.
-        m.select_in_sidebar(SidebarEntry::Artists)?;
-        m.app
-            .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
-        m.app
-            .handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
-        assert_eq!(*m.app.mode(), Mode::Normal);
+        // `R` and `D` do nothing on the fixed rows (`D` on an empty queue
+        // included).
+        for entry in [
+            SidebarEntry::Library,
+            SidebarEntry::Artists,
+            SidebarEntry::Albums,
+            SidebarEntry::Queue,
+        ] {
+            m.select_in_sidebar(entry)?;
+            m.app
+                .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+            m.app
+                .handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+            assert_eq!(*m.app.mode(), Mode::Normal, "{entry:?}");
+        }
         Ok(())
     }
 
@@ -7810,13 +8262,16 @@ mod browse_tests {
         m.write("Gym", &[])?;
         m.keys(&[KeyCode::Tab]);
         m.chars("/zzz");
-        assert_eq!(m.app.visible(), [0, 1, 2]);
+        let fixed: Vec<usize> = (0..FIXED_ROWS).collect();
+        let mut with_gym = fixed.clone();
+        with_gym.extend(SidebarEntry::Playlist(0).value());
+        assert_eq!(m.app.visible(), fixed);
         assert_eq!(m.app.selected(), Some(0));
         m.keys(&[KeyCode::Esc, KeyCode::Esc]);
-        assert_eq!(m.app.visible(), [0, 1, 2, 3]);
+        assert_eq!(m.app.visible(), with_gym);
         // A match selects the first matching playlist, not a fixed row.
         m.chars("/gy");
-        assert_eq!(m.app.visible(), [0, 1, 2, 3]);
+        assert_eq!(m.app.visible(), with_gym);
         assert_eq!(
             m.app.selected_playlist().map(|p| p.name.as_str()),
             Some("Gym")
@@ -8838,6 +9293,592 @@ mod browse_tests {
             m.artist("Air").map(Source::Artist).as_ref(),
             Some(m.app.playback().source())
         );
+        Ok(())
+    }
+
+    // --- Up-next queue: sidebar row and queue view (group 3 of
+    // add-play-queue) ---
+
+    /// Spec *Open the queue*.
+    #[test]
+    fn open_the_queue() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Crying"])?;
+        m.show_queue()?;
+        assert_eq!(m.app.focus(), Focus::Main);
+        assert_eq!(m.names(), ["Venus", "Crying"]);
+        assert_eq!(m.app.main_list().selected, Some(0));
+        assert_eq!(m.app.playback().up_next().len(), 2, "the sidebar count");
+        Ok(())
+    }
+
+    /// Spec *Empty queue*, at the app level: no rows, nothing selected, and
+    /// the list keys do nothing.
+    #[test]
+    fn empty_queue_view_is_harmless() -> Result<()> {
+        let mut m = music()?;
+        m.show_queue()?;
+        assert_eq!(m.app.visible(), [] as [usize; 0]);
+        assert_eq!(m.app.selected_track(), None);
+        m.chars("jdG");
+        m.shift('J');
+        m.shift('K');
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.current(), None);
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        Ok(())
+    }
+
+    /// Spec *View follows the queue*.
+    #[test]
+    fn view_follows_the_queue() -> Result<()> {
+        let mut m = music()?;
+        m.play_moon_safari()?;
+        m.enqueue(&["Venus", "Crying"])?;
+        m.show_queue()?;
+        m.end_track();
+        assert_eq!(m.current().as_deref(), Some("Venus"));
+        assert_eq!(m.names(), ["Crying"]);
+        Ok(())
+    }
+
+    /// Spec *Esc from the queue*: a filter is cleared first.
+    #[test]
+    fn esc_from_the_queue_focuses_its_sidebar_row() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Crying"])?;
+        m.show_queue()?;
+        m.chars("/cry");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.names(), ["Crying"]);
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.app.focus(), Focus::Main, "the filter goes first");
+        assert_eq!(m.names(), ["Venus", "Crying"]);
+        m.keys(&[KeyCode::Esc]);
+        assert_eq!(m.app.focus(), Focus::Sidebar);
+        assert_eq!(
+            m.app
+                .sidebar_list()
+                .selected
+                .map(|row| m.app.sidebar_list().rows[row]),
+            SidebarEntry::Queue.value()
+        );
+        assert_eq!(m.app.main_view(), MainView::Queue, "still shown");
+        // Backspace does nothing in the queue view.
+        m.keys(&[KeyCode::Tab, KeyCode::Backspace]);
+        assert_eq!(m.app.view(), View::Queue);
+        Ok(())
+    }
+
+    /// Spec *Remove from the queue*.
+    #[test]
+    fn d_removes_the_selected_queued_entry() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.select("Sexy Boy")?;
+        m.chars("d");
+        assert_eq!(m.queue(), ["Venus", "Crying"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Crying"), "the next one");
+        m.chars("d");
+        assert_eq!(m.queue(), ["Venus"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Venus"), "clamped");
+        Ok(())
+    }
+
+    /// Spec *Reorder the queue*; past either end nothing moves.
+    #[test]
+    fn shift_j_and_k_move_the_selected_queued_entry() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.select("Crying")?;
+        m.shift('K');
+        assert_eq!(m.queue(), ["Venus", "Crying", "Sexy Boy"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Crying"));
+        m.shift('K');
+        m.shift('K');
+        assert_eq!(m.queue(), ["Crying", "Venus", "Sexy Boy"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Crying"));
+        m.shift('J');
+        assert_eq!(m.queue(), ["Venus", "Crying", "Sexy Boy"]);
+        m.select("Sexy Boy")?;
+        m.shift('J');
+        assert_eq!(m.queue(), ["Venus", "Crying", "Sexy Boy"]);
+        Ok(())
+    }
+
+    /// Spec *Reorder refused while filtered*.
+    #[test]
+    fn reorder_is_refused_while_filtered() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.chars("/y");
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.names(), ["Sexy Boy", "Crying"]);
+        m.shift('J');
+        assert_eq!(m.queue(), ["Venus", "Sexy Boy", "Crying"]);
+        assert_eq!(m.status(), "Clear the filter (Esc) to reorder");
+        // `d` works with a filter: it removes the entry selected.
+        m.chars("d");
+        assert_eq!(m.queue(), ["Venus", "Crying"]);
+        assert_eq!(m.names(), ["Crying"]);
+        Ok(())
+    }
+
+    /// Spec *Play a queued track now*: the play order does not move.
+    #[test]
+    fn enter_plays_a_queued_track_now() -> Result<()> {
+        let mut m = music()?;
+        m.play_moon_safari()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.select("Sexy Boy")?;
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.current().as_deref(), Some("Sexy Boy"));
+        assert!(m.app.playback().playing_queued());
+        assert_eq!(m.queue(), ["Venus", "Crying"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Crying"));
+        assert_eq!(m.app.playback().source_item(), Some(0), "album cursor");
+        m.end_track();
+        assert_eq!(m.current().as_deref(), Some("Venus"));
+        m.end_track();
+        m.end_track();
+        assert_eq!(m.current().as_deref(), Some("Sexy Boy"), "the album's 2nd");
+        assert!(!m.app.playback().playing_queued());
+        Ok(())
+    }
+
+    /// Spec *Selection follows the entry*, both after a tick and with no
+    /// tick between `n` and `d`.
+    #[test]
+    fn queue_selection_follows_its_entry() -> Result<()> {
+        let mut m = music()?;
+        m.play_moon_safari()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying", "Human Behaviour"])?;
+        m.show_queue()?;
+        m.select("Crying")?;
+        m.end_track();
+        assert_eq!(m.names(), ["Sexy Boy", "Crying", "Human Behaviour"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Crying"));
+        m.chars("nd");
+        assert_eq!(m.current().as_deref(), Some("Sexy Boy"));
+        assert_eq!(m.queue(), ["Human Behaviour"], "Crying was removed");
+        Ok(())
+    }
+
+    /// The selected entry itself is taken: the selection moves to the new
+    /// first entry; with a filter, positions are mapped too.
+    #[test]
+    fn queue_selection_when_its_entry_plays() -> Result<()> {
+        let mut m = music()?;
+        m.play_moon_safari()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.chars("n");
+        assert_eq!(m.names(), ["Sexy Boy", "Crying"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Sexy Boy"));
+
+        m.chars("/y");
+        m.keys(&[KeyCode::Enter]);
+        m.select("Crying")?;
+        m.chars("n");
+        assert_eq!(m.names(), ["Crying"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Crying"));
+
+        // Filtered, the selected entry itself taken: the new front entry
+        // when it is listed.
+        m.enqueue(&["Sexy Boy", "Kelly Watch the Stars"])?;
+        m.app.tick(Instant::now());
+        assert_eq!(m.names(), ["Crying", "Sexy Boy", "Kelly Watch the Stars"]);
+        m.select("Crying")?;
+        m.chars("n");
+        assert_eq!(m.names(), ["Sexy Boy", "Kelly Watch the Stars"]);
+        assert_eq!(m.selected_name().as_deref(), Some("Sexy Boy"));
+        Ok(())
+    }
+
+    /// `/` filters the queue view by the library's search keys, and `Enter`
+    /// plays the entry listed, not the one at the same row unfiltered.
+    #[test]
+    fn queue_view_filter() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.chars("/björk");
+        assert_eq!(m.names(), ["Crying"]);
+        m.keys(&[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(m.current().as_deref(), Some("Crying"));
+        assert_eq!(m.queue(), ["Venus", "Sexy Boy"]);
+        assert_eq!(m.names(), [] as [&str; 0]);
+        assert_eq!(m.app.query(), "björk", "the filter stays");
+        Ok(())
+    }
+
+    /// `a` / `A` in the queue view open the picker as in the library.
+    #[test]
+    fn a_in_the_queue_view_offers_the_selected_or_listed_tracks() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.select("Sexy Boy")?;
+        m.chars("a");
+        let Mode::Picker(picker) = m.app.mode() else {
+            bail!("no picker: {:?}", m.app.mode());
+        };
+        assert_eq!(m.titles(&picker.tracks), ["Sexy Boy"]);
+        m.keys(&[KeyCode::Esc]);
+        m.chars("/y");
+        m.keys(&[KeyCode::Enter]);
+        m.shift('A');
+        let Mode::Picker(picker) = m.app.mode() else {
+            bail!("no picker: {:?}", m.app.mode());
+        };
+        assert_eq!(m.titles(&picker.tracks), ["Sexy Boy", "Crying"]);
+        Ok(())
+    }
+
+    /// Showing anything else hides the queue view; showing it again keeps
+    /// its filter and selection.
+    #[test]
+    fn other_sidebar_entries_hide_the_queue() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.select("Crying")?;
+        m.show(SidebarEntry::Library)?;
+        assert_eq!(m.app.main_view(), MainView::Library);
+        assert_eq!(m.app.view(), View::Library);
+        m.show(SidebarEntry::Artists)?;
+        assert!(matches!(m.app.main_view(), MainView::Browse(_)));
+        m.show_queue()?;
+        assert_eq!(m.selected_name().as_deref(), Some("Crying"));
+        m.write("Gym", &[("Air", "Moon Safari", "Sexy Boy")])?;
+        m.keys(&[KeyCode::Tab]);
+        let Some(gym) = SidebarEntry::Playlist(0).value() else {
+            bail!("no value");
+        };
+        m.select_in_sidebar(SidebarEntry::of_value(gym))?;
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.app.main_view(), MainView::Playlist);
+        Ok(())
+    }
+
+    // --- e / E (task 3.3) ---
+
+    /// Spec *Queue a track*, *Add to the end* and *Play next*.
+    #[test]
+    fn e_and_shift_e_queue_the_selected_library_track() -> Result<()> {
+        let mut m = music()?;
+        m.select("Sexy Boy")?;
+        m.chars("e");
+        assert_eq!(m.queue(), ["Sexy Boy"]);
+        assert_eq!(m.status(), "Queued 'Sexy Boy'");
+        m.select("Venus")?;
+        m.chars("e");
+        m.select("Crying")?;
+        m.shift('E');
+        assert_eq!(m.queue(), ["Crying", "Sexy Boy", "Venus"]);
+        assert_eq!(m.status(), "Playing next: 'Crying'");
+        m.chars("e");
+        assert_eq!(m.queue(), ["Crying", "Sexy Boy", "Venus", "Crying"]);
+        assert_eq!(m.current(), None, "queuing plays nothing");
+        Ok(())
+    }
+
+    /// Spec *Queue an album next* (album order, before what was queued).
+    #[test]
+    fn shift_e_on_an_album_queues_its_tracks_next() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Crying"])?;
+        m.show(SidebarEntry::Albums)?;
+        m.select("Moon Safari")?;
+        m.shift('E');
+        assert_eq!(
+            m.queue(),
+            [
+                "La Femme d'Argent",
+                "Sexy Boy",
+                "Kelly Watch the Stars",
+                "Crying"
+            ]
+        );
+        assert_eq!(m.status(), "3 tracks play next");
+        m.select("Debut")?;
+        m.chars("e");
+        assert_eq!(m.status(), "Queued 2 tracks");
+        assert_eq!(m.queue()[4..], ["Human Behaviour", "Crying"]);
+        Ok(())
+    }
+
+    /// `e` on an artist row and on "All tracks": the artist's tracks album
+    /// by album; on an album row of the artist: that album.
+    #[test]
+    fn e_on_artist_rows_queues_in_artist_order() -> Result<()> {
+        let mut m = music()?;
+        m.show(SidebarEntry::Artists)?;
+        m.select("Air")?;
+        m.chars("e");
+        let air = [
+            "La Femme d'Argent",
+            "Sexy Boy",
+            "Kelly Watch the Stars",
+            "Cherry Blossom Girl",
+            "Venus",
+        ];
+        assert_eq!(m.queue(), air);
+        m.open("Air")?;
+        assert_eq!(m.selected_name().as_deref(), Some("All tracks"));
+        m.chars("e");
+        assert_eq!(m.queue()[5..], air);
+        m.select("Talkie Walkie")?;
+        m.chars("e");
+        assert_eq!(m.queue()[10..], ["Cherry Blossom Girl", "Venus"]);
+        m.open("Talkie Walkie")?;
+        m.select("Venus")?;
+        m.shift('E');
+        assert_eq!(m.queue()[0], "Venus");
+        Ok(())
+    }
+
+    /// `e` in a playlist queues the selected entry's track.
+    #[test]
+    fn e_in_a_playlist_queues_the_selected_entry() -> Result<()> {
+        let mut m = music()?;
+        m.write(
+            "Gym",
+            &[
+                ("Björk", "Debut", "Crying"),
+                ("Air", "Moon Safari", "Sexy Boy"),
+            ],
+        )?;
+        m.keys(&[KeyCode::Tab]);
+        m.select_in_sidebar(SidebarEntry::Playlist(0))?;
+        m.keys(&[KeyCode::Enter]);
+        assert_eq!(m.app.view(), View::Playlist);
+        m.select("Sexy Boy")?;
+        m.chars("e");
+        assert_eq!(m.queue(), ["Sexy Boy"]);
+        Ok(())
+    }
+
+    /// Spec *Nothing selected*.
+    #[test]
+    fn e_with_nothing_selected_does_nothing() -> Result<()> {
+        let mut m = music()?;
+        m.chars("/zzz");
+        m.keys(&[KeyCode::Enter]);
+        m.status();
+        m.chars("e");
+        m.shift('E');
+        assert_eq!(m.queue(), [] as [&str; 0]);
+        assert_eq!(m.status(), "");
+        Ok(())
+    }
+
+    /// `e` / `E` with Ctrl or Alt are not queue keys.
+    #[test]
+    fn modified_e_does_not_queue() -> Result<()> {
+        let mut m = music()?;
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::CONTROL] {
+            for c in ['e', 'E'] {
+                m.app.handle_key(KeyEvent::new(KeyCode::Char(c), modifiers));
+            }
+        }
+        assert_eq!(m.queue(), [] as [&str; 0]);
+        Ok(())
+    }
+
+    /// `E` puts tracks before the queue view's selected entry: the view
+    /// (shown or not) keeps that entry selected.
+    #[test]
+    fn shift_e_keeps_the_queue_view_on_its_entry() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.show_queue()?;
+        m.select("Crying")?;
+        m.show(SidebarEntry::Albums)?;
+        m.select("Moon Safari")?;
+        m.shift('E');
+        m.chars("e");
+        m.show_queue()?;
+        assert_eq!(m.selected_name().as_deref(), Some("Crying"));
+        assert_eq!(m.app.main_list().selected, Some(5));
+        Ok(())
+    }
+
+    /// Spec *Not in the sidebar or the queue view*.
+    #[test]
+    fn e_does_nothing_in_the_sidebar_or_the_queue_view() -> Result<()> {
+        let mut m = music()?;
+        m.enqueue(&["Venus"])?;
+        m.keys(&[KeyCode::Tab]);
+        m.chars("e");
+        m.shift('E');
+        assert_eq!(m.queue(), ["Venus"]);
+        m.show_queue()?;
+        m.chars("e");
+        m.shift('E');
+        assert_eq!(m.queue(), ["Venus"]);
+        Ok(())
+    }
+
+    /// Spec *Queue full*: only what fits is added, first ones first.
+    #[test]
+    fn e_on_a_full_queue_adds_what_fits() -> Result<()> {
+        let mut m = music()?;
+        let crying = m.track("Crying")?;
+        let filler = vec![crying; MAX_UP_NEXT - 2];
+        assert_eq!(m.app.playback_mut().enqueue(&filler, false), filler.len());
+        m.status();
+        m.show(SidebarEntry::Albums)?;
+        m.select("Moon Safari")?;
+        m.chars("e");
+        assert_eq!(m.app.playback().up_next().len(), MAX_UP_NEXT);
+        assert_eq!(
+            m.queue()[MAX_UP_NEXT - 2..],
+            ["La Femme d'Argent", "Sexy Boy"]
+        );
+        assert_eq!(m.status(), "Queued 2 of 3 tracks; the queue is full (1000)");
+        m.shift('E');
+        assert_eq!(m.status(), "The queue is full (1000 tracks)");
+        assert_eq!(m.app.playback().up_next().len(), MAX_UP_NEXT);
+        Ok(())
+    }
+
+    // --- Clearing the queue (task 3.4) ---
+
+    /// Spec *Clear*: a queued track that is playing keeps playing.
+    #[test]
+    fn shift_d_on_queue_then_y_clears_it() -> Result<()> {
+        let mut m = music()?;
+        m.play_moon_safari()?;
+        m.enqueue(&["Venus", "Sexy Boy", "Crying"])?;
+        m.chars("n");
+        assert_eq!(m.current().as_deref(), Some("Venus"));
+        m.select_in_sidebar(SidebarEntry::Queue)?;
+        m.shift('D');
+        assert_eq!(*m.app.mode(), Mode::ConfirmClearQueue);
+        m.chars("y");
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.queue(), [] as [&str; 0]);
+        assert_eq!(m.status(), "Cleared the queue (2 tracks)");
+        assert_eq!(m.current().as_deref(), Some("Venus"));
+        assert_eq!(m.app.playback().state(), PlayState::Playing);
+        assert!(m.app.playback().playing_queued());
+        Ok(())
+    }
+
+    /// Spec *Cancel*: the key that cancels does nothing else.
+    #[test]
+    fn shift_d_on_queue_then_another_key_cancels() -> Result<()> {
+        let mut m = music()?;
+        m.play_moon_safari()?;
+        m.enqueue(&["Venus", "Crying"])?;
+        m.select_in_sidebar(SidebarEntry::Queue)?;
+        m.shift('D');
+        m.chars("n");
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        assert_eq!(m.queue(), ["Venus", "Crying"]);
+        assert_eq!(
+            m.current().as_deref(),
+            Some("La Femme d'Argent"),
+            "consumed"
+        );
+        assert_eq!(m.status(), "The queue was not cleared");
+        // A modified `y` is no answer either.
+        m.shift('D');
+        m.app
+            .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(m.queue(), ["Venus", "Crying"]);
+        Ok(())
+    }
+
+    /// `D` on an empty queue asks nothing; `R` on "Queue" does nothing.
+    #[test]
+    fn shift_d_and_r_on_an_empty_queue_do_nothing() -> Result<()> {
+        let mut m = music()?;
+        m.select_in_sidebar(SidebarEntry::Queue)?;
+        m.shift('D');
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        m.enqueue(&["Venus"])?;
+        m.shift('R');
+        assert_eq!(*m.app.mode(), Mode::Normal);
+        Ok(())
+    }
+
+    // --- Markers (task 3.5) ---
+
+    /// Specs *Queued track playing* (play-queue and library-browsing) and
+    /// *Back to the album marker*.
+    #[test]
+    fn markers_while_a_queued_track_plays() -> Result<()> {
+        let mut m = music()?;
+        m.play_moon_safari()?;
+        let (Some(moon), Some(air)) = (m.album("Moon Safari"), m.artist("Air")) else {
+            bail!("no Moon Safari");
+        };
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Albums.value());
+        assert!(m.app.browse_row_playing(BrowseKind::Album(moon), 0));
+        m.enqueue(&["Crying"])?;
+        m.end_track();
+        assert_eq!(m.current().as_deref(), Some("Crying"));
+
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Queue.value());
+        assert!(!m.app.browse_row_playing(BrowseKind::Albums, moon));
+        for item in 0..3 {
+            assert!(!m.app.browse_row_playing(BrowseKind::Album(moon), item));
+        }
+        assert!(!m.app.browse_row_playing(BrowseKind::Artists, air));
+        let moon_row = m
+            .app
+            .catalog()
+            .artist(air)
+            .and_then(|a| a.albums().iter().position(|&b| b == moon))
+            .map(|i| i + ALL_TRACKS_VALUE + 1);
+        let Some(moon_row) = moon_row else {
+            bail!("Moon Safari is not Air's");
+        };
+        assert!(
+            !m.app
+                .browse_row_playing(BrowseKind::ArtistAlbums(air), moon_row)
+        );
+        // The library marks the current track: Crying.
+        assert_eq!(m.app.playback().current(), Some(m.track("Crying")?));
+
+        m.end_track();
+        assert_eq!(m.current().as_deref(), Some("Sexy Boy"));
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Albums.value());
+        assert!(m.app.browse_row_playing(BrowseKind::Album(moon), 1));
+        assert!(m.app.browse_row_playing(BrowseKind::Albums, moon));
+        assert!(m.app.browse_row_playing(BrowseKind::Artists, air));
+        Ok(())
+    }
+
+    /// Spec (playlists delta) *Queued track*.
+    #[test]
+    fn playlist_markers_while_a_queued_track_plays() -> Result<()> {
+        let mut m = music()?;
+        m.write(
+            "Running",
+            &[
+                ("Björk", "Debut", "Crying"),
+                ("Air", "Moon Safari", "Sexy Boy"),
+            ],
+        )?;
+        m.select_in_sidebar(SidebarEntry::Playlist(0))?;
+        m.keys(&[KeyCode::Enter, KeyCode::Enter]);
+        assert!(m.app.playback().is_playing_playlist("Running"));
+        let running = SidebarEntry::Playlist(0).value();
+        assert_eq!(m.app.sidebar_playing(), running);
+        assert_eq!(m.app.playback().current_item(), Some(0));
+
+        m.enqueue(&["Venus"])?;
+        m.chars("n");
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Queue.value());
+        assert_eq!(m.app.playback().current_item(), None, "no entry marked");
+        assert!(m.app.playback().is_playing_playlist("Running"));
         Ok(())
     }
 }

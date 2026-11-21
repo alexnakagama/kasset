@@ -6,10 +6,11 @@
 //! the track line with the shuffle, repeat and volume indicators at its
 //! right end, then the progress line), the status line and the key bar. The
 //! body is two panes side by side, the sidebar (the fixed rows "Library",
-//! "Artists" and "Albums", a separator, then the playlists) and the main
-//! pane (the library, the open playlist or a browse level), when the
-//! terminal is at least [`TWO_PANE_MIN_WIDTH`] columns wide; below that
-//! only the focused pane is drawn, at full width. The focused pane has the
+//! "Artists", "Albums" and "Queue" with their counts, a separator, then the
+//! playlists) and the main pane (the library, the open playlist, a browse
+//! level or the up-next queue), when the terminal is at least
+//! [`TWO_PANE_MIN_WIDTH`] columns wide; below that only the focused pane is
+//! drawn, at full width. The focused pane has the
 //! focused border and the strong selection style ([`theme`]); each pane
 //! keeps its own scroll offset, and the page size fed back to the app is the
 //! focused pane's. The sidebar's fixed rows stay on top (in a short pane
@@ -151,8 +152,8 @@ const LIBRARY_TITLE: &str = " Library ";
 /// The sidebar's title.
 const SIDEBAR_TITLE: &str = " kasset ";
 
-/// Names of the sidebar's fixed rows, top down (values 0, 1 and 2).
-const FIXED_ROW_NAMES: [&str; FIXED_ROWS] = ["Library", "Artists", "Albums"];
+/// Names of the sidebar's fixed rows, top down (values 0 to 3).
+const FIXED_ROW_NAMES: [&str; FIXED_ROWS] = ["Library", "Artists", "Albums", "Queue"];
 
 /// The first row of an artist's albums.
 const ALL_TRACKS_ROW: &str = "All tracks";
@@ -330,6 +331,7 @@ fn bar_context<A: Audio>(app: &App<A>) -> BarContext {
             NamePurpose::Rename(_) => BarContext::Rename,
         },
         Mode::ConfirmDelete(_) => BarContext::ConfirmDelete,
+        Mode::ConfirmClearQueue => BarContext::ConfirmClearQueue,
         Mode::Help { .. } => BarContext::Help,
         Mode::Normal => match app.view() {
             Screen::Library => BarContext::Library,
@@ -339,6 +341,7 @@ fn bar_context<A: Audio>(app: &App<A>) -> BarContext {
             Screen::Groups if app.browse_depth() <= 1 => BarContext::BrowseTop,
             Screen::Groups => BarContext::BrowseGroups,
             Screen::Tracks => BarContext::BrowseTracks,
+            Screen::Queue => BarContext::Queue,
         },
     }
 }
@@ -374,7 +377,8 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
         Mode::NameInput(input) => render_name_input(frame, input, body),
         Mode::ConfirmDelete(name) => render_confirm_delete(frame, name, body),
         Mode::Help { scroll } => render_help(frame, *scroll, body.union(playing), view),
-        Mode::Normal | Mode::Search => {}
+        // Interim: the bottom bar asks until the popup (task 5.1).
+        Mode::Normal | Mode::Search | Mode::ConfirmClearQueue => {}
     }
 }
 
@@ -846,7 +850,44 @@ fn render_main<A: Audio>(
         MainView::Library => render_library(frame, app, offset, area, focused),
         MainView::Playlist => render_open_playlist(frame, app, offset, area, focused),
         MainView::Browse(kind) => render_browse(frame, app, offset, area, focused, kind),
+        MainView::Queue => render_queue(frame, app, offset, area, focused),
     }
+}
+
+/// The up-next queue in the main pane, with the library's columns (interim
+/// until task 5.1 of add-play-queue).
+fn render_queue<A: Audio>(
+    frame: &mut Frame,
+    app: &App<A>,
+    offset: &mut usize,
+    area: Rect,
+    focused: bool,
+) -> usize {
+    let list = app.main_list();
+    let up_next = app.playback().up_next();
+    let count = pane_count(&list, list.rows.len(), up_next.len(), "tracks", area.width);
+    let block = pane_block(area, focused, |room| plain_title("Queue", room), count);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if list.rows.is_empty() {
+        let message = if up_next.is_empty() {
+            "Queue is empty".to_owned()
+        } else {
+            format!("No tracks match '{}'", list.query)
+        };
+        return render_empty(frame, offset, inner, message);
+    }
+    // Rows are positions valid for this frame's queue; the queue view marks
+    // no row as playing.
+    debug_assert!(
+        list.rows.iter().all(|&pos| pos < up_next.len()),
+        "queue view rows are synced with the queue"
+    );
+    // An out-of-range position (never, see above) names no track and its
+    // row is dropped.
+    render_tracks(frame, app, &list, offset, inner, focused, |pos| {
+        (up_next.get(pos).copied().unwrap_or(usize::MAX), false)
+    })
 }
 
 /// A pane title ` text ` cut at the end to fit `room` columns (nothing when
@@ -1291,14 +1332,30 @@ fn sidebar_playlist_rows(list: &ListView) -> Vec<(usize, usize, usize)> {
         .enumerate()
         .filter_map(|(row, &value)| match SidebarEntry::of_value(value) {
             SidebarEntry::Playlist(i) => Some((row, value, i)),
-            SidebarEntry::Library | SidebarEntry::Artists | SidebarEntry::Albums => None,
+            SidebarEntry::Library
+            | SidebarEntry::Artists
+            | SidebarEntry::Albums
+            | SidebarEntry::Queue => None,
         })
         .collect()
 }
 
-/// Draws the sidebar: the fixed rows ("Library", "Artists", "Albums"), a
-/// separator when a playlist row fits below it, then the playlists, or a
-/// hint when none is listed. The fixed rows stay on top (in a short pane
+/// The counts drawn on the sidebar's fixed rows, top down: tracks, artists,
+/// albums and queued tracks.
+fn fixed_row_counts<A: Audio>(app: &App<A>) -> [usize; FIXED_ROWS] {
+    let playback = app.playback();
+    let catalog = app.catalog();
+    [
+        playback.tracks().len(),
+        catalog.artists().len(),
+        catalog.albums().len(),
+        playback.up_next().len(),
+    ]
+}
+
+/// Draws the sidebar: the fixed rows ("Library", "Artists", "Albums",
+/// "Queue"), a separator when a playlist row fits below it, then the
+/// playlists, or a hint when none is listed. The fixed rows stay on top (in a short pane
 /// they are cut from the bottom); only the playlists scroll (`offset` counts
 /// playlist rows). Returns the playlist rows that fit.
 fn render_sidebar<A: Audio>(
@@ -1361,15 +1418,13 @@ fn render_sidebar<A: Audio>(
         }
     };
 
-    let catalog = app.catalog();
-    let fixed_counts = [
-        playback.tracks().len(),
-        catalog.artists().len(),
-        catalog.albums().len(),
-    ];
     // The fixed rows, top down, as many as fit.
     let mut rest = inner;
-    for (value, (name, count)) in FIXED_ROW_NAMES.iter().zip(fixed_counts).enumerate() {
+    for (value, (name, count)) in FIXED_ROW_NAMES
+        .iter()
+        .zip(fixed_row_counts(app))
+        .enumerate()
+    {
         if rest.height == 0 {
             break;
         }
@@ -1826,8 +1881,13 @@ mod tests {
     }
 
     /// In the sidebar: selects the first playlist, below the fixed rows.
-    const FIRST_PLAYLIST: [KeyCode; 1 + FIXED_ROWS] =
-        [KeyCode::Home, KeyCode::Down, KeyCode::Down, KeyCode::Down];
+    const FIRST_PLAYLIST: [KeyCode; 1 + FIXED_ROWS] = [
+        KeyCode::Home,
+        KeyCode::Down,
+        KeyCode::Down,
+        KeyCode::Down,
+        KeyCode::Down,
+    ];
 
     fn press(app: &mut App<SilentAudio>, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -2567,7 +2627,7 @@ mod tests {
         let mut app = library(3);
         let mut view = View::default();
         press(&mut app, KeyCode::Char('?'));
-        let screen = draw_and_feed_back(&mut app, &mut view, 100, 50);
+        let screen = draw_and_feed_back(&mut app, &mut view, 100, 60);
         let body = help_body(&screen);
         // The scrollable height is the table's line count, all on screen.
         assert_eq!(view.help_rows(), keys::help_line_count(), "{screen:#?}");
@@ -2587,17 +2647,19 @@ mod tests {
                 HelpLine::Blank => assert!(shown.is_empty(), "{shown}"),
             }
         }
+        // The position marker reads " N–M of TOTAL ".
+        let position = format!(" of {} ", keys::help_line_count());
         assert!(
-            !screen_contains(&screen, " of "),
+            !screen_contains(&screen, &position),
             "no position when all fit"
         );
         // Scrolling does nothing when everything fits.
         press(&mut app, KeyCode::Char('j'));
-        let again = draw_and_feed_back(&mut app, &mut view, 100, 50);
+        let again = draw_and_feed_back(&mut app, &mut view, 100, 60);
         assert_eq!(screen, again);
         // The overlay is as wide as its widest line: nothing is cut on a
         // wide terminal.
-        let screen = draw_and_feed_back(&mut app, &mut view, 120, 50);
+        let screen = draw_and_feed_back(&mut app, &mut view, 120, 60);
         let body = help_body(&screen);
         assert_eq!(body.len(), keys::help_line_count(), "{screen:#?}");
         assert!(!body.iter().any(|l| l.ends_with('…')), "{screen:#?}");
@@ -2997,8 +3059,9 @@ mod tests {
         draw(&app, &mut view, 100, 20);
         keys(&mut app, &[KeyCode::Tab, KeyCode::End]);
         let screen = draw(&app, &mut view, 100, 20);
-        // The sidebar's rows below its fixed rows and separator.
-        assert_eq!(view.page_size(), 9, "the sidebar's page");
+        // The sidebar's rows below its fixed rows and separator: 15 rows
+        // less 2 borders, the fixed rows and the separator.
+        assert_eq!(view.page_size(), 13 - FIXED_ROWS - 1, "the sidebar's page");
         assert!(screen_contains(&screen, "P29"), "{screen:#?}");
         assert!(!screen_contains(&screen, "P00"), "{screen:#?}");
         assert!(
@@ -3585,8 +3648,8 @@ mod tests {
     // --- Sidebar fixed rows and browse levels (group 4 of
     // add-artist-album-browsing) ---
 
-    /// Spec *Both panes visible*: "Library", "Artists", "Albums" with their
-    /// counts, then the separator and the playlists.
+    /// Spec *Both panes visible*: "Library", "Artists", "Albums", "Queue"
+    /// with their counts, then the separator and the playlists.
     #[test]
     fn sidebar_lists_the_fixed_rows_then_the_playlists() -> anyhow::Result<()> {
         let (_tmp, app) = many(3, 2)?;
@@ -3596,6 +3659,7 @@ mod tests {
             ("Library", "3"),
             ("Artists", "1"),
             ("Albums", "1"),
+            ("Queue", "0"),
             ("─", "─"),
             ("P00", "0"),
             ("P01", "0"),
@@ -3611,6 +3675,95 @@ mod tests {
         Ok(())
     }
 
+    /// The "Queue" row counts the queued tracks, and has the playing marker
+    /// (and "Library" not) while a queued track is current.
+    #[test]
+    fn sidebar_queue_row_counts_and_marks_the_queue() -> anyhow::Result<()> {
+        let (_tmp, mut app) = many(3, 2)?;
+        app.playback_mut().enqueue(&[2, 1], false);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        let sidebar = columns(&screen, 0, usize::from(MAIN_X));
+        let queue_row = sidebar[FIXED_ROWS].trim_end_matches('│').trim_end();
+        assert!(queue_row.starts_with("│   Queue"), "{screen:#?}");
+        assert!(queue_row.ends_with(" 2"), "{screen:#?}");
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.playback().playing_queued());
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        let sidebar = columns(&screen, 0, usize::from(MAIN_X));
+        let marker = state_marker(PlayState::Playing);
+        let queue_row = sidebar[FIXED_ROWS].trim_end_matches('│').trim_end();
+        assert!(
+            queue_row.starts_with(&format!("│ {marker} Queue")),
+            "{screen:#?}"
+        );
+        assert!(queue_row.ends_with(" 1"), "{screen:#?}");
+        assert!(sidebar[1].starts_with("│   Library"), "{screen:#?}");
+        Ok(())
+    }
+
+    /// The queue view (interim drawing): empty, no match, rows without a
+    /// playing marker even for the playing track, and its key bar.
+    #[test]
+    fn queue_view_lists_the_queue_with_its_bar() {
+        let mut app = library(3);
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST[..FIXED_ROWS]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.main_view(), MainView::Queue);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        assert!(screen_contains(&screen, "Queue is empty"), "{screen:#?}");
+        let bar = key_bar(&screen);
+        assert!(
+            bar.starts_with("Enter play · d remove · J/K move · Esc sidebar"),
+            "{bar}"
+        );
+        assert!(
+            !bar.contains("e/E queue") && bar.ends_with("? help"),
+            "{bar}"
+        );
+
+        app.playback_mut().enqueue(&[2, 1, 2], false);
+        app.playback_mut().play(2);
+        app.tick(Instant::now());
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        assert!(screen_contains(&screen, " Queue "), "{screen:#?}");
+        assert!(screen_contains(&screen, " 3 tracks "), "{screen:#?}");
+        let marker = state_marker(PlayState::Playing);
+        let main = columns(&screen, usize::from(MAIN_X), 100);
+        let rows: Vec<&String> = main.iter().filter(|l| l.contains("Song 0")).collect();
+        assert_eq!(rows.len(), 3, "{screen:#?}");
+        assert!(rows[0].contains("Song 02") && rows[1].contains("Song 01"));
+        assert!(!rows.iter().any(|l| l.contains(marker)), "{screen:#?}");
+
+        press(&mut app, KeyCode::Char('/'));
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        assert!(
+            screen_contains(&screen, "No tracks match 'zzz'"),
+            "{screen:#?}"
+        );
+    }
+
+    /// The clear prompt's bar (the popup comes with task 5.1).
+    #[test]
+    fn clear_queue_prompt_has_its_bar() {
+        let mut app = library(3);
+        app.playback_mut().enqueue(&[0], false);
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST[..FIXED_ROWS]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        assert_eq!(*app.mode(), Mode::ConfirmClearQueue);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        assert_eq!(
+            key_bar(&screen).trim_end(),
+            "y clear · any other key cancel"
+        );
+    }
+
     /// Short sidebars: the fixed rows are cut from the bottom, the separator
     /// needs a playlist row below it, and the page counts playlist rows only.
     #[test]
@@ -3619,11 +3772,12 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         // Inner height = terminal height - 3 (now playing) - 2 (status, keys)
         // - 2 (borders); narrow, so the sidebar is drawn alone.
-        let cases: [(u16, &[&str], usize); 4] = [
+        let cases: [(u16, &[&str], usize); 5] = [
             (2, &["Library", "Artists"], 0),
             (3, &["Library", "Artists", "Albums"], 0),
-            (4, &["Library", "Artists", "Albums", "P00"], 1),
-            (5, &["Library", "Artists", "Albums", "─", "P00"], 1),
+            (4, &["Library", "Artists", "Albums", "Queue"], 0),
+            (5, &["Library", "Artists", "Albums", "Queue", "P00"], 1),
+            (6, &["Library", "Artists", "Albums", "Queue", "─", "P00"], 1),
         ];
         for (inner, rows, page) in cases {
             let mut view = View::default();
@@ -3656,7 +3810,7 @@ mod tests {
         for (y, name) in FIXED_ROW_NAMES.iter().enumerate() {
             assert!(screen[y + 1].contains(name), "{screen:#?}");
         }
-        assert!(screen[4].contains("──"), "{screen:#?}");
+        assert!(screen[FIXED_ROWS + 1].contains("──"), "{screen:#?}");
         assert!(screen_contains(&screen, "P29"), "{screen:#?}");
         assert!(!screen_contains(&screen, "P00"), "{screen:#?}");
         Ok(())

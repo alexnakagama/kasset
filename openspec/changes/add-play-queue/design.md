@@ -225,7 +225,9 @@ and `ui::FIXED_ROW_NAMES`.
 
 `D` on the "Queue" sidebar row (only if the queue is not empty) opens a new
 `Mode::ConfirmClearQueue` ("Clear the queue (N tracks)? y/n"). `y` calls
-`clear_queued`, and any other key cancels and is consumed, like
+`clear_queued` (`Info` notice `Cleared the queue (N tracks)`, none if
+the queue emptied itself meanwhile), and any other key cancels and is
+consumed (`Info` notice `The queue was not cleared`), like
 `ConfirmDelete`. A separate mode keeps the playlist-delete code untouched.
 It gets its own popup in `ui.rs` (drawn like `render_confirm_delete`, text
 "Clear the queue (N tracks)? y/n") and its own `BarContext::ConfirmClearQueue`

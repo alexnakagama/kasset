@@ -227,17 +227,30 @@ as commands until you press `Enter` or `Esc`.
 | `Tab`, `Shift+Tab`     | move focus between the sidebar and the main pane; each list keeps its own selection and filter |
 | `a`                    | in the library: add the selected track to a playlist |
 | `A`                    | in the library: add every listed track (after any search) to a playlist |
-| `Enter`                | in the sidebar: show the selected entry ("Library", "Artists", "Albums" or a playlist) in the main pane and focus it; in a playlist: play from the selected track |
-| `Esc`                  | in a playlist or the artist / album list: clear the filter, then focus the sidebar (the list stays shown); in the sidebar: clear the filter |
-| `d`                    | in a playlist: remove the selected entry (only that occurrence) |
-| `J` / `K`              | in a playlist: move the selected entry down / up (not while filtered) |
+| `Enter`                | in the sidebar: show the selected entry ("Library", "Artists", "Albums", "Queue" or a playlist) in the main pane and focus it; in a playlist: play from the selected track |
+| `Esc`                  | in a playlist, the queue or the artist / album list: clear the filter, then focus the sidebar (the list stays shown); in the sidebar: clear the filter |
+| `d`                    | in a playlist or the queue: remove the selected entry (only that occurrence) |
+| `J` / `K`              | in a playlist or the queue: move the selected entry down / up (not while filtered) |
 | `R`                    | in the sidebar: rename the selected playlist (changing only the letter case is allowed) |
-| `D`                    | in the sidebar: delete the selected playlist after a `y` confirmation; any other key cancels |
+| `D`                    | in the sidebar: delete the selected playlist, or on "Queue" clear the queue, after a `y` confirmation; any other key cancels |
 
-The sidebar lists "Library", "Artists" and "Albums" first, then your
-playlists with their track counts; they are listed when kasset starts and
-again whenever the sidebar gets the focus. `R` and `D` do nothing on the
-first three entries.
+The sidebar lists "Library", "Artists", "Albums" and "Queue" first, then
+your playlists with their track counts; they are listed when kasset starts
+and again whenever the sidebar gets the focus. `R` does nothing on the first
+four entries, and `D` only clears a non-empty queue on "Queue".
+
+### Queue
+
+| Key                    | Action                                   |
+| ---------------------- | ---------------------------------------- |
+| `e`                    | in the library, a playlist or a list of tracks: add the selected track to the end of the queue; on an artist, album or "All tracks": all its tracks |
+| `E`                    | the same, to the front of the queue: they play next |
+| `Enter`                | in the queue: play the selected track now (it leaves the queue) |
+| `d`, `J` / `K`, `Esc`, `/`, `a` / `A` | in the queue: remove, move, back to the sidebar, filter, add to a playlist, as in a playlist |
+
+Queued tracks play before the play order (the list you last played from)
+goes on from where it was; playing from another list keeps the queue. The
+queue holds up to 1000 tracks.
 
 ### Browsing
 

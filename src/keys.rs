@@ -6,9 +6,9 @@
 //! - Every entry's `keys` column is ASCII, so the `--help` text lines up in
 //!   any terminal; bar labels may use arrows (`↑/↓`).
 //! - A context's bar lists its labels in table order. Groups are ordered so
-//!   that each view's own keys (library, sidebar, playlist, browse levels)
-//!   come before the shared transport keys, because the bar is cut at the
-//!   terminal's width.
+//!   that each view's own keys (library, sidebar, playlist, browse levels,
+//!   queue) come before the shared transport keys, because the bar is cut
+//!   at the terminal's width.
 //! - Every [`BarContext`] has a non-empty bar, and no bar label is wider
 //!   than 24 columns.
 //!
@@ -41,6 +41,8 @@ pub enum BarContext {
     /// Normal mode, main pane showing a browsed list of tracks (an album, or
     /// an artist's tracks).
     BrowseTracks,
+    /// Normal mode, main pane showing the up-next queue.
+    Queue,
     /// Typing a search query.
     Search,
     /// Choosing the playlist to add tracks to.
@@ -51,6 +53,8 @@ pub enum BarContext {
     Rename,
     /// Asking whether to delete a playlist.
     ConfirmDelete,
+    /// Asking whether to clear the up-next queue.
+    ConfirmClearQueue,
     /// The help overlay.
     Help,
 }
@@ -58,18 +62,20 @@ pub enum BarContext {
 impl BarContext {
     /// Every context, for exhaustive checks.
     #[cfg(test)]
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 14] = [
         Self::Library,
         Self::Playlist,
         Self::Sidebar,
         Self::BrowseTop,
         Self::BrowseGroups,
         Self::BrowseTracks,
+        Self::Queue,
         Self::Search,
         Self::Picker,
         Self::Name,
         Self::Rename,
         Self::ConfirmDelete,
+        Self::ConfirmClearQueue,
         Self::Help,
     ];
 
@@ -82,8 +88,8 @@ impl BarContext {
 }
 
 use BarContext::{
-    BrowseGroups, BrowseTop, BrowseTracks, ConfirmDelete, Help, Library, Name, Picker, Playlist,
-    Rename, Search, Sidebar,
+    BrowseGroups, BrowseTop, BrowseTracks, ConfirmClearQueue, ConfirmDelete, Help, Library, Name,
+    Picker, Playlist, Queue, Rename, Search, Sidebar,
 };
 
 /// The Normal-mode contexts.
@@ -94,6 +100,7 @@ const NORMAL: &[BarContext] = &[
     BrowseTop,
     BrowseGroups,
     BrowseTracks,
+    Queue,
 ];
 
 /// A short label for the key bar and the contexts whose bar shows it.
@@ -134,7 +141,10 @@ pub const GROUPS: &[Group] = &[
                 keys: "Enter",
                 action: "play the selected track (in the library, a playlist, an album or an \
                          artist's tracks)",
-                bar: &[shown("Enter play", &[Library, Playlist, BrowseTracks])],
+                bar: &[shown(
+                    "Enter play",
+                    &[Library, Playlist, BrowseTracks, Queue],
+                )],
             },
             Entry {
                 keys: "a / A",
@@ -161,13 +171,13 @@ pub const GROUPS: &[Group] = &[
             },
             Entry {
                 keys: "d",
-                action: "in a playlist: remove the selected entry",
-                bar: &[shown("d remove", &[Playlist])],
+                action: "in a playlist or the queue: remove the selected entry",
+                bar: &[shown("d remove", &[Playlist, Queue])],
             },
             Entry {
                 keys: "J / K",
-                action: "in a playlist: move the selected entry down / up",
-                bar: &[shown("J/K move", &[Playlist])],
+                action: "in a playlist or the queue: move the selected entry down / up",
+                bar: &[shown("J/K move", &[Playlist, Queue])],
             },
             Entry {
                 keys: "R",
@@ -181,18 +191,20 @@ pub const GROUPS: &[Group] = &[
             },
             Entry {
                 keys: "D",
-                action: "in the sidebar: delete the selected playlist (asks y/n; songs stay)",
+                action: "in the sidebar: delete the selected playlist (songs stay) or clear \
+                         \"Queue\" (asks y/n)",
                 bar: &[
                     shown("D delete", &[Sidebar]),
                     shown("y delete", &[ConfirmDelete]),
-                    shown("any other key cancel", &[ConfirmDelete]),
+                    shown("y clear", &[ConfirmClearQueue]),
+                    shown("any other key cancel", &[ConfirmDelete, ConfirmClearQueue]),
                 ],
             },
             Entry {
                 keys: "Esc",
-                action: "in a playlist or the artist / album list: clear the filter, then \
-                         focus the sidebar",
-                bar: &[shown("Esc sidebar", &[Playlist, BrowseTop])],
+                action: "in a playlist, the queue or the artist / album list: clear the \
+                         filter, then focus the sidebar",
+                bar: &[shown("Esc sidebar", &[Playlist, BrowseTop, Queue])],
             },
             Entry {
                 keys: "Tab, Shift+Tab",
@@ -213,6 +225,21 @@ pub const GROUPS: &[Group] = &[
                 keys: "a",
                 action: "on an artist, album or All tracks: add all its tracks to a playlist",
                 bar: &[shown("a add", &[BrowseTop, BrowseGroups])],
+            },
+        ],
+    },
+    Group {
+        title: "Queue",
+        entries: &[
+            Entry {
+                keys: "e / E",
+                action: "add the selected track(s) to the end of the queue / play them next",
+                bar: &[shown("e/E queue", &[Library, Playlist, BrowseTracks])],
+            },
+            Entry {
+                keys: "Enter",
+                action: "in the queue: play the selected track now (it leaves the queue)",
+                bar: &[],
             },
         ],
     },
@@ -453,22 +480,76 @@ mod tests {
         assert_eq!(bar(BrowseTop)[..2], ["Enter open", "Esc sidebar"]);
         assert_eq!(bar(BrowseGroups)[..1], ["Enter open"]);
         assert_eq!(bar(BrowseTracks)[..2], ["Enter play", "a/A add"]);
+        assert_eq!(
+            bar(Queue)[..4],
+            ["Enter play", "d remove", "J/K move", "Esc sidebar"]
+        );
+    }
+
+    /// Spec *Queue view bar*: no `e/E queue` there (it does nothing in the
+    /// queue view), nor where the bar has no room for it.
+    #[test]
+    fn queue_bars() {
+        for context in [Library, Playlist, BrowseTracks] {
+            assert!(bar(context).contains(&"e/E queue"), "{context:?}");
+        }
+        for context in [Queue, Sidebar, BrowseTop, BrowseGroups] {
+            assert!(!bar(context).contains(&"e/E queue"), "{context:?}");
+        }
+        assert!(!bar(Queue).contains(&"a/A add"));
+        assert!(Queue.is_normal());
+        assert!(!ConfirmClearQueue.is_normal());
+    }
+
+    /// Spec *Help lists the queue keys*.
+    #[test]
+    fn help_lists_the_queue_keys() {
+        let text = help_text();
+        let Some(line) = text.lines().find(|l| l.trim_start().starts_with("e / E")) else {
+            panic!("--help does not list e / E: {text}");
+        };
+        assert!(line.contains("end of the queue"), "{line}");
+        assert!(line.contains("next"), "{line}");
+        assert!(text.contains("\nQueue:\n"), "{text}");
+        for key in ["d ", "J / K ", "Esc "] {
+            let listed = text
+                .lines()
+                .any(|l| l.trim_start().starts_with(key) && l.contains("the queue"));
+            assert!(listed, "{key:?} does not mention the queue: {text}");
+        }
+        let clear = text
+            .lines()
+            .any(|l| l.trim_start().starts_with("D ") && l.contains("clear \"Queue\""));
+        assert!(clear, "{text}");
     }
 
     /// Every view's own keys come before the shared transport keys, which
     /// start with `Space pause`.
     #[test]
     fn own_keys_come_before_the_transport_keys() {
-        let own: [(BarContext, &[&str]); 6] = [
-            (Library, &["Enter play", "a/A add"]),
+        let own: [(BarContext, &[&str]); 7] = [
+            (Library, &["Enter play", "a/A add", "e/E queue"]),
             (
                 Playlist,
-                &["Enter play", "d remove", "J/K move", "Esc sidebar"],
+                &[
+                    "Enter play",
+                    "d remove",
+                    "J/K move",
+                    "Esc sidebar",
+                    "e/E queue",
+                ],
             ),
             (Sidebar, &["Enter open", "R rename", "D delete"]),
             (BrowseTop, &["Enter open", "Esc sidebar", "a add"]),
             (BrowseGroups, &["Enter open", "Esc back", "a add"]),
-            (BrowseTracks, &["Enter play", "a/A add", "Esc back"]),
+            (
+                BrowseTracks,
+                &["Enter play", "a/A add", "Esc back", "e/E queue"],
+            ),
+            (
+                Queue,
+                &["Enter play", "d remove", "J/K move", "Esc sidebar"],
+            ),
         ];
         for (context, labels) in own {
             let bar = bar(context);
@@ -521,6 +602,7 @@ mod tests {
         assert_eq!(bar(Name), ["type a name", "Enter create", "Esc cancel"]);
         assert_eq!(bar(Rename), ["type a name", "Enter rename", "Esc cancel"]);
         assert_eq!(bar(ConfirmDelete), ["y delete", "any other key cancel"]);
+        assert_eq!(bar(ConfirmClearQueue), ["y clear", "any other key cancel"]);
         assert_eq!(bar(Help), ["↑/↓ scroll", "any other key close"]);
         assert_eq!(
             bar(Search),
@@ -536,7 +618,15 @@ mod tests {
 
     #[test]
     fn no_prompt_bar_offers_normal_mode_keys() {
-        for context in [Search, Picker, Name, Rename, ConfirmDelete, Help] {
+        for context in [
+            Search,
+            Picker,
+            Name,
+            Rename,
+            ConfirmDelete,
+            ConfirmClearQueue,
+            Help,
+        ] {
             for label in bar(context) {
                 for &normal in NORMAL {
                     assert!(

@@ -221,10 +221,6 @@ impl<A: Audio> Playback<A> {
 
     /// Whether the current track came from the up-next queue.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub const fn playing_queued(&self) -> bool {
         self.queued_current.is_some()
     }
@@ -235,7 +231,7 @@ impl<A: Audio> Playback<A> {
     #[must_use]
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
+        expect(dead_code, reason = "used from group 4 of add-play-queue")
     )]
     pub fn source_current(&self) -> Option<usize> {
         self.queue.current()
@@ -246,7 +242,7 @@ impl<A: Audio> Playback<A> {
     #[must_use]
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
+        expect(dead_code, reason = "used from group 4 of add-play-queue")
     )]
     pub fn source_item(&self) -> Option<usize> {
         self.queue.current_item()
@@ -766,7 +762,7 @@ impl<A: Audio> Playback<A> {
     /// an invalid index.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
+        expect(dead_code, reason = "used from group 4 of add-play-queue")
     )]
     pub fn resume_queued(&mut self, track: usize, position: Duration) -> bool {
         let Some(load) = ResumeLoad::new(&self.tracks, track, position) else {
@@ -867,10 +863,6 @@ impl<A: Audio> Playback<A> {
     /// The queued tracks (library indices), in the order they play. The
     /// queued track that is current is not among them.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub fn up_next(&self) -> &[usize] {
         &self.up_next
     }
@@ -878,10 +870,6 @@ impl<A: Audio> Playback<A> {
     /// Changes every time [`Playback::up_next`] does, and only then, so
     /// positions in it are valid for one generation.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub const fn up_next_generation(&self) -> u64 {
         self.up_next_generation
     }
@@ -890,10 +878,6 @@ impl<A: Audio> Playback<A> {
     /// (wrapping): when it grows by `k`, every remaining entry moved up `k`
     /// positions.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub const fn up_next_taken(&self) -> u64 {
         self.up_next_taken
     }
@@ -903,10 +887,6 @@ impl<A: Audio> Playback<A> {
     /// [`MAX_UP_NEXT`] are added. Returns how many were added: 0 (nothing
     /// changed) when none fit, `tracks` is empty or one of them is not a
     /// library index.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub fn enqueue(&mut self, tracks: &[usize], front: bool) -> usize {
         if !self.valid_tracks(tracks) {
             return 0;
@@ -929,10 +909,6 @@ impl<A: Audio> Playback<A> {
 
     /// Removes the queued entry at position `pos`. Returns `false` (nothing
     /// changed) when `pos` is out of range.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub fn remove_queued(&mut self, pos: usize) -> bool {
         if pos >= self.up_next.len() {
             return false;
@@ -946,10 +922,6 @@ impl<A: Audio> Playback<A> {
     /// entries in between shift by one). Returns `false` (nothing changed)
     /// when either position is out of range; `from == to` changes nothing
     /// and returns `true`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub fn move_queued(&mut self, from: usize, to: usize) -> bool {
         let len = self.up_next.len();
         if from >= len || to >= len {
@@ -967,10 +939,6 @@ impl<A: Audio> Playback<A> {
     /// now as the current queued track. The play order's cursor does not
     /// move, so the rest of the queue and then the play order continue after
     /// it. Returns `false` (nothing changed) when `pos` is out of range.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub fn play_queued(&mut self, pos: usize) -> bool {
         if pos >= self.up_next.len() {
             return false;
@@ -985,10 +953,6 @@ impl<A: Audio> Playback<A> {
 
     /// Empties the queue; a queued track that is current keeps playing.
     /// Returns whether anything was removed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
-    )]
     pub fn clear_queued(&mut self) -> bool {
         if self.up_next.is_empty() {
             return false;
@@ -1003,7 +967,7 @@ impl<A: Audio> Playback<A> {
     /// when one of them is not a library index.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "used from group 3 of add-play-queue")
+        expect(dead_code, reason = "used from group 4 of add-play-queue")
     )]
     pub fn restore_up_next(&mut self, mut tracks: Vec<usize>) -> bool {
         if !self.valid_tracks(&tracks) {
