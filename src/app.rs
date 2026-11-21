@@ -98,17 +98,20 @@
 //! once saved, so a failed or conflicting save leaves the screen as it was.
 //! Changes to the playlist that is playing are forwarded to the play order.
 //!
-//! The session (settings, the current track and position, its play source
-//! and the shown playlist) is saved through a [`StateStore`]. [`App::new`]
-//! uses [`NoState`], which saves nothing; [`App::restore`] installs the real
-//! store and continues the saved session once at start: the settings, the
-//! shown playlist (focused), then the track, loaded **paused**. The state
-//! file is untrusted: it only ever selects a track the scan found (matched by
-//! its path relative to the root), playlists the listing found (by exact
-//! name), and artists and albums of the catalog (by name, ignoring case,
-//! like the grouping); the browse location is not saved. A resume point
-//! that could not be resumed is kept and saved again until a track becomes
-//! current. [`App::tick`] saves at most every
+//! The session (settings, the current track and position, its play source,
+//! the shown playlist and the up-next queue) is saved through a
+//! [`StateStore`]. [`App::new`] uses [`NoState`], which saves nothing;
+//! [`App::restore`] installs the real store and continues the saved session
+//! once at start: the settings, the shown playlist (focused), the queue, then
+//! the track, loaded **paused**. While a queued track plays, the resume
+//! point is the play order's track it was played after, plus the queued
+//! track (D9 of the `add-play-queue` design). The state file is untrusted: it
+//! only ever selects tracks the scan found (matched by their paths relative
+//! to the root; queued ones not found are dropped), playlists the listing
+//! found (by exact name), and artists and albums of the catalog (by name,
+//! ignoring case, like the grouping); the browse location is not saved. A
+//! resume point that could not be resumed is kept and saved again until a
+//! track becomes current. [`App::tick`] saves at most every
 //! [`SAVE_INTERVAL`], only when the session changed, and reports only the
 //! first of a run of failed saves. [`App::shutdown`] takes the final session
 //! before it stops the audio and writes nothing; [`App::save_final`] writes
@@ -116,6 +119,7 @@
 //! after a newer state file was seen, no session is ever built or saved.
 
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -2491,9 +2495,11 @@ impl<A: Audio> App<A> {
 /// The saved session: restoring it at start and saving it while running and
 /// at quit (D4–D6 of the `persist-session-state` design).
 ///
-/// The state file is untrusted: a resume point only ever selects a track the
-/// scan found (by its path relative to the root) and playlists the sidebar
-/// listing found (by exact name), and loads its track paused. Nothing is
+/// The state file is untrusted: a resume point and the saved queue only ever
+/// select tracks the scan found (by their paths relative to the root, looked
+/// up in an index of the scanned tracks, never opened from the file's text)
+/// and playlists the sidebar listing found (by exact name); the resume point
+/// loads its track paused. Nothing is
 /// saved with a store that persists nothing ([`NoState`], so the tests that
 /// build an `App` directly never touch a real file) or after a newer state
 /// file was seen; then no session is even built.
@@ -2501,7 +2507,14 @@ impl<A: Audio> App<A> {
     /// Installs `store` and continues the session it holds for the library
     /// scanned from `root` (the canonical root): first the settings, then
     /// the playlist that was shown (focused, if it is still listed), then the
-    /// resume point, loaded paused (see [`Playback::resume`]). The play
+    /// up-next queue (queued tracks the scan did not find are dropped, with
+    /// no notice), then the resume point, loaded paused (see
+    /// [`Playback::resume`]). A resume point saved while a queued track
+    /// played loads that queued track, with the play order's cursor on the
+    /// track it was played after; if the queued track is gone, that play
+    /// order track is resumed at zero instead, and if only the play order's
+    /// track is gone, the queued track is resumed with the library as the
+    /// play order and nothing current in it. The play
     /// source is the saved playlist if it is listed and still holds the
     /// track, or the saved artist or album if the catalog has one by that
     /// name that still holds it, else the library. The browse location is
@@ -2528,14 +2541,23 @@ impl<A: Audio> App<A> {
         if let Some(settings) = loaded.settings {
             self.apply_settings(settings);
         }
-        let FolderEntry { resume, open, .. } = loaded.folder;
+        let FolderEntry {
+            resume,
+            open,
+            queue,
+        } = loaded.folder;
         if let Some(name) = open {
             self.restore_open(&name);
         }
-        if let Some(resume) = resume
-            && !self.resume_point(&resume)
-        {
-            self.saved.pending = Some(resume);
+        // Without anything to look up, the index is not built.
+        if !queue.is_empty() || resume.is_some() {
+            let index = self.scanned_index(root);
+            self.restore_queue(&index, &queue);
+            if let Some(resume) = resume
+                && !self.resume_point(&index, &resume)
+            {
+                self.saved.pending = Some(resume);
+            }
         }
         if self.saved.enabled {
             self.saved.last = Some(self.session());
@@ -2576,26 +2598,69 @@ impl<A: Audio> App<A> {
         }
     }
 
-    /// Loads the track of `resume` paused, if the scan found it. Returns
-    /// whether a track is now current.
-    fn resume_point(&mut self, resume: &Resume) -> bool {
-        let Some(root) = self.saved.root.as_deref() else {
-            return false;
-        };
-        let Some(track) = self
-            .playback
-            .tracks()
+    /// The library index of every scanned track by its path relative to
+    /// `root`, built once per restore so looking up a saved path (the resume
+    /// point and up to [`MAX_UP_NEXT`] queued tracks) does not scan the
+    /// library each time. Tracks outside `root` (or with a path that has no
+    /// [`RelPath`]) are left out; should two tracks share one, the first
+    /// wins.
+    fn scanned_index(&self, root: &Path) -> HashMap<RelPath, usize> {
+        let tracks = self.playback.tracks();
+        let mut index = HashMap::with_capacity(tracks.len());
+        for (i, track) in tracks.iter().enumerate() {
+            if let Some(rel) = relative(root, &track.path) {
+                index.entry(rel).or_insert(i);
+            }
+        }
+        index
+    }
+
+    /// Replaces the up-next queue with the saved `queue`, keeping the tracks
+    /// the scan found, in order (duplicates included).
+    fn restore_queue(&mut self, index: &HashMap<RelPath, usize>, queue: &[RelPath]) {
+        if queue.is_empty() {
+            return;
+        }
+        let tracks: Vec<usize> = queue
             .iter()
-            .position(|t| relative(root, &t.path).as_ref() == Some(&resume.track))
-        else {
-            return false;
+            .filter_map(|rel| index.get(rel).copied())
+            .take(MAX_UP_NEXT)
+            .collect();
+        let restored = self.playback.restore_up_next(tracks);
+        debug_assert!(restored, "indices come from the scanned tracks");
+    }
+
+    /// Loads the track of `resume` paused, if the scan found it (see
+    /// [`App::restore`] for a saved queued track). Returns whether a track
+    /// is now current.
+    fn resume_point(&mut self, index: &HashMap<RelPath, usize>, resume: &Resume) -> bool {
+        let track = index.get(&resume.track).copied();
+        let queued = resume.queued.as_ref().map(|rel| index.get(rel).copied());
+        let Some(track) = track else {
+            // The play order's track is gone: a queued track found is
+            // resumed with the library as the play order, nothing current.
+            return match queued {
+                Some(Some(queued)) => self.playback.resume_queued(queued, resume.position),
+                _ => false,
+            };
         };
         let (source, items, item) = self.resume_source(resume, track).unwrap_or_else(|| {
             let all = (0..self.playback.tracks().len()).collect();
             (Source::Library, all, track)
         });
-        self.playback
-            .resume(source, items, item, resume.position, None)
+        match queued {
+            None => self
+                .playback
+                .resume(source, items, item, resume.position, None),
+            Some(Some(queued)) => {
+                self.playback
+                    .resume(source, items, item, resume.position, Some(queued))
+            }
+            // The position was the queued track's, not this one's.
+            Some(None) => self
+                .playback
+                .resume(source, items, item, Duration::ZERO, None),
+        }
     }
 
     /// The saved source of `resume` as the play order for library track
@@ -2636,7 +2701,17 @@ impl<A: Audio> App<A> {
     /// The session as it would be saved now. A detached play order is saved
     /// as the library; an artist or album source by its names (catalog
     /// indices are only valid for the run); the position is in whole
-    /// milliseconds.
+    /// milliseconds. While a queued track plays, the resume point is the
+    /// play order's track and item with the queued track as `queued` (the
+    /// position is the queued track's), or a plain library resume point of
+    /// the queued track when the play order has nothing current (or its
+    /// track has no [`RelPath`]); a queued track with no `RelPath` resumes
+    /// the play order's track from zero instead. A play order left detached
+    /// by a playlist edit saves its source with no item, as when no queued
+    /// track plays, so a restore finds the track again by its first match
+    /// in the source, or in the library. The queue
+    /// is saved in order; an entry with no [`RelPath`] (a non-Unicode path
+    /// off Unix) is left out.
     fn session(&self) -> Session {
         #[cfg(test)]
         self.saved.built.set(self.saved.built.get() + 1);
@@ -2648,54 +2723,100 @@ impl<A: Audio> App<A> {
             visualizer: self.visualizer.on,
             lyrics: self.lyrics.on,
         };
-        let resume = self.saved.root.as_deref().and_then(|root| {
-            let index = playback.current()?;
-            let track = relative(root, &playback.tracks().get(index)?.path)?;
-            let library = (SavedSource::Library, Some(index));
-            let (source, item) = match playback.source() {
-                Source::Playlist(name) => {
-                    (SavedSource::Playlist(name.clone()), playback.current_item())
-                }
-                // Catalog indices are only valid for this run: saved by
-                // name. An index the catalog lacks (never, in practice)
-                // falls back to the library.
-                Source::Artist(a) => self.catalog.artist(*a).map_or(library, |artist| {
-                    (
-                        SavedSource::Artist(artist.name().to_owned()),
-                        playback.current_item(),
-                    )
-                }),
-                Source::Album(b) => self.catalog.album(*b).map_or(library, |album| {
-                    let artist = self
-                        .catalog
-                        .artist(album.artist())
-                        .map_or_else(String::new, |artist| artist.name().to_owned());
-                    (
-                        SavedSource::Album {
-                            artist,
-                            title: album.title().to_owned(),
-                        },
-                        playback.current_item(),
-                    )
-                }),
-                // The library's items are its indices.
-                Source::Library | Source::Detached => library,
-            };
-            Some(Resume {
-                track,
-                item,
-                position: whole_millis(playback.position()),
-                source,
-                queued: None,
-            })
+        let root = self.saved.root.as_deref();
+        let resume = root.and_then(|root| self.resume_now(root));
+        let queue = root.map_or_else(Vec::new, |root| {
+            let tracks = playback.tracks();
+            playback
+                .up_next()
+                .iter()
+                .filter_map(|&t| relative(root, &tracks.get(t)?.path))
+                .collect()
         });
         Session {
             settings,
             folder: FolderEntry {
                 resume,
                 open: self.open.as_ref().map(|o| o.name().to_owned()),
-                ..FolderEntry::default()
+                queue,
             },
+        }
+    }
+
+    /// The resume point as it would be saved now; see [`App::session`].
+    fn resume_now(&self, root: &Path) -> Option<Resume> {
+        let playback = &self.playback;
+        let tracks = playback.tracks();
+        let current = playback.current()?;
+        let position = whole_millis(playback.position());
+        let plain = |index: usize, item: Option<usize>| {
+            let (source, item) = self.saved_source(index, item);
+            Some(Resume {
+                track: relative(root, &tracks.get(index)?.path)?,
+                item,
+                position,
+                source,
+                queued: None,
+            })
+        };
+        if !playback.playing_queued() {
+            return plain(current, playback.current_item());
+        }
+        let queued = tracks.get(current).and_then(|t| relative(root, &t.path));
+        let order = playback
+            .source_current()
+            .and_then(|after| plain(after, playback.source_item()));
+        match (order, queued) {
+            (Some(order), Some(queued)) => Some(Resume {
+                queued: Some(queued),
+                ..order
+            }),
+            // The queued track cannot be named in the file: resume the play
+            // order's track, from zero since the position is not its own.
+            (Some(order), None) => Some(Resume {
+                position: Duration::ZERO,
+                ..order
+            }),
+            // Nothing current in the play order (or its track cannot be
+            // named): the queued track is resumed as a library track.
+            (None, Some(queued)) => Some(Resume {
+                track: queued,
+                item: Some(current),
+                position,
+                source: SavedSource::Library,
+                queued: None,
+            }),
+            (None, None) => None,
+        }
+    }
+
+    /// How the play order's track `index` (a library index), at position
+    /// `item` in the source's list, is saved: the source and the item.
+    fn saved_source(&self, index: usize, item: Option<usize>) -> (SavedSource, Option<usize>) {
+        let library = (SavedSource::Library, Some(index));
+        match self.playback.source() {
+            Source::Playlist(name) => (SavedSource::Playlist(name.clone()), item),
+            // Catalog indices are only valid for this run: saved by name. An
+            // index the catalog lacks (never, in practice) falls back to the
+            // library.
+            Source::Artist(a) => self.catalog.artist(*a).map_or(library, |artist| {
+                (SavedSource::Artist(artist.name().to_owned()), item)
+            }),
+            Source::Album(b) => self.catalog.album(*b).map_or(library, |album| {
+                let artist = self
+                    .catalog
+                    .artist(album.artist())
+                    .map_or_else(String::new, |artist| artist.name().to_owned());
+                (
+                    SavedSource::Album {
+                        artist,
+                        title: album.title().to_owned(),
+                    },
+                    item,
+                )
+            }),
+            // The library's items are its indices.
+            Source::Library | Source::Detached => library,
         }
     }
 
@@ -9293,6 +9414,393 @@ mod browse_tests {
             m.artist("Air").map(Source::Artist).as_ref(),
             Some(m.app.playback().source())
         );
+        Ok(())
+    }
+
+    // --- Saved queue (group 4 of add-play-queue) ---
+
+    impl Lib {
+        /// The entry saved for this folder in `state`.
+        fn saved_entry(&self, state: &Path) -> Result<FolderEntry> {
+            let Parsed::Valid(file) = parse(&fs::read(state)?) else {
+                bail!("state file not valid");
+            };
+            let key = RootKey::new(&self.root).context("root key")?;
+            file.folders
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, entry)| entry)
+                .context("no entry for this folder")
+        }
+
+        /// Restores from a store that saves nothing, so [`App::session`]
+        /// knows the root.
+        fn saved_root(&mut self) {
+            let root = self.root.clone();
+            self.app.restore(Box::new(NoState), &root);
+        }
+
+        /// The path of the track titled `title` relative to the root.
+        fn rel(&self, title: &str) -> Result<RelPath> {
+            let index = self.track(title)?;
+            let path = &self.app.playback().tracks()[index].path;
+            relative(&self.root, path).context("relative path")
+        }
+
+        /// Plays "La Femme d'Argent" from "Moon Safari", queues `queued`,
+        /// and ends the album track so the first of them plays, at 1:20.
+        fn queued_after_moon_safari(&mut self, queued: &[&str]) -> Result<()> {
+            self.play_moon_safari()?;
+            self.enqueue(queued)?;
+            self.end_track();
+            self.app.playback_mut().audio_mut().position = Duration::from_secs(80);
+            assert!(self.app.playback().playing_queued());
+            Ok(())
+        }
+
+        /// Ends the current track (as [`Lib::end_track`]) after starting
+        /// playback if it was paused.
+        fn play_to_end(&mut self) {
+            if self.app.playback().state() == PlayState::Paused {
+                self.chars(" ");
+            }
+            self.end_track();
+        }
+    }
+
+    /// The music without the tracks titled `titles` (deleted before a
+    /// restart).
+    fn without(tracks: &[Track], titles: &[&str]) -> Vec<Track> {
+        tracks
+            .iter()
+            .filter(|t| !titles.contains(&t.title.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Task 4.1: the queue is saved in order, duplicates included.
+    #[test]
+    fn session_saves_the_queue_in_order() -> Result<()> {
+        let mut m = music()?;
+        m.saved_root();
+        m.enqueue(&["Venus", "Crying", "Venus"])?;
+        let session = m.app.session();
+        let expected = vec![m.rel("Venus")?, m.rel("Crying")?, m.rel("Venus")?];
+        assert_eq!(session.folder.queue, expected);
+        assert_eq!(session.folder.resume, None, "nothing current");
+        Ok(())
+    }
+
+    /// Task 4.1: a queued track playing after an album track saves the
+    /// album track's position in the play order and the queued track.
+    #[test]
+    fn session_while_a_queued_track_plays_after_an_album_track() -> Result<()> {
+        let mut m = music()?;
+        m.saved_root();
+        m.queued_after_moon_safari(&["Crying", "Venus"])?;
+        let resume = m.app.session().folder.resume.context("a resume point")?;
+        assert_eq!(
+            resume,
+            Resume {
+                track: m.rel("La Femme d'Argent")?,
+                item: Some(0),
+                position: Duration::from_secs(80),
+                source: moon_safari(),
+                queued: Some(m.rel("Crying")?),
+            }
+        );
+        assert_eq!(m.app.session().folder.queue, vec![m.rel("Venus")?]);
+        Ok(())
+    }
+
+    /// Task 4.1: a queued track with nothing played before it is saved as a
+    /// plain library resume point.
+    #[test]
+    fn session_while_a_queued_track_plays_with_no_play_order() -> Result<()> {
+        let mut m = music()?;
+        m.saved_root();
+        m.enqueue(&["Crying"])?;
+        m.chars(" ");
+        assert_eq!(m.current().as_deref(), Some("Crying"));
+        assert!(m.app.playback().playing_queued());
+        assert_eq!(m.app.playback().source_current(), None);
+        m.app.playback_mut().audio_mut().position = Duration::from_millis(4_250);
+        let resume = m.app.session().folder.resume.context("a resume point")?;
+        assert_eq!(
+            resume,
+            Resume {
+                track: m.rel("Crying")?,
+                item: Some(m.track("Crying")?),
+                position: Duration::from_millis(4_250),
+                source: SavedSource::Library,
+                queued: None,
+            }
+        );
+        Ok(())
+    }
+
+    /// Task 4.1: the periodic save writes when only the queue changed.
+    #[test]
+    fn autosave_writes_when_only_the_queue_changed() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        let start = Instant::now();
+        m.app.tick(start);
+        m.app.tick(start + SAVE_INTERVAL);
+        assert!(!state.exists(), "nothing changed, nothing written");
+        m.enqueue(&["Venus"])?;
+        m.app.tick(start + SAVE_INTERVAL * 2);
+        let entry = m.saved_entry(&state)?;
+        assert_eq!(entry.queue, vec![m.rel("Venus")?]);
+        assert_eq!(entry.resume, None);
+        m.app.playback_mut().clear_queued();
+        m.app.tick(start + SAVE_INTERVAL * 3);
+        assert_eq!(m.saved_entry(&state)?.queue, []);
+        Ok(())
+    }
+
+    /// Spec *Queue restored*.
+    #[test]
+    fn queue_restored() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.enqueue(&["Venus", "Crying", "Sexy Boy", "Venus"])?;
+        let tracks = m.tracks();
+        m.restart(tracks, &state)?;
+        assert_eq!(m.queue(), ["Venus", "Crying", "Sexy Boy", "Venus"]);
+        assert_eq!(m.current(), None, "nothing was current");
+        assert_eq!(m.status(), "", "no notice");
+        Ok(())
+    }
+
+    /// Spec *Queue per folder*.
+    #[test]
+    fn queue_per_folder() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut music_dir = music()?;
+        music_dir.restore_from(&state);
+        music_dir.enqueue(&["Venus"])?;
+        music_dir.app.shutdown();
+        assert_eq!(music_dir.app.save_final(), None);
+
+        let mut other = music()?;
+        other.restore_from(&state);
+        assert_eq!(other.queue(), [] as [String; 0], "another folder's queue");
+        other.app.shutdown();
+        assert_eq!(other.app.save_final(), None);
+
+        let tracks = music_dir.tracks();
+        music_dir.start(tracks, &state);
+        assert_eq!(music_dir.queue(), ["Venus"]);
+        Ok(())
+    }
+
+    /// Spec *Missing queued track dropped*.
+    #[test]
+    fn missing_queued_track_dropped() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.enqueue(&["Venus", "Crying", "Venus"])?;
+        let tracks = without(&m.tracks(), &["Crying"]);
+        m.restart(tracks, &state)?;
+        assert_eq!(m.queue(), ["Venus", "Venus"]);
+        assert_eq!(m.status(), "", "no error");
+        Ok(())
+    }
+
+    /// Spec *Queue outside the library*, at the app level: entries naming no
+    /// scanned track select nothing.
+    #[test]
+    fn saved_queue_selects_only_scanned_tracks() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        let venus = m.rel("Venus")?;
+        let file = StateFile {
+            settings: None,
+            folders: vec![(
+                RootKey::new(&m.root).context("root key")?,
+                FolderEntry {
+                    queue: vec![venus],
+                    ..FolderEntry::default()
+                },
+            )],
+        };
+        if let Some(dir) = state.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let text = String::from_utf8(render(&file))?;
+        let text = text.replace(
+            "queue ",
+            "queue ../../etc/passwd\nqueue Air/Nope.mp3\nqueue %2Fetc%2Fpasswd\nqueue ",
+        );
+        fs::write(&state, text)?;
+        let tracks = m.tracks();
+        m.start(tracks, &state);
+        assert_eq!(m.queue(), ["Venus"]);
+        Ok(())
+    }
+
+    /// Spec *Queued track resumed*.
+    #[test]
+    fn queued_track_resumed() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.queued_after_moon_safari(&["Crying", "Venus"])?;
+        let tracks = m.tracks();
+        m.restart(tracks, &state)?;
+
+        assert_eq!(m.current().as_deref(), Some("Crying"));
+        assert!(m.app.playback().playing_queued());
+        assert_eq!(m.app.playback().state(), PlayState::Paused);
+        assert_eq!(m.app.playback().position(), Duration::from_secs(80));
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Queue.value());
+        assert_eq!(m.queue(), ["Venus"]);
+        assert_eq!(m.app.playback().source_item(), Some(0));
+        assert_eq!(
+            m.album("Moon Safari").map(Source::Album).as_ref(),
+            Some(m.app.playback().source())
+        );
+        m.play_to_end();
+        assert_eq!(m.current().as_deref(), Some("Venus"));
+        m.end_track();
+        assert_eq!(m.current().as_deref(), Some("Sexy Boy"));
+        assert_eq!(m.app.sidebar_playing(), SidebarEntry::Albums.value());
+        Ok(())
+    }
+
+    /// Spec *Queued track gone*.
+    #[test]
+    fn queued_track_gone() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.queued_after_moon_safari(&["Crying"])?;
+        let tracks = without(&m.tracks(), &["Crying"]);
+        m.restart(tracks, &state)?;
+
+        assert_eq!(m.current().as_deref(), Some("La Femme d'Argent"));
+        assert!(!m.app.playback().playing_queued());
+        assert_eq!(m.app.playback().state(), PlayState::Paused);
+        assert_eq!(m.app.playback().position(), Duration::ZERO);
+        assert_eq!(
+            m.album("Moon Safari").map(Source::Album).as_ref(),
+            Some(m.app.playback().source())
+        );
+        assert_eq!(m.status(), "", "no error");
+        Ok(())
+    }
+
+    /// Spec *Play order gone*.
+    #[test]
+    fn play_order_gone() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.queued_after_moon_safari(&["Crying"])?;
+        let tracks = without(&m.tracks(), &["La Femme d'Argent"]);
+        m.restart(tracks, &state)?;
+
+        assert_eq!(m.current().as_deref(), Some("Crying"));
+        assert!(m.app.playback().playing_queued());
+        assert_eq!(m.app.playback().state(), PlayState::Paused);
+        assert_eq!(m.app.playback().position(), Duration::from_secs(80));
+        assert_eq!(*m.app.playback().source(), Source::Library);
+        assert_eq!(m.app.playback().source_current(), None);
+        m.play_to_end();
+        let first = m.app.playback().tracks().first().map(|t| t.title.clone());
+        assert_eq!(m.current(), first, "the library from its first track");
+        Ok(())
+    }
+
+    /// Spec *Older version reads the file*: a reader that ignores the
+    /// `queue` and `queued-track` lines resumes the play order's track.
+    #[test]
+    fn older_version_reads_a_file_with_a_queue() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.queued_after_moon_safari(&["Crying", "Venus"])?;
+        m.app.shutdown();
+        assert_eq!(m.app.save_final(), None);
+        let text = String::from_utf8(fs::read(&state)?)?;
+        assert!(text.contains("\nqueue ") && text.contains("\nqueued-track "));
+        let older: String = text
+            .split_inclusive('\n')
+            .filter(|line| !line.starts_with("queue ") && !line.starts_with("queued-track "))
+            .collect();
+        fs::write(&state, older)?;
+
+        let tracks = m.tracks();
+        m.start(tracks, &state);
+        assert_eq!(m.current().as_deref(), Some("La Femme d'Argent"));
+        assert_eq!(m.app.playback().state(), PlayState::Paused);
+        assert_eq!(m.queue(), [] as [String; 0]);
+        Ok(())
+    }
+
+    /// A queued track playing after a playlist entry that was then removed
+    /// (a detached play order) is resumed, with the removed track found
+    /// again in the library.
+    #[test]
+    fn queued_track_after_a_removed_playlist_entry() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.write(
+            "Running",
+            &[
+                ("Björk", "Debut", "Crying"),
+                ("Air", "Moon Safari", "Sexy Boy"),
+            ],
+        )?;
+        m.select_in_sidebar(SidebarEntry::Playlist(0))?;
+        m.keys(&[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(m.current().as_deref(), Some("Crying"));
+        m.enqueue(&["Venus"])?;
+        m.chars("n");
+        assert_eq!(m.current().as_deref(), Some("Venus"));
+        m.select("Crying")?;
+        m.chars("d");
+        assert_eq!(m.names(), ["Sexy Boy"]);
+        assert_eq!(m.app.playback().source_item(), None, "detached");
+        let resume = m.app.session().folder.resume.context("a resume point")?;
+        assert_eq!(
+            (resume.item, &resume.source, resume.queued.as_ref()),
+            (
+                None,
+                &SavedSource::Playlist("Running".to_owned()),
+                Some(&m.rel("Venus")?)
+            )
+        );
+
+        let tracks = m.tracks();
+        m.restart(tracks, &state)?;
+        assert_eq!(m.current().as_deref(), Some("Venus"));
+        assert!(m.app.playback().playing_queued());
+        assert_eq!(*m.app.playback().source(), Source::Library);
+        assert_eq!(m.app.playback().source_current(), Some(m.track("Crying")?));
+        Ok(())
+    }
+
+    /// A resume point that cannot be resumed keeps its queued track for the
+    /// next start (`pending`).
+    #[test]
+    fn unresumed_queued_point_is_kept() -> Result<()> {
+        let (_dir, state) = state_file()?;
+        let mut m = music()?;
+        m.restore_from(&state);
+        m.queued_after_moon_safari(&["Crying"])?;
+        let all = m.tracks();
+        m.restart(without(&all, &["La Femme d'Argent", "Crying"]), &state)?;
+        assert_eq!(m.current(), None);
+        m.restart(all, &state)?;
+        assert_eq!(m.current().as_deref(), Some("Crying"));
+        assert_eq!(m.app.playback().position(), Duration::from_secs(80));
+        assert_eq!(m.app.playback().source_item(), Some(0));
         Ok(())
     }
 

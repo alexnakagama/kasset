@@ -25,8 +25,8 @@ Every group ends green before it is handed off for review: `cargo test` (the who
 
 ## 4. Saved queue in the session (`src/app.rs`)
 
-- [ ] 4.1 `session()` saves `up_next` as `RelPath`s and, while a queued track plays, the play order's track and item plus `queued` (or a plain library resume point when the play order has nothing current) (D9). Verify with unit tests on the built `Session`: the queue in order, a queued track playing after an album track, and a queued track with nothing played before it. The autosave writes when only the queue changed.
-- [ ] 4.2 `restore` maps the saved queue through a `HashMap<RelPath, usize>` built once, then resumes with `queued` per D9, keeping `pending` as today. Update the `CLAUDE.md` saved-session notes. Verify with tests on a `tempfile` `FsStateStore`: spec *Queue restored*, *Queue per folder*, *Missing queued track dropped*, *Queued track resumed* (marker, order after it), *Queued track gone*, *Play order gone*, and *Older version reads the file* (an older-format reading: a file with `queue` / `queued-track` lines parsed with those keys removed resumes the play order's track).
+- [x] 4.1 `session()` saves `up_next` as `RelPath`s and, while a queued track plays, the play order's track and item plus `queued` (or a plain library resume point when the play order has nothing current) (D9). Verify with unit tests on the built `Session`: the queue in order, a queued track playing after an album track, and a queued track with nothing played before it. The autosave writes when only the queue changed.
+- [x] 4.2 `restore` maps the saved queue through a `HashMap<RelPath, usize>` built once, then resumes with `queued` per D9, keeping `pending` as today. Update the `CLAUDE.md` saved-session notes. Verify with tests on a `tempfile` `FsStateStore`: spec *Queue restored*, *Queue per folder*, *Missing queued track dropped*, *Queued track resumed* (marker, order after it), *Queued track gone*, *Play order gone*, and *Older version reads the file* (an older-format reading: a file with `queue` / `queued-track` lines parsed with those keys removed resumes the play order's track).
 
 ## 5. Rendering (`src/ui.rs`)
 
