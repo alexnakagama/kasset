@@ -82,11 +82,11 @@ Entries that do not match a track in the scanned library SHALL NOT be shown as t
 - **THEN** the saved file still contains the unmatched entry
 
 ### Requirement: Switch between library and playlists
-The sidebar SHALL list a "Library" entry first, then the saved playlists ordered case-insensitively, each with its track count. The playlists SHALL be listed when kasset starts and listed again whenever the sidebar gains focus. `Enter` on a sidebar entry SHALL show it in the main pane and focus the main pane. The library SHALL keep its selection and filter while a playlist is shown.
+The sidebar SHALL list a "Library" entry first, then the "Artists" and "Albums" entries, then the saved playlists ordered case-insensitively, each with its track count. The playlists SHALL be listed when kasset starts and listed again whenever the sidebar gains focus. `Enter` on a sidebar entry SHALL show it in the main pane and focus the main pane. The library SHALL keep its selection and filter while a playlist is shown.
 
 #### Scenario: Playlists listed on start
 - **WHEN** `Playlists` contains `Gym.m3u8` and `Running.m3u8` and kasset starts
-- **THEN** the sidebar lists "Library", "Gym" and "Running" without any key being pressed
+- **THEN** the sidebar lists "Library", "Artists", "Albums", "Gym" and "Running" without any key being pressed
 
 #### Scenario: Open playlists view
 - **WHEN** no playlist has been opened, the main pane shows the library with focus, and the user presses `Tab`
@@ -110,7 +110,7 @@ The sidebar SHALL list a "Library" entry first, then the saved playlists ordered
 
 #### Scenario: Filter the sidebar
 - **WHEN** the sidebar has focus and the user types `/run` and Enter
-- **THEN** the sidebar lists "Library" and only the playlists whose names contain "run", with the first of those playlists selected
+- **THEN** the sidebar lists "Library", "Artists", "Albums" and only the playlists whose names contain "run", with the first of those playlists selected
 
 #### Scenario: Sidebar kept current
 - **WHEN** the user adds a track from the library to a new playlist "Road trip" through "New playlist…", and then removes a track from "Running" with `d`
@@ -333,7 +333,7 @@ Removing the entry that is playing SHALL let it finish without replaying it, eve
 - **THEN** D plays when B ends; or, if the user instead presses `p` at 0:02, C plays
 
 ### Requirement: Playing indicator in playlist views
-The system SHALL mark the playing entry in a shown playlist only when that playlist is the play order, and the library SHALL mark the playing track whichever play order is active. While a track is loaded, the sidebar SHALL mark the entry ("Library" or a playlist) that is the play order.
+The system SHALL mark the playing entry in a shown playlist only when that playlist is the play order, and the library SHALL mark the playing track whichever play order is active. While a track is loaded, the sidebar SHALL mark the entry that is the play order: "Library", a playlist, "Artists" for an artist or "Albums" for an album.
 
 #### Scenario: Playlist playing
 - **WHEN** "Running" is playing B and the user opens "Running"
@@ -342,6 +342,10 @@ The system SHALL mark the playing entry in a shown playlist only when that playl
 #### Scenario: Different source
 - **WHEN** the library is the play order and the user opens a playlist that contains the playing song
 - **THEN** no entry in that playlist has the playing marker, and "Library" has the playing marker in the sidebar
+
+#### Scenario: Album source
+- **WHEN** a track is playing with an album as the play order
+- **THEN** "Albums" has the playing marker in the sidebar, and "Library" does not
 
 #### Scenario: Nothing played yet
 - **WHEN** kasset has just started

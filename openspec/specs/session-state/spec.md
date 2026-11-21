@@ -37,7 +37,7 @@ The system SHALL remember the volume, the shuffle setting, the repeat mode, and 
 - **THEN** the volume is 100%, shuffle and repeat are off, and the visualizer and lyrics pane are on
 
 ### Requirement: Resume point per library folder
-For each library folder (identified by its resolved absolute path), the system SHALL remember the current track, its position, whether it was played from the library or from a named playlist, and which playlist the main pane shows. It SHALL keep resume points for at most 20 folders, dropping the least recently opened one first.
+For each library folder (identified by its resolved absolute path), the system SHALL remember the current track, its position, whether it was played from the library, a named playlist, an artist or an album, and which playlist the main pane shows. It SHALL keep resume points for at most 20 folders, dropping the least recently opened one first.
 
 #### Scenario: Separate folders keep separate resume points
 - **WHEN** the user quits at "Song A" in `~/Music`, then quits at "Song B" in `/mnt/other`, then runs `kasset ~/Music`
@@ -59,8 +59,12 @@ For each library folder (identified by its resolved absolute path), the system S
 - **WHEN** the saved track could not be resumed and the user plays another track and quits
 - **THEN** the next start resumes the track the user played
 
+#### Scenario: Album source remembered
+- **WHEN** the user quits while playing "Sexy Boy" from the album "Moon Safari" by "Air"
+- **THEN** the state holds "Sexy Boy", its position, and the album "Moon Safari" by "Air" as its source
+
 ### Requirement: Resume on start
-When the opened folder has a resume point, the system SHALL load its track paused at the saved position, never playing on its own, with the saved play source. A track the scan no longer finds SHALL NOT be resumed. A saved source playlist that no longer exists or no longer holds the track SHALL be replaced by the library as the source. Independently, the saved shown playlist SHALL be shown, focused, if it still exists; else the library is shown.
+When the opened folder has a resume point, the system SHALL load its track paused at the saved position, never playing on its own, with the saved play source. A track the scan no longer finds SHALL NOT be resumed. A saved source playlist, artist or album that no longer exists or no longer holds the track SHALL be replaced by the library as the source. Independently, the saved shown playlist SHALL be shown, focused, if it still exists; else the library is shown.
 
 #### Scenario: Resumed paused
 - **WHEN** the user quits while "Song" plays at 2:15 and starts kasset again in the same folder
@@ -69,6 +73,14 @@ When the opened folder has a resume point, the system SHALL load its track pause
 #### Scenario: Resumed in its playlist
 - **WHEN** the user quits while playing "Running" with "Running" shown, and starts kasset again
 - **THEN** "Running" is shown in the main pane with focus, the current track is the same one, and next/previous follow "Running"
+
+#### Scenario: Resumed in its album
+- **WHEN** the user quits while playing from the album "Moon Safari" with the album shown, and starts kasset again
+- **THEN** the library is shown in the main pane with focus, the current track is the same one, next/previous follow "Moon Safari", and "Albums" has the playing marker in the sidebar
+
+#### Scenario: Album no longer holds the track
+- **WHEN** the saved source is the album "Moon Safari" by "Air", but the track's album tag was changed to "Premiers Symptômes"
+- **THEN** the track is resumed with the library as the play source
 
 #### Scenario: Track gone
 - **WHEN** the saved track was deleted from the folder before kasset starts, and "Running" was shown
@@ -125,7 +137,7 @@ A failed save SHALL NOT stop playback, block quitting or change the exit status.
 - **THEN** the status line reports it once, not every 30 seconds
 
 ### Requirement: Saved state is untrusted
-The system SHALL treat the state file as untrusted input. It SHALL read at most 64 KiB, only from a regular file, and SHALL never write a file larger than it reads. Unknown entries and invalid values SHALL be ignored one by one; a file that cannot be read or parsed SHALL mean starting with the defaults. The state SHALL only select tracks the scan found and playlists the listing found, never open any other path, and any text from it shown on screen SHALL be sanitised.
+The system SHALL treat the state file as untrusted input. It SHALL read at most 64 KiB, only from a regular file, and SHALL never write a file larger than it reads. Unknown entries and invalid values SHALL be ignored one by one; a file that cannot be read or parsed SHALL mean starting with the defaults. The state SHALL only select tracks the scan found, playlists the listing found, and artists and albums of the scanned library, never open any other path, and any text from it shown on screen SHALL be sanitised.
 
 #### Scenario: Damaged file
 - **WHEN** the state file contains random bytes
@@ -138,6 +150,10 @@ The system SHALL treat the state file as untrusted input. It SHALL read at most 
 #### Scenario: Path outside the library
 - **WHEN** the resume point names the track `../../etc/passwd`
 - **THEN** nothing is loaded and that file is never opened
+
+#### Scenario: Unknown album source
+- **WHEN** the resume point's source names an album no scanned track belongs to
+- **THEN** the track is resumed with the library as the play source and nothing else is read
 
 #### Scenario: Long paths
 - **WHEN** resume points are saved for 20 folders whose paths and tracks are long enough that all 20 do not fit in 64 KiB
