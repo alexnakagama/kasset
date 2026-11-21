@@ -36,8 +36,8 @@ Every group ends green: `cargo test` (the whole suite), `cargo clippy --all-targ
 
 ## 7. Integration
 
-- [ ] 7.1 End to end in a real terminal (pty and pyte harness, see the memory notes on DSR and the first `Tab`): with a generated library of two artists, one with two albums, plus a compilation with an album-artist tag, open Artists → artist → album, play a track, let it advance within the album, go back with `Backspace`/`Esc`, quit, restart, and check that the track resumes with next following the album. Verify by recording the screens and the state file contents.
-- [ ] 7.2 `cargo +1.89 build` (MSRV, no new dependencies) and the full `cargo clippy --all-targets -- -D warnings` / `cargo test` pass. Update `CLAUDE.md`'s OpenSpec section (active change, then none after archive) and current specs list (`library-browsing`).
+- [x] 7.1 End to end in a real terminal (pty and pyte harness, see the memory notes on DSR and the first `Tab`): with a generated library of two artists, one with two albums, plus a compilation with an album-artist tag, open Artists → artist → album, play a track, let it advance within the album, go back with `Backspace`/`Esc`, quit, restart, and check that the track resumes with next following the album. Verify by recording the screens and the state file contents. Harness and recorded run (30/30 checks): `e2e/e2e_browse.py`, `e2e/e2e_browse_screens.txt`.
+- [x] 7.2 `cargo +1.89 build` (MSRV, no new dependencies) and the full `cargo clippy --all-targets -- -D warnings` / `cargo test` pass. Update `CLAUDE.md`'s OpenSpec section (active change, then none after archive) and current specs list (`library-browsing`).
 
 ## Workflow follow-up
 
