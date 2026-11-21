@@ -2415,7 +2415,7 @@ impl<A: Audio> App<A> {
         if let Some(settings) = loaded.settings {
             self.apply_settings(settings);
         }
-        let FolderEntry { resume, open } = loaded.folder;
+        let FolderEntry { resume, open, .. } = loaded.folder;
         if let Some(name) = open {
             self.restore_open(&name);
         }
@@ -2573,6 +2573,7 @@ impl<A: Audio> App<A> {
                 item,
                 position: whole_millis(playback.position()),
                 source,
+                queued: None,
             })
         });
         Session {
@@ -2580,6 +2581,7 @@ impl<A: Audio> App<A> {
             folder: FolderEntry {
                 resume,
                 open: self.open.as_ref().map(|o| o.name().to_owned()),
+                ..FolderEntry::default()
             },
         }
     }
@@ -6925,6 +6927,7 @@ mod state_tests {
             item,
             position: Duration::from_millis(ms),
             source,
+            queued: None,
         }
     }
 
@@ -7100,6 +7103,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(resume_at("Gone", None, 5_000, playlist("Running"))),
             open: Some("Running".to_owned()),
+            ..FolderEntry::default()
         };
         let disk = lib.disk_with(None, entry)?;
         lib.start_on(&disk)?;
@@ -7117,6 +7121,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(resume_at("C", Some(0), 5_000, playlist("Gym"))),
             open: Some("Gym".to_owned()),
+            ..FolderEntry::default()
         };
         let disk = lib.disk_with(None, entry)?;
         lib.start_on(&disk)?;
@@ -7135,6 +7140,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(resume_at("C", Some(1), 5_000, playlist("Gym"))),
             open: Some("Gym".to_owned()),
+            ..FolderEntry::default()
         };
         let disk = lib.disk_with(None, entry)?;
         lib.start_on(&disk)?;
@@ -7185,6 +7191,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(resume_at("A", Some(2), 0, playlist("Twice"))),
             open: None,
+            ..FolderEntry::default()
         };
         lib.start_on(&lib.disk_with(None, entry)?)?;
         assert_eq!(lib.app.playback().current_item(), Some(2));
@@ -7195,6 +7202,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(resume_at("A", Some(1), 0, playlist("Twice"))),
             open: None,
+            ..FolderEntry::default()
         };
         lib.start_on(&lib.disk_with(None, entry)?)?;
         assert_eq!(lib.app.playback().current_item(), Some(0));
@@ -7227,6 +7235,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(resume_at("B", None, 5_000, SavedSource::Library)),
             open: None,
+            ..FolderEntry::default()
         };
         let disk = lib.disk_with(None, entry)?;
         lib.app = Lib::fresh(&lib.root, lib.tracks.clone());
@@ -7267,6 +7276,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(gone.clone()),
             open: None,
+            ..FolderEntry::default()
         };
         let disk = lib.disk_with(None, entry)?;
         lib.start_on(&disk)?;
@@ -7292,6 +7302,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(resume_at("B", None, 2_000, SavedSource::Library)),
             open: None,
+            ..FolderEntry::default()
         };
         lib.start_on(&lib.disk_with(None, entry)?)?;
         lib.app.set_lyrics_layout(true);
@@ -7332,6 +7343,7 @@ mod state_tests {
         let entry = FolderEntry {
             resume: Some(resume_at("A", Some(0), 10_000, SavedSource::Library)),
             open: None,
+            ..FolderEntry::default()
         };
         let disk = lib.disk_with(Some(Settings::default()), entry)?;
         lib.start_on(&disk)?;
@@ -8638,6 +8650,7 @@ mod browse_tests {
                 item,
                 position: Duration::from_millis(1_500),
                 source,
+                queued: None,
             }
         }
 
@@ -8649,7 +8662,7 @@ mod browse_tests {
                     RootKey::new(&self.root).context("root key")?,
                     FolderEntry {
                         resume: Some(resume),
-                        open: None,
+                        ..FolderEntry::default()
                     },
                 )],
             };
