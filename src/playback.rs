@@ -229,10 +229,6 @@ impl<A: Audio> Playback<A> {
     /// track is current (then it is the track played before the queue took
     /// over).
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 4 of add-play-queue")
-    )]
     pub fn source_current(&self) -> Option<usize> {
         self.queue.current()
     }
@@ -240,10 +236,6 @@ impl<A: Audio> Playback<A> {
     /// Position of the play order's current track in the source's list, even
     /// while a queued track is current; see [`Playback::current_item`].
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 4 of add-play-queue")
-    )]
     pub fn source_item(&self) -> Option<usize> {
         self.queue.current_item()
     }
@@ -760,10 +752,6 @@ impl<A: Audio> Playback<A> {
     /// it and the queue are done, the library plays from its first track.
     /// Returns whether the track was loaded; `false` with nothing changed for
     /// an invalid index.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 4 of add-play-queue")
-    )]
     pub fn resume_queued(&mut self, track: usize, position: Duration) -> bool {
         let Some(load) = ResumeLoad::new(&self.tracks, track, position) else {
             return false;
@@ -965,10 +953,6 @@ impl<A: Audio> Playback<A> {
     /// Replaces the queue with library tracks `tracks` (a restored session),
     /// keeping the first [`MAX_UP_NEXT`]. Returns `false` and changes nothing
     /// when one of them is not a library index.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used from group 4 of add-play-queue")
-    )]
     pub fn restore_up_next(&mut self, mut tracks: Vec<usize>) -> bool {
         if !self.valid_tracks(&tracks) {
             return false;
