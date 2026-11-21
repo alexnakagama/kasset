@@ -2481,7 +2481,8 @@ impl<A: Audio> App<A> {
             let all = (0..self.playback.tracks().len()).collect();
             (Source::Library, all, track)
         });
-        self.playback.resume(source, items, item, resume.position)
+        self.playback
+            .resume(source, items, item, resume.position, None)
     }
 
     /// The saved source of `resume` as the play order for library track

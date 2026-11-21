@@ -9,11 +9,33 @@
 //! for one run), or a deleted playlist playing on ([`Source::Detached`]).
 //! Only playlist sources follow playlist edits, renames and deletions.
 //!
+//! On top of the play order sits the *up-next queue* (`up_next`, D1 of
+//! add-play-queue): library indices (duplicates allowed, at most
+//! [`MAX_UP_NEXT`]) that play before the play order continues. A track taken
+//! from it becomes `queued_current`, while the play order's cursor stays on
+//! the track played before the queue took over. [`Playback::current`] covers
+//! both; [`Playback::current_item`] is `None` while a queued track is
+//! current, and [`Playback::source_current`] / [`Playback::source_item`] give
+//! the play order's position. Every move to another track (`n`, a track's
+//! end, skipping a failure) goes through one rule (`advance`, D3): repeat
+//! one replays the current track at its end (a removed, detached play order
+//! track cannot be replayed and moves on), else the first queued track
+//! plays, else the play order moves on. `advance` clears `queued_current`
+//! only when the play order actually moves; starting a new play order,
+//! going back with `p` and a failed resume clear it too. Shuffle never applies to the queue,
+//! no track goes back into it by itself, starting a new play order keeps it,
+//! and queued failures never count toward stopping the play order.
+//! `up_next_generation` changes exactly when `up_next` does, and
+//! `up_next_taken` counts tracks taken from its front, so the interface can
+//! keep its selection on the same entry.
+//!
 //! A saved session is continued with [`Playback::resume`] (after the
 //! `set_volume` / `set_shuffle` / `set_repeat` setters restore the
-//! settings): it loads one track paused at a position and, unlike every
-//! other way of starting a track, never moves on to another track when that
-//! one fails.
+//! settings): it loads one track paused at a position (the play order's, or
+//! a queued one with the play order's cursor set without loading it, or with
+//! [`Playback::resume_queued`] a queued one with nothing current in the
+//! library) and, unlike every other way of starting a track, never moves on
+//! to another track when that one fails.
 
 use std::time::Duration;
 
@@ -32,6 +54,13 @@ const EARLY_END_TOLERANCE: Duration = Duration::from_secs(2);
 /// Most tracks tried in a single call before deferring to the next
 /// [`Playback::tick`], so a run of unplayable files cannot freeze the UI.
 const MAX_ATTEMPTS_PER_CALL: usize = 16;
+
+/// Most tracks the up-next queue holds.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used from group 3 of add-play-queue")
+)]
+pub const MAX_UP_NEXT: usize = 1000;
 
 /// Transport state shown to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +161,17 @@ pub struct Playback<A: Audio> {
     /// Why playback stopped on its own, if it did; stays until playback
     /// starts again, so transient messages cannot hide it for good.
     stop_reason: Option<Notice>,
+    /// Library indices waiting to play before the play order continues, in
+    /// the order they play. At most [`MAX_UP_NEXT`], all valid indices.
+    up_next: Vec<usize>,
+    /// The queued track that is current (taken out of `up_next`), if one is.
+    /// While it is set, `queue`'s cursor stays on the play order's track
+    /// played before it.
+    queued_current: Option<usize>,
+    /// Tracks taken from the front of `up_next` to play them (wrapping).
+    up_next_taken: u64,
+    /// Changes (wrapping) every time `up_next` does, and only then.
+    up_next_generation: u64,
 }
 
 impl<A: Audio> Playback<A> {
@@ -151,6 +191,10 @@ impl<A: Audio> Playback<A> {
             retry: false,
             notice: None,
             stop_reason: None,
+            up_next: Vec::new(),
+            queued_current: None,
+            up_next_taken: 0,
+            up_next_generation: 0,
         }
     }
 
@@ -172,10 +216,44 @@ impl<A: Audio> Playback<A> {
         &self.tracks
     }
 
-    /// Library index of the current track (playing, paused, or last played).
+    /// Library index of the current track (playing, paused, or last played):
+    /// the queued track that is current, else the play order's.
     #[must_use]
     pub fn current(&self) -> Option<usize> {
+        self.queued_current.or_else(|| self.queue.current())
+    }
+
+    /// Whether the current track came from the up-next queue.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub const fn playing_queued(&self) -> bool {
+        self.queued_current.is_some()
+    }
+
+    /// Library index of the play order's current track, even while a queued
+    /// track is current (then it is the track played before the queue took
+    /// over).
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn source_current(&self) -> Option<usize> {
         self.queue.current()
+    }
+
+    /// Position of the play order's current track in the source's list, even
+    /// while a queued track is current; see [`Playback::current_item`].
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn source_item(&self) -> Option<usize> {
+        self.queue.current_item()
     }
 
     /// The current track, if any.
@@ -246,12 +324,13 @@ impl<A: Audio> Playback<A> {
     }
 
     /// Plays library track `track` from the start, replacing the current one,
-    /// with the whole library as the play order. Out-of-range indices are
-    /// ignored.
+    /// with the whole library as the play order. The up-next queue is kept.
+    /// Out-of-range indices are ignored.
     pub fn play(&mut self, track: usize) {
         if track >= self.tracks.len() {
             return;
         }
+        self.queued_current = None;
         if self.source != Source::Library {
             self.queue.reset((0..self.tracks.len()).collect());
             self.source = Source::Library;
@@ -263,7 +342,8 @@ impl<A: Audio> Playback<A> {
     }
 
     /// Pauses or resumes. When stopped, starts the current track again from
-    /// the beginning; does nothing if there is no current track.
+    /// the beginning, or with nothing current the first queued track; does
+    /// nothing if there is neither.
     pub fn toggle_pause(&mut self) {
         match self.state {
             // While unplayable tracks are still being skipped (`retry`), only
@@ -280,39 +360,55 @@ impl<A: Audio> Playback<A> {
                 if self.current().is_some() {
                     self.failures = 0;
                     self.start_current(false);
+                } else if !self.up_next.is_empty() && self.advance(Advance::Manual) {
+                    // Nothing current, so `advance` takes the first queued
+                    // track (manual causes never replay).
+                    self.failures = 0;
+                    self.start_current(false);
                 }
             }
         }
     }
 
-    /// Stops playback; the current track stays selected and restarts from the
-    /// beginning when resumed.
+    /// Stops playback; the current track (a queued one too) stays selected and
+    /// restarts from the beginning when resumed.
     pub fn stop(&mut self) {
         self.audio.stop();
         self.state = PlayState::Stopped;
         self.retry = false;
     }
 
-    /// Starts the next track in play order (the first if nothing is current).
+    /// Starts the first queued track, else the next track in play order (the
+    /// first if nothing is current).
     pub fn next(&mut self) {
-        if self.queue.next(Advance::Manual).is_some() {
+        if self.advance(Advance::Manual) {
             self.failures = 0;
             self.start_current(false);
-        } else if !self.queue.is_empty() {
+        } else if !self.queue.is_empty() || self.queued_current.is_some() {
             self.notice = Some(Notice::info("Already at the last track"));
         }
     }
 
     /// Restarts the current track if it is more than
     /// [`PREV_RESTART_AFTER`] in, else starts the previous track in play order
-    /// (restarting the current one when there is no previous).
+    /// (restarting the current one when there is no previous). For a queued
+    /// track "previous" is the play order's track played before it (from the
+    /// start), or the queued track again when the play order has nothing
+    /// current; the queued track never goes back into the queue.
     pub fn prev(&mut self) {
         if self.current().is_none() {
             return;
         }
         if self.state == PlayState::Stopped || self.position() <= PREV_RESTART_AFTER {
-            // At the start of the order the current track is kept and restarted.
-            self.queue.prev();
+            if self.queued_current.is_some() {
+                if self.queue.current().is_some() {
+                    self.queued_current = None;
+                }
+            } else {
+                // At the start of the order the current track is kept and
+                // restarted.
+                self.queue.prev();
+            }
         }
         self.failures = 0;
         self.start_current(false);
@@ -421,15 +517,51 @@ impl<A: Audio> Playback<A> {
         }
     }
 
+    /// Moves to the track to play after the current one (D3 of
+    /// add-play-queue) and returns whether one is now current to start:
+    ///
+    /// 1. at a track's end with repeat one, the current track is kept (a
+    ///    queued one, or the play order's unless it is detached, which
+    ///    cannot be replayed and moves on as before), so the queue waits;
+    /// 2. else the first queued track is taken out of the queue;
+    /// 3. else the play order moves on. Only when it does is the queued
+    ///    track (if one was current) left behind; at the end of the order
+    ///    with repeat off nothing changes and `false` is returned.
+    fn advance(&mut self, cause: Advance) -> bool {
+        if cause == Advance::Ended && self.queue.repeat() == Repeat::One {
+            if self.queued_current.is_some() {
+                return true;
+            }
+            if self.queue.current().is_some() && !self.queue.is_detached() {
+                // `Queue::next` keeps the current item for this cause.
+                return self.queue.next(cause).is_some();
+            }
+        }
+        if !self.up_next.is_empty() {
+            let track = self.up_next.remove(0);
+            self.queued_current = Some(track);
+            self.up_next_taken = self.up_next_taken.wrapping_add(1);
+            self.up_next_changed();
+            return true;
+        }
+        if self.queue.next(cause).is_some() {
+            self.queued_current = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Whether every entry of `tracks` is a library index.
     fn valid_tracks(&self, tracks: &[usize]) -> bool {
         tracks.iter().all(|&t| t < self.tracks.len())
     }
 
-    /// The current track finished normally: continue per repeat mode.
+    /// The current track finished normally: continue per repeat mode, the
+    /// queue first.
     fn track_ended(&mut self) {
         self.failures = 0;
-        if self.queue.next(Advance::Ended).is_some() {
+        if self.advance(Advance::Ended) {
             // Seeking to the end while paused moves on to the next track paused.
             self.start_current(self.state == PlayState::Paused);
         } else {
@@ -492,23 +624,32 @@ impl<A: Audio> Playback<A> {
         self.retry = true;
     }
 
-    /// Reports the current track as unplayable and moves the queue past it.
-    /// Returns `false` when playback stopped: end of the order with repeat off,
-    /// or every track in the order failed in a row.
+    /// Reports the current track as unplayable and moves past it: to the
+    /// next queued track, else along the play order. Returns `false` when
+    /// playback stopped: end of the order with repeat off, or every track in
+    /// the order failed in a row.
     fn record_failure(&mut self, why: &str) -> bool {
         self.audio.stop();
-        // `failures` counts tracks of the play order; a removed track that is
-        // still current is not one of them, so its failure must not use up
-        // an attempt meant for the tracks still in the order.
-        if !self.queue.is_detached() {
-            self.failures += 1;
+        let queued = self.queued_current.is_some();
+        // `failures` counts tracks of the play order; a queued track, or a
+        // removed track that is still current, is not one of them, so its
+        // failure must not use up an attempt meant for the tracks still in
+        // the order.
+        if !queued && !self.queue.is_detached() {
+            self.failures = self.failures.saturating_add(1);
         }
         let name = self.current_track().map_or_else(String::new, file_name);
         let mut notice = Notice::error(format!("Cannot play '{name}': {why}"));
 
-        let more = self.failures < self.queue.len() && self.queue.next(Advance::Failed).is_some();
+        // A queued track has already left `up_next` and each one is tried
+        // once, so moving on through the queue cannot loop.
+        let more = if self.up_next.is_empty() {
+            self.failures < self.queue.len() && self.advance(Advance::Failed)
+        } else {
+            self.advance(Advance::Failed)
+        };
         if !more {
-            if self.failures >= self.queue.len() {
+            if !queued && self.up_next.is_empty() && self.failures >= self.queue.len() {
                 notice.text.push_str(" (no playable tracks, stopped)");
             }
             self.state = PlayState::Stopped;
@@ -530,9 +671,13 @@ impl<A: Audio> Playback<A> {
 
     /// Position of the current track in the source's list (for a playlist,
     /// the index among its matched entries), or `None` when nothing is
-    /// current or the current entry was removed from the list.
+    /// current, the current entry was removed from the list, or the current
+    /// track is a queued one.
     #[must_use]
     pub fn current_item(&self) -> Option<usize> {
+        if self.queued_current.is_some() {
+            return None;
+        }
         self.queue.current_item()
     }
 
@@ -545,13 +690,14 @@ impl<A: Audio> Playback<A> {
 
     /// Makes `items` (library indices, duplicates allowed) the play order,
     /// coming from `source`, and plays the item at position `start` from the
-    /// beginning. Shuffle and repeat stay as they are. Returns `false` and
-    /// changes nothing when `start` is out of range or an item is not a
-    /// library index.
+    /// beginning. Shuffle and repeat stay as they are, and so does the
+    /// up-next queue. Returns `false` and changes nothing when `start` is out
+    /// of range or an item is not a library index.
     pub fn play_source(&mut self, source: Source, items: Vec<usize>, start: usize) -> bool {
         if start >= items.len() || !self.valid_tracks(&items) {
             return false;
         }
+        self.queued_current = None;
         self.queue.reset(items);
         self.source = source;
         if self.queue.select(start, &mut rand::rng()) {
@@ -562,52 +708,90 @@ impl<A: Audio> Playback<A> {
     }
 
     /// Continues a saved session: makes `items` (library indices) from
-    /// `source` the play order and loads the item at position `item`
-    /// **paused** at `position`. Shuffle and repeat stay as they are (with
-    /// shuffle on, the new order starts at `item`).
+    /// `source` the play order with the item at position `item` current, and
+    /// loads one track **paused** at `position`: that item's track, or with
+    /// `queued` (a library index) that queued track, played after the item
+    /// (the item's track is then not loaded; the queue and then the play
+    /// order continue after it as usual). Shuffle and repeat stay as they
+    /// are (with shuffle on, the new order starts at `item`), and so does the
+    /// up-next queue.
     ///
     /// The track starts at zero instead when its tag length is known and
     /// `position` is at or past it, and a load that fails to seek
     /// ([`SeekFailed`], for any reason) is retried once at zero, since the
     /// file itself may be playable. Other load errors are not retried.
     /// Unlike every other way of starting a track, a failure never moves on
-    /// to another one: nothing is current, playback is stopped, and the
-    /// notice (kept as the stop reason) says "Cannot resume …".
+    /// to another one: nothing is current (the play order keeps its list and
+    /// source, with no cursor), playback is stopped, and the notice (kept as
+    /// the stop reason) says "Cannot resume …".
     ///
     /// Returns whether the track was loaded. Returns `false` and changes
-    /// nothing when `item` is out of range or an item is not a library
-    /// index.
+    /// nothing when `item` is out of range, an item is not a library index,
+    /// or `queued` is not one.
     pub fn resume(
         &mut self,
         source: Source,
         items: Vec<usize>,
         item: usize,
         position: Duration,
+        queued: Option<usize>,
     ) -> bool {
-        if item >= items.len() || !self.valid_tracks(&items) {
+        if item >= items.len()
+            || !self.valid_tracks(&items)
+            || queued.is_some_and(|q| q >= self.tracks.len())
+        {
             return false;
         }
         // `items` were checked to be library indices, so `items[item]` is
         // the track `select` makes current, with or without shuffle.
-        let Some(track) = self.tracks.get(items[item]) else {
+        let Some(&track) = items.get(item) else {
             return false;
         };
-        let path = track.path.clone();
-        let name = sanitize(&track.title).unwrap_or_else(|| file_name(track));
-        let start = if track.duration.is_some_and(|length| position >= length) {
-            Duration::ZERO
-        } else {
-            position
+        let Some(load) = ResumeLoad::new(&self.tracks, queued.unwrap_or(track), position) else {
+            return false;
         };
         self.audio.stop();
         self.retry = false;
         self.failures = 0;
         self.queue.reset(items);
         self.source = source;
-        self.queue.select(item, &mut rand::rng());
-        let mut loaded = self.audio.load(&path, start, true);
-        if !start.is_zero() && loaded.as_ref().is_err_and(anyhow::Error::is::<SeekFailed>) {
-            loaded = self.audio.load(&path, Duration::ZERO, true);
+        let selected = self.queue.select(item, &mut rand::rng());
+        debug_assert!(selected, "`item` was checked to be in range");
+        self.queued_current = queued;
+        self.finish_resume(&load)
+    }
+
+    /// Continues a saved session whose queued track was played with nothing
+    /// current in the play order: the library becomes the play order with
+    /// nothing current, and queued track `track` (a library index) is loaded
+    /// **paused** at `position`, by the rules of [`Playback::resume`]. Once
+    /// it and the queue are done, the library plays from its first track.
+    /// Returns whether the track was loaded; `false` with nothing changed for
+    /// an invalid index.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn resume_queued(&mut self, track: usize, position: Duration) -> bool {
+        let Some(load) = ResumeLoad::new(&self.tracks, track, position) else {
+            return false;
+        };
+        self.audio.stop();
+        self.retry = false;
+        self.failures = 0;
+        self.queue.reset((0..self.tracks.len()).collect());
+        self.source = Source::Library;
+        self.queued_current = Some(track);
+        self.finish_resume(&load)
+    }
+
+    /// Loads the track of a resume paused (with the seek fallback) once the
+    /// play order is set; on failure nothing is current, see
+    /// [`Playback::resume`].
+    fn finish_resume(&mut self, load: &ResumeLoad) -> bool {
+        let mut loaded = self.audio.load(&load.path, load.start, true);
+        if !load.start.is_zero() && loaded.as_ref().is_err_and(anyhow::Error::is::<SeekFailed>) {
+            loaded = self.audio.load(&load.path, Duration::ZERO, true);
         }
         match loaded {
             Ok(()) => {
@@ -617,10 +801,12 @@ impl<A: Audio> Playback<A> {
             }
             Err(err) => {
                 self.audio.stop();
-                let notice = Notice::error(format!("Cannot resume '{name}': {}", reason(&err)));
+                let notice =
+                    Notice::error(format!("Cannot resume '{}': {}", load.name, reason(&err)));
                 // Same list and source, but nothing current.
                 let items = self.queue.items().to_vec();
                 self.queue.reset(items);
+                self.queued_current = None;
                 self.state = PlayState::Stopped;
                 self.stop_reason = Some(notice.clone());
                 self.notice = Some(notice);
@@ -677,6 +863,194 @@ impl<A: Audio> Playback<A> {
     #[must_use]
     pub fn is_playing_playlist(&self, name: &str) -> bool {
         matches!(&self.source, Source::Playlist(playing) if playing == name)
+    }
+}
+
+/// The up-next queue: tracks that play before the play order continues.
+impl<A: Audio> Playback<A> {
+    /// The queued tracks (library indices), in the order they play. The
+    /// queued track that is current is not among them.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn up_next(&self) -> &[usize] {
+        &self.up_next
+    }
+
+    /// Changes every time [`Playback::up_next`] does, and only then, so
+    /// positions in it are valid for one generation.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub const fn up_next_generation(&self) -> u64 {
+        self.up_next_generation
+    }
+
+    /// How many tracks were taken from the front of the queue to play them
+    /// (wrapping): when it grows by `k`, every remaining entry moved up `k`
+    /// positions.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub const fn up_next_taken(&self) -> u64 {
+        self.up_next_taken
+    }
+
+    /// Adds library tracks `tracks`, in their order, to the end of the queue,
+    /// or to its front with `front`. Only the first ones that fit under
+    /// [`MAX_UP_NEXT`] are added. Returns how many were added: 0 (nothing
+    /// changed) when none fit, `tracks` is empty or one of them is not a
+    /// library index.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn enqueue(&mut self, tracks: &[usize], front: bool) -> usize {
+        if !self.valid_tracks(tracks) {
+            return 0;
+        }
+        let room = MAX_UP_NEXT.saturating_sub(self.up_next.len());
+        let Some(added) = tracks
+            .get(..tracks.len().min(room))
+            .filter(|t| !t.is_empty())
+        else {
+            return 0;
+        };
+        if front {
+            self.up_next.splice(0..0, added.iter().copied());
+        } else {
+            self.up_next.extend_from_slice(added);
+        }
+        self.up_next_changed();
+        added.len()
+    }
+
+    /// Removes the queued entry at position `pos`. Returns `false` (nothing
+    /// changed) when `pos` is out of range.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn remove_queued(&mut self, pos: usize) -> bool {
+        if pos >= self.up_next.len() {
+            return false;
+        }
+        self.up_next.remove(pos);
+        self.up_next_changed();
+        true
+    }
+
+    /// Moves the queued entry at position `from` to position `to` (the
+    /// entries in between shift by one). Returns `false` (nothing changed)
+    /// when either position is out of range; `from == to` changes nothing
+    /// and returns `true`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn move_queued(&mut self, from: usize, to: usize) -> bool {
+        let len = self.up_next.len();
+        if from >= len || to >= len {
+            return false;
+        }
+        if from != to {
+            let track = self.up_next.remove(from);
+            self.up_next.insert(to, track);
+            self.up_next_changed();
+        }
+        true
+    }
+
+    /// Takes the queued entry at position `pos` out of the queue and plays it
+    /// now as the current queued track. The play order's cursor does not
+    /// move, so the rest of the queue and then the play order continue after
+    /// it. Returns `false` (nothing changed) when `pos` is out of range.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn play_queued(&mut self, pos: usize) -> bool {
+        if pos >= self.up_next.len() {
+            return false;
+        }
+        let track = self.up_next.remove(pos);
+        self.up_next_changed();
+        self.queued_current = Some(track);
+        self.failures = 0;
+        self.start_current(false);
+        true
+    }
+
+    /// Empties the queue; a queued track that is current keeps playing.
+    /// Returns whether anything was removed.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn clear_queued(&mut self) -> bool {
+        if self.up_next.is_empty() {
+            return false;
+        }
+        self.up_next.clear();
+        self.up_next_changed();
+        true
+    }
+
+    /// Replaces the queue with library tracks `tracks` (a restored session),
+    /// keeping the first [`MAX_UP_NEXT`]. Returns `false` and changes nothing
+    /// when one of them is not a library index.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used from group 3 of add-play-queue")
+    )]
+    pub fn restore_up_next(&mut self, mut tracks: Vec<usize>) -> bool {
+        if !self.valid_tracks(&tracks) {
+            return false;
+        }
+        tracks.truncate(MAX_UP_NEXT);
+        if tracks != self.up_next {
+            self.up_next = tracks;
+            self.up_next_changed();
+        }
+        true
+    }
+
+    /// Records a change to `up_next`.
+    const fn up_next_changed(&mut self) {
+        self.up_next_generation = self.up_next_generation.wrapping_add(1);
+    }
+}
+
+/// What [`Playback::resume`] loads: the track's file, where to start and
+/// its sanitised name for the failure notice.
+struct ResumeLoad {
+    path: std::path::PathBuf,
+    start: Duration,
+    name: String,
+}
+
+impl ResumeLoad {
+    /// The load of library track `track` at `position` (zero when its tag
+    /// length is known and `position` is at or past it); `None` for an
+    /// invalid index.
+    fn new(tracks: &[Track], track: usize, position: Duration) -> Option<Self> {
+        let track = tracks.get(track)?;
+        let start = if track.duration.is_some_and(|length| position >= length) {
+            Duration::ZERO
+        } else {
+            position
+        };
+        Some(Self {
+            path: track.path.clone(),
+            start,
+            name: sanitize(&track.title).unwrap_or_else(|| file_name(track)),
+        })
     }
 }
 
@@ -1779,7 +2153,7 @@ mod tests {
     #[test]
     fn resume_keeps_an_album_source() {
         let mut p = playback(6, &[]);
-        assert!(p.resume(Source::Album(2), vec![4, 1, 3], 1, secs(5)));
+        assert!(p.resume(Source::Album(2), vec![4, 1, 3], 1, secs(5), None));
         assert_eq!(p.source(), &Source::Album(2));
         assert_eq!(p.state(), PlayState::Paused);
         p.toggle_pause();
@@ -1833,7 +2207,7 @@ mod tests {
         item: usize,
         at: Duration,
     ) -> bool {
-        p.resume(Source::Library, items, item, at)
+        p.resume(Source::Library, items, item, at, None)
     }
 
     /// Asserts that a failed resume left nothing current, stopped, with one
@@ -1955,7 +2329,7 @@ mod tests {
     #[test]
     fn failed_resume_keeps_the_source_and_space_does_nothing() {
         let mut p = playback(6, &[1]);
-        assert!(!p.resume(running(), vec![4, 1, 3], 1, secs(5)));
+        assert!(!p.resume(running(), vec![4, 1, 3], 1, secs(5), None));
         assert_eq!(p.source(), &running());
         assert_eq!(p.items(), [4, 1, 3]);
         p.toggle_pause();
@@ -1986,7 +2360,7 @@ mod tests {
     fn resume_with_shuffle_starts_a_shuffled_order_at_the_track() {
         let mut p = playback(6, &[]);
         p.set_shuffle(true);
-        assert!(p.resume(running(), vec![4, 2, 0, 3, 1], 2, secs(10)));
+        assert!(p.resume(running(), vec![4, 2, 0, 3, 1], 2, secs(10), None));
         assert_eq!(p.current(), Some(0));
         assert_eq!(p.current_item(), Some(2));
         assert_eq!(p.source(), &running());
@@ -2074,7 +2448,7 @@ mod tests {
         assert!(p.queue.is_detached());
         let before = p.audio.loads.len();
 
-        assert!(p.resume(running(), vec![1, 1, 1], 2, secs(5)));
+        assert!(p.resume(running(), vec![1, 1, 1], 2, secs(5), None));
         assert_eq!(p.current_item(), Some(2));
         assert_eq!(p.current(), Some(1));
         assert!(!p.queue.is_detached());
@@ -2151,5 +2525,806 @@ mod tests {
             assert_eq!(p.repeat(), repeat);
         }
         assert_eq!(p.audio.loads.len(), 1, "no setter reloads the track");
+    }
+
+    // ---- Up-next queue ----
+
+    /// An album listing A, B, C (library tracks 3, 4, 5).
+    fn album() -> Source {
+        Source::Album(0)
+    }
+
+    const A: usize = 3;
+    const B: usize = 4;
+    const C: usize = 5;
+    const X: usize = 7;
+    const Y: usize = 8;
+    const Z: usize = 9;
+
+    /// Ten library tracks, playing A from the album with repeat `repeat`.
+    fn playing_album(repeat: Repeat, broken: &[usize], start: usize) -> Playback<FakeAudio> {
+        let mut p = playback(10, broken);
+        p.set_repeat(repeat);
+        assert!(p.play_source(album(), vec![A, B, C], start));
+        p
+    }
+
+    /// The files loaded so far, in order.
+    fn loaded(p: &Playback<FakeAudio>) -> Vec<PathBuf> {
+        p.audio.loads.iter().map(|(l, ..)| l.clone()).collect()
+    }
+
+    #[test]
+    fn enqueue_adds_to_the_end_or_the_front() {
+        let mut p = playback(10, &[]);
+        assert_eq!(p.enqueue(&[A, B], false), 2);
+        assert_eq!(p.enqueue(&[C], false), 1);
+        assert_eq!(p.up_next(), [A, B, C], "add to the end");
+
+        let mut p = playback(10, &[]);
+        assert_eq!(p.enqueue(&[A, B], false), 2);
+        assert_eq!(p.enqueue(&[C, X], true), 2);
+        assert_eq!(p.up_next(), [C, X, A, B], "play next keeps their order");
+
+        let mut p = playback(10, &[]);
+        p.enqueue(&[A], false);
+        p.enqueue(&[A], false);
+        assert_eq!(p.up_next(), [A, A], "duplicates allowed");
+        assert_eq!(p.audio.loads.len(), 0, "queueing never plays");
+        assert_eq!(p.state(), PlayState::Stopped);
+    }
+
+    #[test]
+    fn a_full_queue_takes_the_first_tracks_that_fit() {
+        let mut p = playback(20, &[]);
+        let filler = vec![0; MAX_UP_NEXT - 5];
+        assert_eq!(p.enqueue(&filler, false), MAX_UP_NEXT - 5);
+        let album: Vec<usize> = (10..20).collect();
+        assert_eq!(p.enqueue(&album, false), 5);
+        assert_eq!(p.up_next().len(), MAX_UP_NEXT);
+        assert_eq!(p.up_next()[MAX_UP_NEXT - 5..], [10, 11, 12, 13, 14]);
+
+        let generation = p.up_next_generation();
+        assert_eq!(p.enqueue(&[1], false), 0, "none fit");
+        assert_eq!(p.enqueue(&[1], true), 0);
+        assert_eq!(p.up_next_generation(), generation);
+
+        let mut p = playback(20, &[]);
+        p.enqueue(&filler, false);
+        assert_eq!(p.enqueue(&album, true), 5, "the front takes the first ones");
+        assert_eq!(p.up_next()[..6], [10, 11, 12, 13, 14, 0]);
+
+        let mut p = playback(3, &[]);
+        assert!(p.restore_up_next(vec![1; MAX_UP_NEXT + 7]));
+        assert_eq!(p.up_next().len(), MAX_UP_NEXT, "a restore is capped too");
+    }
+
+    #[test]
+    fn invalid_queue_operations_change_nothing() {
+        let mut p = playback(10, &[]);
+        p.enqueue(&[A, B], false);
+        let generation = p.up_next_generation();
+        assert_eq!(p.enqueue(&[C, 10], false), 0, "one invalid index");
+        assert_eq!(p.enqueue(&[usize::MAX], true), 0);
+        assert_eq!(p.enqueue(&[], false), 0);
+        assert!(!p.remove_queued(2));
+        assert!(!p.move_queued(0, 2));
+        assert!(!p.move_queued(2, 0));
+        assert!(!p.play_queued(2));
+        assert!(!p.restore_up_next(vec![C, 10]));
+        assert_eq!(p.up_next(), [A, B]);
+        assert_eq!(p.up_next_generation(), generation);
+        assert_eq!(p.current(), None);
+        assert_eq!(p.audio.loads.len(), 0);
+
+        let mut p = playback(10, &[]);
+        assert!(!p.clear_queued(), "nothing to clear");
+        assert_eq!(p.up_next_generation(), 0);
+    }
+
+    #[test]
+    fn the_generation_changes_exactly_when_the_queue_does() {
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        let mut last = p.up_next_generation();
+        let mut changed = |p: &Playback<FakeAudio>| {
+            let now = p.up_next_generation();
+            let changed = now != last;
+            last = now;
+            changed
+        };
+        p.enqueue(&[X, Y, Z], false);
+        assert!(changed(&p), "enqueue");
+        assert!(p.move_queued(1, 1));
+        assert!(!changed(&p), "a move in place changes nothing");
+        assert!(p.move_queued(2, 0));
+        assert_eq!(p.up_next(), [Z, X, Y]);
+        assert!(changed(&p), "move");
+        assert!(p.remove_queued(1));
+        assert_eq!(p.up_next(), [Z, Y]);
+        assert!(changed(&p), "remove");
+        assert!(p.restore_up_next(vec![Z, Y]));
+        assert!(!changed(&p), "restoring the same list changes nothing");
+        p.audio.position = secs(5);
+        p.seek(true);
+        p.toggle_pause();
+        p.toggle_pause();
+        p.cycle_repeat();
+        p.cycle_repeat();
+        p.cycle_repeat();
+        p.tick();
+        assert!(!changed(&p), "transport commands leave the queue alone");
+
+        let taken = p.up_next_taken();
+        p.next();
+        assert_eq!(p.up_next(), [Y]);
+        assert!(changed(&p), "taking the front to play it");
+        assert_eq!(p.up_next_taken(), taken + 1);
+        assert!(p.play_queued(0));
+        assert!(changed(&p), "play now");
+        assert_eq!(
+            p.up_next_taken(),
+            taken + 1,
+            "play now is not taken by advancing"
+        );
+        p.enqueue(&[X], true);
+        assert!(changed(&p));
+        assert!(p.clear_queued());
+        assert!(changed(&p), "clear");
+        p.next();
+        assert!(!changed(&p), "the play order moving on");
+    }
+
+    #[test]
+    fn a_queued_track_is_current_but_not_an_item_of_the_play_order() {
+        let mut p = playing_album(Repeat::Off, &[], 1);
+        p.enqueue(&[X], false);
+        assert!(!p.playing_queued());
+        assert_eq!(p.current_item(), Some(1));
+        p.next();
+        assert_eq!(p.current(), Some(X));
+        assert!(p.playing_queued());
+        assert_eq!(p.current_item(), None);
+        assert_eq!(p.current_track().map(|t| t.path.clone()), Some(path(X)));
+        assert_eq!(p.source_current(), Some(B), "the play order stays on B");
+        assert_eq!(p.source_item(), Some(1));
+        assert_eq!(p.source(), &album());
+        assert_eq!(p.items(), [A, B, C]);
+    }
+
+    #[test]
+    fn a_queued_track_plays_when_the_current_one_ends() {
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        p.enqueue(&[X], false);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(X));
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.up_next(), [] as [usize; 0]);
+        assert_eq!(
+            p.audio.loads.last(),
+            Some(&(path(X), Duration::ZERO, false))
+        );
+    }
+
+    #[test]
+    fn next_takes_the_queue_first() {
+        let mut p = playback(10, &[]);
+        p.play(3);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        assert_eq!(p.current(), Some(X));
+        assert_eq!(p.up_next(), [Y]);
+
+        let mut p = playback(10, &[]);
+        p.enqueue(&[X], false);
+        p.next();
+        assert_eq!(p.current(), Some(X), "nothing played yet");
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.source_current(), None);
+    }
+
+    #[test]
+    fn the_play_order_continues_after_the_queue() {
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        p.enqueue(&[X, Y], false);
+        end_track(&mut p);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(Y));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(B), "back to the album");
+        assert_eq!(p.current_item(), Some(1));
+        assert!(!p.playing_queued());
+        assert_eq!(loaded(&p), [path(A), path(X), path(Y), path(B)]);
+    }
+
+    #[test]
+    fn the_queue_at_the_end_of_the_play_order() {
+        let mut p = playing_album(Repeat::Off, &[], 2);
+        p.enqueue(&[X], false);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(X));
+        end_track(&mut p);
+        assert_eq!(p.state(), PlayState::Stopped, "stops after X");
+        assert_eq!(p.current(), Some(X), "X stays current");
+        assert!(p.playing_queued());
+        p.toggle_pause();
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(
+            p.audio.loads.last(),
+            Some(&(path(X), Duration::ZERO, false))
+        );
+        assert_eq!(p.current(), Some(X), "Space plays X again");
+    }
+
+    #[test]
+    fn next_on_the_last_queued_track_at_the_end_keeps_it() {
+        let mut p = playing_album(Repeat::Off, &[], 2);
+        p.enqueue(&[X], false);
+        end_track(&mut p);
+        let loads = p.audio.loads.len();
+        p.take_notice();
+        p.next();
+        assert_eq!(p.current(), Some(X));
+        assert!(p.playing_queued());
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.audio.loads.len(), loads, "not reloaded");
+        assert_eq!(
+            p.take_notice(),
+            Some(Notice::info("Already at the last track"))
+        );
+    }
+
+    #[test]
+    fn repeat_all_continues_the_play_order_after_the_queue() {
+        let mut p = playing_album(Repeat::All, &[], 2);
+        p.enqueue(&[X], false);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(X));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(A));
+        assert_eq!(p.current_item(), Some(0));
+        assert_eq!(p.up_next(), [] as [usize; 0], "X is not queued again");
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(B));
+    }
+
+    #[test]
+    fn shuffle_does_not_reorder_the_queue() {
+        let mut p = playback(20, &[]);
+        p.set_shuffle(true);
+        assert!(p.play_source(album(), (10..20).collect(), 0));
+        p.enqueue(&[X, Y, Z], false);
+        let mut played = Vec::new();
+        for _ in 0..3 {
+            end_track(&mut p);
+            played.extend(p.current());
+        }
+        assert_eq!(played, [X, Y, Z]);
+        end_track(&mut p);
+        assert!(!p.playing_queued());
+        assert!(p.current().is_some_and(|t| (10..20).contains(&t)));
+    }
+
+    #[test]
+    fn repeat_one_holds_the_queue_until_next() {
+        // On a play order track.
+        let mut p = playing_album(Repeat::One, &[], 0);
+        p.enqueue(&[X], false);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(A), "A plays again");
+        assert_eq!(p.up_next(), [X]);
+        assert_eq!(loaded(&p), [path(A), path(A)]);
+        p.next();
+        assert_eq!(p.current(), Some(X));
+
+        // On a queued track.
+        let mut p = playing_album(Repeat::One, &[], 0);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(X), "X plays again");
+        assert!(p.playing_queued());
+        assert_eq!(p.up_next(), [Y]);
+        assert_eq!(loaded(&p), [path(A), path(X), path(X)]);
+        p.next();
+        assert_eq!(p.current(), Some(Y));
+        p.next();
+        assert_eq!(p.current(), Some(B), "then the album moves on from A");
+    }
+
+    #[test]
+    fn repeat_one_on_a_removed_playlist_entry_takes_the_queue() {
+        // A detached track cannot be replayed, so it moves on as before:
+        // here to the queue first.
+        let mut p = playback(10, &[]);
+        p.set_repeat(Repeat::One);
+        assert!(p.play_source(running(), vec![A, B, C], 0));
+        assert!(p.edit_playlist("Running", Edit::Remove(0)));
+        p.enqueue(&[X], false);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(X));
+        p.next();
+        assert_eq!(p.current(), Some(B), "the entry after the removed one");
+    }
+
+    #[test]
+    fn repeat_all_never_puts_a_track_back_in_the_queue() {
+        let mut p = playing_album(Repeat::All, &[], 0);
+        p.enqueue(&[X], false);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(X));
+        end_track(&mut p);
+        assert_eq!(p.up_next(), [] as [usize; 0]);
+        assert_eq!(p.current(), Some(B));
+        assert!(!p.playing_queued());
+    }
+
+    #[test]
+    fn a_corrupt_queued_track_is_reported_and_skipped() {
+        let mut p = playing_album(Repeat::Off, &[X], 0);
+        p.enqueue(&[X, Y], false);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(Y));
+        assert_eq!(p.state(), PlayState::Playing);
+        let notice = p.take_notice();
+        assert!(
+            notice
+                .as_ref()
+                .is_some_and(|n| n.level == Level::Error && n.text.contains("07.mp3")),
+            "{notice:?}"
+        );
+        assert_eq!(loaded(&p), [path(A), path(X), path(Y)]);
+    }
+
+    #[test]
+    fn a_failing_queued_track_with_an_empty_play_order_moves_on_through_the_queue() {
+        let mut p = playback(10, &[X]);
+        assert!(p.play_source(running(), vec![A], 0));
+        assert!(p.edit_playlist("Running", Edit::Remove(0)));
+        assert_eq!(p.items(), [] as [usize; 0]);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        assert_eq!(p.current(), Some(Y));
+        assert_eq!(p.state(), PlayState::Playing);
+        let notice = p.take_notice();
+        assert!(
+            notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("07.mp3") && !n.text.contains("no playable")),
+            "{notice:?}"
+        );
+
+        // The last queued track failing stops, without the suffix.
+        p.audio.broken.insert(path(Z));
+        p.enqueue(&[Z], false);
+        p.next();
+        assert_eq!(p.state(), PlayState::Stopped);
+        let reason = p.stop_reason().map(|n| n.text.clone()).unwrap_or_default();
+        assert!(reason.contains("09.mp3"), "{reason}");
+        assert!(!reason.contains("no playable"), "{reason}");
+    }
+
+    #[test]
+    fn a_failing_queued_track_is_followed_by_the_play_order() {
+        let mut p = playing_album(Repeat::Off, &[X], 0);
+        p.enqueue(&[X], false);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(B));
+        assert_eq!(p.current_item(), Some(1));
+        assert!(!p.playing_queued());
+        assert_eq!(p.state(), PlayState::Playing);
+        assert!(p.take_notice().is_some_and(|n| n.text.contains("07.mp3")));
+    }
+
+    #[test]
+    fn queued_failures_do_not_count_toward_stopping_the_play_order() {
+        let mut p = playback(10, &[A, B, C, X, Y]);
+        p.set_repeat(Repeat::All);
+        p.enqueue(&[X, Y], false);
+        assert!(p.play_source(album(), vec![A, B, C], 0));
+        assert_eq!(p.state(), PlayState::Stopped);
+        assert_eq!(
+            loaded(&p),
+            [path(A), path(X), path(Y), path(B), path(C)],
+            "every track tried once, each play order track before giving up"
+        );
+        assert!(
+            p.stop_reason()
+                .is_some_and(|n| n.text.contains("no playable tracks"))
+        );
+    }
+
+    #[test]
+    fn previous_on_a_queued_track() {
+        // Early: back to the play order's track, from the start.
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        p.enqueue(&[X], false);
+        p.next();
+        p.audio.position = secs(2);
+        p.prev();
+        assert_eq!(p.current(), Some(A));
+        assert_eq!(p.current_item(), Some(0));
+        assert!(!p.playing_queued());
+        assert_eq!(p.up_next(), [] as [usize; 0], "X is not queued again");
+        assert_eq!(
+            p.audio.loads.last(),
+            Some(&(path(A), Duration::ZERO, false))
+        );
+
+        // Late: X restarts.
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        p.enqueue(&[X], false);
+        p.next();
+        p.audio.position = secs(70);
+        p.prev();
+        assert_eq!(p.current(), Some(X));
+        assert!(p.playing_queued());
+        assert_eq!(
+            p.audio.loads.last(),
+            Some(&(path(X), Duration::ZERO, false))
+        );
+
+        // No play order position: X restarts.
+        let mut p = playback(10, &[]);
+        p.enqueue(&[X], false);
+        p.next();
+        p.audio.position = secs(2);
+        p.prev();
+        assert_eq!(p.current(), Some(X));
+        assert!(p.playing_queued());
+        assert_eq!(loaded(&p), [path(X), path(X)]);
+    }
+
+    #[test]
+    fn stop_keeps_the_queued_track_current() {
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        p.audio.position = secs(30);
+        p.stop();
+        assert_eq!(p.current(), Some(X));
+        p.toggle_pause();
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(
+            p.audio.loads.last(),
+            Some(&(path(X), Duration::ZERO, false))
+        );
+        assert_eq!(p.up_next(), [Y], "the queue does not move");
+    }
+
+    #[test]
+    fn space_with_nothing_loaded_plays_the_first_queued_track() {
+        let mut p = playback(10, &[]);
+        assert!(p.restore_up_next(vec![X, Y]));
+        p.toggle_pause();
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.current(), Some(X));
+        assert_eq!(p.up_next(), [Y]);
+
+        let mut p = playback(10, &[]);
+        p.toggle_pause();
+        assert_eq!(
+            p.state(),
+            PlayState::Stopped,
+            "nothing queued, nothing to play"
+        );
+        assert_eq!(p.up_next_generation(), 0);
+    }
+
+    #[test]
+    fn a_new_play_order_keeps_the_queue() {
+        let mut p = playback(10, &[]);
+        p.play(1);
+        p.enqueue(&[X], false);
+        assert!(p.play_source(album(), vec![A, B, C], 1));
+        assert_eq!(p.up_next(), [X]);
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(X));
+
+        // Playing a track while a queued one is current leaves it behind.
+        p.enqueue(&[Y], false);
+        p.play(2);
+        assert!(!p.playing_queued());
+        assert_eq!(p.current(), Some(2));
+        assert_eq!(p.current_item(), Some(2));
+        assert_eq!(p.up_next(), [Y]);
+        p.next();
+        assert_eq!(p.current(), Some(Y));
+        assert!(p.play_source(album(), vec![A, B, C], 0));
+        assert!(!p.playing_queued());
+        assert_eq!(p.current_item(), Some(0));
+    }
+
+    #[test]
+    fn play_a_queued_track_now() {
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        p.enqueue(&[X, Y, Z], false);
+        assert!(p.play_queued(1));
+        assert_eq!(p.current(), Some(Y));
+        assert!(p.playing_queued());
+        assert_eq!(p.up_next(), [X, Z]);
+        assert_eq!(p.source_item(), Some(0), "the play order's cursor stays");
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(X));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(Z));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(B));
+        assert_eq!(p.current_item(), Some(1));
+    }
+
+    #[test]
+    fn playing_a_broken_queued_track_now_moves_on() {
+        let mut p = playing_album(Repeat::Off, &[X], 0);
+        p.enqueue(&[X, Y], false);
+        assert!(p.play_queued(0));
+        assert_eq!(p.current(), Some(Y));
+        assert!(p.take_notice().is_some_and(|n| n.text.contains("07.mp3")));
+    }
+
+    #[test]
+    fn playlist_edits_while_a_queued_track_plays() {
+        // Removing the play order's current entry.
+        let mut p = playback(10, &[]);
+        assert!(p.play_source(running(), vec![A, B, C], 0));
+        p.enqueue(&[X], false);
+        p.next();
+        assert!(p.edit_playlist("Running", Edit::Remove(0)));
+        assert_eq!(p.current(), Some(X));
+        assert!(p.playing_queued());
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(B), "the entry after the removed one");
+        assert_eq!(p.current_item(), Some(0));
+
+        // Moving entries.
+        let mut p = playback(10, &[]);
+        assert!(p.play_source(running(), vec![A, B, C], 0));
+        p.enqueue(&[X], false);
+        p.next();
+        assert!(p.edit_playlist("Running", Edit::Move { from: 2, to: 1 }));
+        assert_eq!(p.current(), Some(X));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(C), "C now follows A");
+        assert_eq!(p.current_item(), Some(1));
+
+        // Reloading the playlist.
+        let mut p = playback(10, &[]);
+        assert!(p.play_source(running(), vec![A, B, C], 1));
+        p.enqueue(&[X], false);
+        p.next();
+        assert!(p.edit_playlist("Running", Edit::Replace(vec![C, B, 6])));
+        assert_eq!(p.current(), Some(X));
+        assert_eq!(p.source_item(), Some(1), "B followed to its new position");
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(6));
+        assert_eq!(p.current_item(), Some(2));
+
+        // Appending.
+        let mut p = playback(10, &[]);
+        assert!(p.play_source(running(), vec![A], 0));
+        p.enqueue(&[X], false);
+        p.next();
+        assert!(p.edit_playlist("Running", Edit::Append(vec![B])));
+        assert_eq!(p.current(), Some(X));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(B));
+    }
+
+    #[test]
+    fn resume_a_queued_track_after_the_play_order_item() {
+        let mut p = playback(10, &[]);
+        assert!(p.restore_up_next(vec![Y]));
+        assert!(p.resume(album(), vec![A, B, C], 0, secs(30), Some(X)));
+        assert_eq!(p.current(), Some(X));
+        assert!(p.playing_queued());
+        assert_eq!(p.current_item(), None);
+        assert_eq!(p.source_item(), Some(0));
+        assert_eq!(p.source_current(), Some(A));
+        assert_eq!(p.source(), &album());
+        assert_eq!(p.state(), PlayState::Paused);
+        assert_eq!(
+            p.audio.loads,
+            [(path(X), secs(30), true)],
+            "A is not loaded"
+        );
+        assert_eq!(p.up_next(), [Y], "the queue is kept");
+
+        p.toggle_pause();
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(Y));
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(B));
+        assert_eq!(p.current_item(), Some(1));
+    }
+
+    #[test]
+    fn resume_a_queued_track_uses_the_seek_fallback() {
+        let mut p = playback(10, &[]);
+        p.audio.seek_failure = Some(false);
+        assert!(p.resume(album(), vec![A, B, C], 1, secs(30), Some(X)));
+        assert_eq!(
+            p.audio.loads,
+            [(path(X), secs(30), true), (path(X), Duration::ZERO, true)]
+        );
+        assert_eq!(p.current(), Some(X));
+
+        let mut p = playback(10, &[]);
+        assert!(p.resume(album(), vec![A, B, C], 1, secs(500), Some(X)));
+        assert_eq!(
+            p.audio.loads,
+            [(path(X), Duration::ZERO, true)],
+            "past its tag length"
+        );
+    }
+
+    #[test]
+    fn a_queued_track_that_fails_to_resume_leaves_nothing_current() {
+        let mut p = playback(10, &[X]);
+        assert!(!p.resume(album(), vec![A, B, C], 1, secs(30), Some(X)));
+        assert_eq!(p.current(), None);
+        assert!(!p.playing_queued());
+        assert_eq!(p.source_item(), None);
+        assert_eq!(p.source(), &album());
+        assert_eq!(p.items(), [A, B, C]);
+        assert_eq!(p.state(), PlayState::Stopped);
+        assert_eq!(loaded(&p), [path(X)], "nothing else is loaded");
+        let notice = p.take_notice().unwrap_or_else(|| Notice::info("none"));
+        assert_eq!(notice.level, Level::Error);
+        assert!(
+            notice.text.starts_with("Cannot resume 'Song 7': "),
+            "{}",
+            notice.text
+        );
+        assert_eq!(p.stop_reason(), Some(&notice));
+        p.tick();
+        assert_eq!(p.audio.loads.len(), 1, "nothing is retried later");
+    }
+
+    #[test]
+    fn resume_a_queued_track_with_nothing_current_in_the_play_order() {
+        let mut p = playback(10, &[]);
+        assert!(p.play_source(album(), vec![A, B, C], 0));
+        assert!(p.resume_queued(X, secs(12)));
+        assert_eq!(p.current(), Some(X));
+        assert!(p.playing_queued());
+        assert_eq!(p.source(), &Source::Library);
+        assert_eq!(p.items(), (0..10).collect::<Vec<_>>());
+        assert_eq!(p.source_current(), None);
+        assert_eq!(p.state(), PlayState::Paused);
+        assert_eq!(p.audio.loads.last(), Some(&(path(X), secs(12), true)));
+
+        p.toggle_pause();
+        end_track(&mut p);
+        assert_eq!(p.current(), Some(0), "the library from its start");
+        assert!(!p.playing_queued());
+
+        let mut p = playback(10, &[X]);
+        assert!(!p.resume_queued(X, secs(12)));
+        assert_eq!(p.current(), None);
+        assert!(!p.playing_queued());
+        assert!(
+            p.take_notice()
+                .is_some_and(|n| n.text.starts_with("Cannot resume 'Song 7': "))
+        );
+    }
+
+    #[test]
+    fn invalid_queued_resumes_change_nothing() {
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        assert!(!p.resume(album(), vec![A, B, C], 0, secs(5), Some(10)));
+        assert!(!p.resume_queued(10, secs(5)));
+        assert!(!p.resume_queued(usize::MAX, secs(5)));
+        assert_eq!(p.current(), Some(A));
+        assert_eq!(p.state(), PlayState::Playing);
+        assert_eq!(p.audio.loads.len(), 1);
+    }
+
+    #[test]
+    fn a_plain_resume_leaves_a_queued_track_behind() {
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        assert!(p.resume(album(), vec![A, B, C], 2, secs(5), None));
+        assert!(!p.playing_queued());
+        assert_eq!(p.current(), Some(C));
+        assert_eq!(p.up_next(), [Y]);
+    }
+
+    #[test]
+    fn seeking_to_the_end_of_a_queued_track_follows_the_advance_rule() {
+        // At the end of the play order with repeat off: stops on X.
+        let mut p = playing_album(Repeat::Off, &[], 2);
+        p.enqueue(&[X], false);
+        p.next();
+        p.audio.position = secs(198);
+        p.seek(true);
+        assert_eq!(p.state(), PlayState::Stopped);
+        assert_eq!(p.current(), Some(X));
+        assert!(p.playing_queued());
+
+        // Repeat one: X plays again and the queue waits.
+        let mut p = playing_album(Repeat::One, &[], 0);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        p.audio.position = secs(198);
+        p.seek(true);
+        assert_eq!(p.current(), Some(X));
+        assert_eq!(p.up_next(), [Y]);
+        assert_eq!(
+            p.audio.loads.last(),
+            Some(&(path(X), Duration::ZERO, false))
+        );
+    }
+
+    #[test]
+    fn long_runs_of_failing_queued_tracks_are_spread_over_ticks() {
+        let n = MAX_ATTEMPTS_PER_CALL + 4;
+        let broken: Vec<usize> = (0..n).collect();
+        let mut p = playback(n + 1, &broken);
+        p.enqueue(&broken, false);
+        p.next();
+        assert_eq!(p.audio.loads.len(), MAX_ATTEMPTS_PER_CALL);
+        assert!(p.retry, "the rest is deferred");
+        assert_eq!(p.state(), PlayState::Playing);
+        for _ in 0..3 {
+            p.tick();
+        }
+        // The play order (the whole library) starts at track 0 once the
+        // queue is used up; it is broken too, and so on up to track n.
+        assert_eq!(p.current(), Some(n), "reaches the playable track");
+        assert_eq!(p.audio.loaded, Some(path(n)));
+        assert_eq!(p.up_next(), [] as [usize; 0]);
+        let queued_loads = p.audio.loads.iter().take(n).map(|(l, ..)| l.clone());
+        assert!(
+            queued_loads.eq(broken.iter().map(|&i| path(i))),
+            "each queued track tried once"
+        );
+        assert!(p.stop_reason().is_none());
+    }
+
+    #[test]
+    fn a_queued_track_failing_while_it_plays_moves_on() {
+        let mut p = playing_album(Repeat::Off, &[], 0);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        p.audio.status = Some(Status::Failed("bad data".to_owned()));
+        p.tick();
+        assert_eq!(p.current(), Some(Y));
+        assert_eq!(p.state(), PlayState::Playing);
+        assert!(p.take_notice().is_some_and(|n| n.text.contains("07.mp3")));
+        assert_eq!(p.failures, 0, "a queued failure is not counted");
+    }
+
+    #[test]
+    fn a_failing_queued_track_with_repeat_one_is_not_retried() {
+        let mut p = playing_album(Repeat::One, &[X], 0);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        assert_eq!(p.current(), Some(Y));
+        assert_eq!(loaded(&p), [path(A), path(X), path(Y)]);
+
+        // Failing during playback too.
+        let mut p = playing_album(Repeat::One, &[], 0);
+        p.enqueue(&[X, Y], false);
+        p.next();
+        p.audio.status = Some(Status::Failed("bad data".to_owned()));
+        p.tick();
+        assert_eq!(p.current(), Some(Y));
+        p.tick();
+        assert_eq!(loaded(&p), [path(A), path(X), path(Y)], "X not retried");
+    }
+
+    #[test]
+    fn space_after_a_failed_resume_plays_the_queue() {
+        let mut p = playback(10, &[A]);
+        assert!(p.restore_up_next(vec![X]));
+        assert!(!p.resume(album(), vec![A, B, C], 0, secs(5), None));
+        assert_eq!(p.current(), None);
+        p.toggle_pause();
+        assert_eq!(
+            p.current(),
+            Some(X),
+            "with nothing current, Space takes the queue"
+        );
+        assert_eq!(p.state(), PlayState::Playing);
     }
 }
