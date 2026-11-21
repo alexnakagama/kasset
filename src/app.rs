@@ -998,10 +998,6 @@ impl<A: Audio> App<A> {
     ///   level's own album or artist is the play order and the row is its
     ///   current item, so a track played from elsewhere is never marked.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "drawn from task 6.1 of add-artist-album-browsing")
-    )]
     pub fn browse_row_playing(&self, kind: BrowseKind, value: usize) -> bool {
         if self.playback.current_track().is_none() {
             return false;

@@ -8,7 +8,10 @@ leaving the terminal.
 - Title, artist, album, track number and duration read from tags; when a tag
   is missing, it is taken from the file name (`01 - Artist - Title`) and from
   `Artist/Album/` folders, with video labels such as "(Official Audio)"
-  removed from the title
+  removed from the title; album artist and disc number come from tags only
+- Browse by artist and album (Artists → albums → tracks, or Albums →
+  tracks) and play one album, or everything by one artist, as its own play
+  order
 - Play, pause, stop, next/previous, seek, volume, automatic advance
 - Shuffle and repeat (off / all / one)
 - Live search with `/` over title, artist and album
@@ -124,11 +127,15 @@ the status bar says how many entries were left out.
 
 ## The screen
 
-- **Sidebar** (left): "Library", then your playlists with their track counts.
+- **Sidebar** (left): "Library", "Artists" and "Albums" (with their track,
+  artist and album counts), then your playlists with their track counts.
   Read-only playlists are drawn dimmed. While a track is loaded, the entry
-  that is the play order carries the playing marker (`▶`, `‖` or `■`).
-- **Main pane** (right): the tracks of the entry chosen in the sidebar, the
-  whole library or one playlist, with title, artist, album and length.
+  that is the play order carries the playing marker (`▶`, `‖` or `■`):
+  "Artists" for an artist's tracks, "Albums" for an album (also one opened
+  through "Artists").
+- **Main pane** (right): what the entry chosen in the sidebar shows: the
+  tracks of the whole library or one playlist (title, artist, album and
+  length), or a browse level (see [Browsing](#browsing-artists-and-albums)).
 - One pane has the keyboard focus: its border is highlighted and its
   selected row is drawn in reverse video; the other pane's selected row is
   only bold and underlined. `Tab` moves the focus.
@@ -244,7 +251,9 @@ first three entries.
 | `/`                    | filter the level: artists by name, albums by title or artist, tracks as in the library |
 
 Each level keeps its own filter and selection, and "Artists" and "Albums"
-come back to where you left them.
+come back to where you left them. See
+[Browsing artists and albums](#browsing-artists-and-albums) for how tracks
+are grouped.
 
 **Changed in this version:** `Tab` used to swap the whole list between the
 library and the playlists; it now moves the focus between the two panes.
@@ -269,6 +278,36 @@ deleting the playing playlist does not interrupt playback.
 Playing a track from the library makes the whole library the play order
 again. The playing marker shows in an open playlist only when it is the one
 playing.
+
+## Browsing artists and albums
+
+`Enter` on "Artists" in the sidebar lists every artist with their number of
+albums and tracks; `Enter` on an artist lists an "All tracks" row, then
+their albums by title. `Enter` on "Albums" lists every album with its
+artist and track count, by artist then title. An album lists its tracks
+with the library's columns, by disc number, then track number (tracks
+without a number last), then title; "All tracks" lists the artist's albums
+one after another. The pane title names what is shown, for an album with
+its artist.
+
+Albums are grouped by **album artist** and album title, ignoring letter
+case. The album artist is the file's album-artist tag (`ALBUMARTIST`,
+ID3v2 `TPE2`, MP4 `aART`) when it has one, else its artist. So a
+**compilation stays one album only when its tracks carry the same
+album-artist tag** (for example "Various Artists"); without it, each
+track artist gets an album of their own. Each track still shows its own
+artist. Only album artists are listed under "Artists": a guest who appears
+only on someone else's album is not. Neither the album artist nor the disc
+number is ever guessed from folder or file names. Tracks whose album is
+unknown (no tag and nothing to infer it from) form one "Unknown" album per
+album artist.
+
+Playing a track from an album makes that album the play order, and playing
+one from "All tracks" makes all of that artist's tracks the play order:
+next, previous, automatic advance, shuffle and repeat stay within it, as
+for a playlist. The playing marker shows on the album (and its artist) or
+on the artist and its "All tracks" row, and on the track only in the list
+that is playing. Playing from the library or a playlist replaces it.
 
 ## Playlists on disk
 
@@ -320,15 +359,17 @@ kasset remembers between runs:
   mode, and whether the visualizer and the lyrics pane are shown.
 - **For each music folder** (the last 20 opened, identified by their full
   resolved path): the current track and its position, whether it was played
-  from the library or from a playlist, and which playlist the main pane
-  shows.
+  from the library, a playlist, an artist or an album, and which playlist
+  the main pane shows. The artist or album shown in the main pane is not
+  remembered: the library (or the saved playlist) is shown on start.
 
 When you open a folder again, its track is loaded **paused** at the saved
 position, never playing on its own: `Space` continues it. Next and previous
-follow the same play order (the library or the playlist) as before, and the
-playlist that was shown is shown again. A track the scan no longer finds is
-not resumed, and a playlist that is gone, or no longer holds the track, is
-replaced by the library. If the saved position can't be reached (the file
+follow the same play order (the library, the playlist, the artist or the
+album) as before, and the playlist that was shown is shown again. A track
+the scan no longer finds is not resumed, and a playlist, artist or album
+that is gone, or no longer holds the track, is replaced by the library.
+Artists and albums are found again by name, ignoring letter case. If the saved position can't be reached (the file
 became shorter, or can't seek), the track starts paused at 0:00. A resume
 point that can't be used (the track's drive isn't mounted, say) is kept,
 and used on a later start once the track is found again, until you play
