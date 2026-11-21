@@ -37,6 +37,13 @@
 //! lyrics with the current line in the playing style near the middle and
 //! earlier lines dimmed, plain lyrics scrolled in proportion to the
 //! position in the track.
+//! Browse levels are tables under a header: artists (name, albums, tracks),
+//! an artist's albums ("All tracks" first, then title and tracks), albums
+//! (title, album artist, tracks), or tracks with the library's columns. The
+//! pane title names the level (an album with its artist), elided at the
+//! end; the count leaves "All tracks" out. A row has the playing marker
+//! exactly when [`App::browse_row_playing`] says so, so a track list marks
+//! its track only when its own album or artist is the play order.
 //! Popups are centred over the whole body, panes and strip together.
 //!
 //! The key bar and the help overlay are drawn from [`keys`], the single key
@@ -852,12 +859,61 @@ fn plain_title(text: &str, room: usize) -> String {
     }
 }
 
-/// Draws a browse level: the artist or album list, an artist's albums, or a
-/// list of tracks (with the library's columns). Names come from the
-/// catalog, whose text is the library's sanitised tag text.
-///
-/// Interim rendering (task 4.2 of add-artist-album-browsing): group levels
-/// list names only; task 6.1 draws the full tables and playing markers.
+/// One column of an artist or album table, after the marker column.
+struct Column {
+    header: &'static str,
+    width: Constraint,
+    /// A count: right-aligned, header included.
+    count: bool,
+}
+
+impl Column {
+    /// A name column taking `share` of the room left by the counts.
+    const fn name(header: &'static str, share: u16) -> Self {
+        Self {
+            header,
+            width: Constraint::Fill(share),
+            count: false,
+        }
+    }
+
+    /// A count column, as wide as its header ("Albums", "Tracks").
+    const fn count(header: &'static str) -> Self {
+        Self {
+            header,
+            // The headers are ASCII, so their length is their width.
+            #[expect(clippy::cast_possible_truncation, reason = "short constant headers")]
+            width: Constraint::Length(header.len() as u16),
+            count: true,
+        }
+    }
+}
+
+/// The artist table: name, albums, tracks.
+const ARTIST_COLUMNS: [Column; 3] = [
+    Column::name("Artist", 1),
+    Column::count("Albums"),
+    Column::count("Tracks"),
+];
+
+/// An artist's albums: title, tracks.
+const ARTIST_ALBUM_COLUMNS: [Column; 2] = [Column::name("Album", 1), Column::count("Tracks")];
+
+/// The album table: title, album artist, tracks.
+const ALBUM_COLUMNS: [Column; 3] = [
+    Column::name("Album", 4),
+    Column::name("Artist", 3),
+    Column::count("Tracks"),
+];
+
+/// Draws a browse level: the artist table (name, albums, tracks), an
+/// artist's albums ("All tracks", then title and tracks), the album table
+/// (title, album artist, tracks), or a list of tracks with the library's
+/// columns. The title names the level (an album with its artist) and the
+/// count says how many entries are listed ("All tracks" is listed but not
+/// counted). Rows get the playing marker per [`App::browse_row_playing`].
+/// Names come from the catalog, whose text is the library's sanitised tag
+/// text. Returns the list rows that fit.
 fn render_browse<A: Audio>(
     frame: &mut Frame,
     app: &App<A>,
@@ -870,6 +926,11 @@ fn render_browse<A: Audio>(
     let list = app.main_list();
     let artist_name = |a: usize| catalog.artist(a).map_or("", |artist| artist.name());
     let album_title = |b: usize| catalog.album(b).map_or("", |album| album.title());
+    let album_artist = |b: usize| {
+        catalog
+            .album(b)
+            .map_or("", |album| artist_name(album.artist()))
+    };
     let (title, total, noun) = match kind {
         BrowseKind::Artists => ("Artists".to_owned(), catalog.artists().len(), "artists"),
         BrowseKind::ArtistAlbums(a) => (
@@ -879,13 +940,7 @@ fn render_browse<A: Audio>(
         ),
         BrowseKind::Albums => ("Albums".to_owned(), catalog.albums().len(), "albums"),
         BrowseKind::Album(b) => (
-            format!(
-                "{} · {}",
-                album_title(b),
-                catalog
-                    .album(b)
-                    .map_or("", |album| artist_name(album.artist()))
-            ),
+            format!("{} · {}", album_title(b), album_artist(b)),
             app.browse_tracks().len(),
             "tracks",
         ),
@@ -895,7 +950,6 @@ fn render_browse<A: Audio>(
             "tracks",
         ),
     };
-    // An artist's "All tracks" row is listed but not counted.
     let shown = match kind {
         BrowseKind::ArtistAlbums(_) => list
             .rows
@@ -917,60 +971,135 @@ fn render_browse<A: Audio>(
         };
         return render_empty(frame, offset, inner, message);
     }
+    render_browse_rows(frame, app, &list, offset, inner, focused, kind)
+}
+
+/// Draws the rows of browse level `kind` (not empty) in `inner`; returns
+/// the rows that fit.
+fn render_browse_rows<A: Audio>(
+    frame: &mut Frame,
+    app: &App<A>,
+    list: &ListView,
+    offset: &mut usize,
+    inner: Rect,
+    focused: bool,
+    kind: BrowseKind,
+) -> usize {
+    let catalog = app.catalog();
+    let album_title = |b: usize| catalog.album(b).map_or("", |album| album.title());
+    let album_tracks = |b: usize| catalog.album(b).map_or(0, |album| album.tracks().len());
+    let state = app.playback().state();
+    let playing = |value: usize| app.browse_row_playing(kind, value);
+    let count_cell = |n: usize| Cell::from(Line::from(n.to_string()).right_aligned());
     match kind {
         BrowseKind::Album(_) | BrowseKind::ArtistTracks(_) => {
             let items = app.browse_tracks();
-            render_tracks(frame, app, &list, offset, inner, focused, |item| {
-                (items.get(item).copied().unwrap_or(usize::MAX), false)
+            render_tracks(frame, app, list, offset, inner, focused, |item| {
+                (
+                    items.get(item).copied().unwrap_or(usize::MAX),
+                    playing(item),
+                )
             })
         }
-        BrowseKind::Artists => render_names(frame, &list, offset, inner, focused, |a| {
-            artist_name(a).to_owned()
-        }),
+        BrowseKind::Artists => {
+            render_groups(frame, list, offset, inner, focused, &ARTIST_COLUMNS, |a| {
+                let artist = catalog.artist(a)?;
+                let cells = [
+                    Cell::from(artist.name()),
+                    count_cell(artist.albums().len()),
+                    count_cell(artist.track_count()),
+                ];
+                Some(group_row(cells, playing(a), state))
+            })
+        }
         BrowseKind::ArtistAlbums(a) => {
-            let albums = catalog.artist(a).map_or(&[][..], |artist| artist.albums());
-            render_names(
+            let artist = catalog.artist(a);
+            render_groups(
                 frame,
-                &list,
+                list,
                 offset,
                 inner,
                 focused,
-                |value| match artist_album_of_value(value) {
-                    None => ALL_TRACKS_ROW.to_owned(),
-                    Some(i) => albums.get(i).map_or("", |&b| album_title(b)).to_owned(),
+                &ARTIST_ALBUM_COLUMNS,
+                |value| {
+                    let (name, tracks) = match artist_album_of_value(value) {
+                        None => (ALL_TRACKS_ROW, artist?.track_count()),
+                        Some(i) => {
+                            let b = *artist?.albums().get(i)?;
+                            (album_title(b), album_tracks(b))
+                        }
+                    };
+                    let cells = [Cell::from(name), count_cell(tracks)];
+                    Some(group_row(cells, playing(value), state))
                 },
             )
         }
-        BrowseKind::Albums => render_names(frame, &list, offset, inner, focused, |b| {
-            let artist = catalog
-                .album(b)
-                .map_or("", |album| artist_name(album.artist()));
-            format!("{} · {artist}", album_title(b))
-        }),
+        BrowseKind::Albums => {
+            render_groups(frame, list, offset, inner, focused, &ALBUM_COLUMNS, |b| {
+                let album = catalog.album(b)?;
+                let artist = catalog.artist(album.artist()).map_or("", |a| a.name());
+                let cells = [
+                    Cell::from(album.title()),
+                    Cell::from(artist),
+                    count_cell(album.tracks().len()),
+                ];
+                Some(group_row(cells, playing(b), state))
+            })
+        }
     }
 }
 
-/// Draws the rows of a list of names, `name(value)` for each row, scrolled
-/// to keep the selection on screen. Returns the rows that fit.
-fn render_names(
+/// A row of an artist or album table: the playing marker (in the playing
+/// style when `playing`), then `cells`.
+fn group_row<const N: usize>(cells: [Cell<'_>; N], playing: bool, state: PlayState) -> Row<'_> {
+    let marker = Cell::from(if playing { state_marker(state) } else { " " });
+    let row = Row::new(std::iter::once(marker).chain(cells));
+    if playing {
+        row.style(theme::PLAYING)
+    } else {
+        row
+    }
+}
+
+/// Draws a table of artists or albums under a header: a marker column, then
+/// `columns`. `row(value)` gives a row ([`group_row`]; `None` skips it).
+/// Scrolled to keep the selection on screen. Returns the rows that fit.
+fn render_groups<'a>(
     frame: &mut Frame,
     list: &ListView,
     offset: &mut usize,
     inner: Rect,
     focused: bool,
-    name: impl Fn(usize) -> String,
+    columns: &[Column],
+    row: impl Fn(usize) -> Option<Row<'a>>,
 ) -> usize {
     let shown = list.rows.len();
-    let rows = usize::from(inner.height);
+    // One line is the header.
+    let rows = usize::from(inner.height.saturating_sub(1));
     let selected = list.selected.unwrap_or(0);
     *offset = scroll(*offset, selected, rows, shown);
     let end = offset.saturating_add(rows).min(shown);
     let body = list.rows[*offset..end]
         .iter()
-        .map(|&value| Row::new([Cell::from(name(value))]));
-    let table =
-        Table::new(body, [Constraint::Fill(1)]).row_highlight_style(theme::selected(focused));
-    let mut state = TableState::new().with_selected(Some(selected - *offset));
+        .filter_map(|&value| row(value));
+    let header = Row::new(
+        std::iter::once(Cell::from("")).chain(columns.iter().map(|column| {
+            let line = Line::from(column.header);
+            Cell::from(if column.count {
+                line.right_aligned()
+            } else {
+                line
+            })
+        })),
+    )
+    .style(theme::HEADER);
+    let table = Table::new(
+        body,
+        std::iter::once(Constraint::Length(1)).chain(columns.iter().map(|column| column.width)),
+    )
+    .header(header)
+    .row_highlight_style(theme::selected(focused));
+    let mut state = TableState::new().with_selected(Some(selected.saturating_sub(*offset)));
     frame.render_stateful_widget(table, inner, &mut state);
     rows
 }
@@ -3562,65 +3691,457 @@ mod tests {
         assert!(bar.ends_with("? help"), "{bar}");
     }
 
-    /// The browse levels as drawn for now (task 6.1 draws the full tables):
-    /// names, titles naming the level, and the messages of an empty list.
-    #[test]
-    fn browse_levels_list_their_entries() {
-        let mut app = library(3);
-        keys(&mut app, &[KeyCode::Tab]);
-        keys(&mut app, &FIRST_PLAYLIST[..2]);
-        press(&mut app, KeyCode::Enter);
-        let screen = draw(&app, &mut View::default(), 100, 20);
-        assert!(screen[0].contains(" Artists "), "{screen:#?}");
-        assert!(screen[0].contains(" 1 artists "), "{screen:#?}");
-        assert!(screen_contains(&screen, "Band"), "{screen:#?}");
-
-        keys(&mut app, &[KeyCode::Enter, KeyCode::Down, KeyCode::Enter]);
-        // Narrow: only the main pane, titled with the album and its artist.
-        let screen = draw(&app, &mut View::default(), 60, 20);
-        assert!(screen[0].starts_with("┌ LP · Band "), "{screen:#?}");
-        assert!(screen_contains(&screen, "Song 02"), "{screen:#?}");
-
-        press(&mut app, KeyCode::Char('/'));
-        for c in "zzz".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        let screen = draw(&app, &mut View::default(), 60, 20);
-        assert!(
-            screen_contains(&screen, "No tracks match 'zzz'"),
-            "{screen:#?}"
-        );
-
-        // A long title is cut inside the pane, never drawn over its border.
-        let long = "Ω".repeat(200);
-        let mut wide = App::new(
-            vec![track("Song", "Band", &long)],
+    /// Air with "Moon Safari" (3 tracks) and "Talkie Walkie" (2), Björk
+    /// with "Debut" (2), and "Hits" by "Various Artists" with guests "A"
+    /// and "B"; the lyrics pane is off.
+    fn browse_music() -> App<SilentAudio> {
+        let specs = [
+            ("Venus", "Air", "Talkie Walkie", 2, None),
+            ("Cherry Blossom Girl", "Air", "Talkie Walkie", 1, None),
+            ("La Femme d'Argent", "Air", "Moon Safari", 1, None),
+            ("Sexy Boy", "Air", "Moon Safari", 2, None),
+            ("Kelly Watch the Stars", "Air", "Moon Safari", 3, None),
+            ("Human Behaviour", "Björk", "Debut", 1, None),
+            ("Crying", "Björk", "Debut", 2, None),
+            ("First Hit", "A", "Hits", 1, Some("Various Artists")),
+            ("Second Hit", "B", "Hits", 2, Some("Various Artists")),
+        ];
+        let mut tracks: Vec<_> = specs
+            .iter()
+            .map(|&(title, artist, album, number, album_artist)| {
+                let mut t = track(title, artist, album);
+                t.number = Some(number);
+                t.album_artist = album_artist.map(str::to_owned);
+                t
+            })
+            .collect();
+        crate::library::sort_tracks(&mut tracks);
+        let mut app = App::new(
+            tracks,
             SilentAudio::default(),
             no_store(),
             "/music".to_owned(),
             None,
         );
-        wide.set_lyrics_on(false);
-        keys(&mut wide, &[KeyCode::Tab]);
-        keys(&mut wide, &FIRST_PLAYLIST[..3]);
-        press(&mut wide, KeyCode::Enter);
-        let screen = draw(&wide, &mut View::default(), 40, 12);
-        // The body is 12 - 5 rows: now playing, status and keys below it.
-        for line in &screen[..7] {
-            assert!(line.starts_with(['┌', '│', '└']), "{screen:#?}");
-            assert!(line.ends_with(['┐', '│', '┘']), "{screen:#?}");
-        }
-        assert!(screen_contains(&screen, "ΩΩΩ"), "{screen:#?}");
+        app.set_lyrics_on(false);
+        app
+    }
 
+    /// From anywhere in Normal mode: focuses the sidebar and presses
+    /// `Enter` on fixed row `value` (1 = "Artists", 2 = "Albums").
+    fn open_fixed_row(app: &mut App<SilentAudio>, value: usize) {
+        if app.focus() == Focus::Main {
+            press(app, KeyCode::Tab);
+        }
+        press(app, KeyCode::Home);
+        for _ in 0..value {
+            press(app, KeyCode::Down);
+        }
+        press(app, KeyCode::Enter);
+    }
+
+    /// Selects the row of the focused list that shows `name` (in a narrow
+    /// terminal, so only the main pane is drawn) and presses `Enter`.
+    fn enter_on(app: &mut App<SilentAudio>, name: &str) {
+        press(app, KeyCode::Home);
+        for _ in 0..app.visible().len() {
+            let buffer = draw_buffer(app, &mut View::default(), NARROW, 30);
+            let screen = lines(&buffer);
+            // The selection is reversed, from the marker column on.
+            let selected = (0..buffer.area.height)
+                .find(|&y| buffer[(2, y)].modifier.contains(Modifier::REVERSED));
+            if selected.is_some_and(|y| screen[usize::from(y)].contains(name)) {
+                press(app, KeyCode::Enter);
+                return;
+            }
+            press(app, KeyCode::Down);
+        }
+        panic!("no row shows {name}");
+    }
+
+    /// A terminal narrower than [`TWO_PANE_MIN_WIDTH`]: only the focused
+    /// pane is drawn.
+    const NARROW: u16 = 60;
+
+    /// The words of the main pane's row showing `name` (borders, marker
+    /// and padding dropped), in a narrow terminal.
+    fn row_words(screen: &[String], name: &str) -> Vec<String> {
+        row_with(&screen[1..], name).map_or_else(Vec::new, |row| {
+            row.split_whitespace()
+                .filter(|w| !["│", "▶", "‖", "■"].contains(w))
+                .map(str::to_owned)
+                .collect()
+        })
+    }
+
+    /// Whether any row of the main pane has a playing marker (in a narrow
+    /// terminal; the now-playing area below has its own).
+    fn any_marked(screen: &[String]) -> bool {
+        screen
+            .iter()
+            .take_while(|l| !l.starts_with(" Now playing"))
+            .any(|l| l.starts_with("│ ▶ ") || l.starts_with("│ ‖ "))
+    }
+
+    /// Whether the main pane's row showing `name` has the playing marker.
+    /// The row must start with `name` (after the border, marker and
+    /// padding), so a name inside another row's text never matches.
+    fn marked(screen: &[String], name: &str) -> bool {
+        let prefix = format!("│ ▶ {name}");
+        screen
+            .iter()
+            .take_while(|l| !l.starts_with(" Now playing"))
+            .any(|l| l.starts_with(&prefix))
+    }
+
+    /// The artist table: header, name, album and track counts, in order.
+    #[test]
+    fn artist_table_lists_albums_and_tracks() {
+        let mut app = browse_music();
+        open_fixed_row(&mut app, 1);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(screen[0].starts_with("┌ Artists "), "{screen:#?}");
+        assert!(screen[0].ends_with(" 3 artists ┐"), "{screen:#?}");
+        assert_eq!(row_words(&screen, "Artist"), ["Artist", "Albums", "Tracks"]);
+        assert_eq!(row_words(&screen, "Air"), ["Air", "2", "5"]);
+        assert_eq!(row_words(&screen, "Björk"), ["Björk", "1", "2"]);
+        assert_eq!(
+            row_words(&screen, "Various"),
+            ["Various", "Artists", "1", "2"]
+        );
+        let air = screen.iter().position(|l| l.contains("Air"));
+        let various = screen.iter().position(|l| l.contains("Various"));
+        assert!(air < various, "{screen:#?}");
+        // The counts end at the right border's padding.
+        assert!(
+            row_with(&screen, "Air").is_some_and(|r| r.ends_with("5 │")),
+            "{screen:#?}"
+        );
+        assert!(!any_marked(&screen), "nothing is playing");
+    }
+
+    /// An artist's albums: "All tracks" (counting all the artist's tracks)
+    /// first, then the albums by title, the title naming the artist.
+    #[test]
+    fn artist_albums_start_with_all_tracks() {
+        let mut app = browse_music();
+        open_fixed_row(&mut app, 1);
+        enter_on(&mut app, "Air");
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(screen[0].starts_with("┌ Air "), "{screen:#?}");
+        assert!(screen[0].ends_with(" 2 albums ┐"), "{screen:#?}");
+        assert_eq!(row_words(&screen[..2], "Album"), ["Album", "Tracks"]);
+        assert_eq!(row_words(&screen, "All tracks"), ["All", "tracks", "5"]);
+        assert_eq!(row_words(&screen, "Moon"), ["Moon", "Safari", "3"]);
+        assert_eq!(row_words(&screen, "Talkie"), ["Talkie", "Walkie", "2"]);
+        let order: Vec<_> = ["All tracks", "Moon Safari", "Talkie Walkie"]
+            .iter()
+            .map(|n| screen.iter().position(|l| l.contains(n)))
+            .collect();
+        assert!(order.is_sorted() && order[0].is_some(), "{screen:#?}");
+
+        // A filter keeps "All tracks" and counts only the albums.
+        press(&mut app, KeyCode::Char('/'));
+        for c in "talk".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(screen_contains(&screen, "All tracks"), "{screen:#?}");
+        assert!(!screen_contains(&screen, "Moon"), "{screen:#?}");
+        assert!(screen[0].contains(" 1 of 2 match 'talk' "), "{screen:#?}");
+    }
+
+    /// The album table: title, album artist and tracks, by artist then
+    /// title; a compilation is one album under its album artist.
+    #[test]
+    fn album_table_lists_artist_and_tracks() {
+        let mut app = browse_music();
+        open_fixed_row(&mut app, 2);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(screen[0].starts_with("┌ Albums "), "{screen:#?}");
+        assert!(screen[0].ends_with(" 4 albums ┐"), "{screen:#?}");
+        assert_eq!(row_words(&screen, "Album"), ["Album", "Artist", "Tracks"]);
+        assert_eq!(row_words(&screen, "Moon"), ["Moon", "Safari", "Air", "3"]);
+        assert_eq!(row_words(&screen, "Debut"), ["Debut", "Björk", "2"]);
+        assert_eq!(
+            row_words(&screen, "Hits"),
+            ["Hits", "Various", "Artists", "2"]
+        );
+        let order: Vec<_> = ["Moon Safari", "Talkie Walkie", "Debut", "Hits"]
+            .iter()
+            .map(|n| screen.iter().position(|l| l.contains(n)))
+            .collect();
+        assert!(order.is_sorted() && order[0].is_some(), "{screen:#?}");
+    }
+
+    /// Spec *Browsing shown in the main pane*: an album's tracks with the
+    /// library's columns, in album order, titled with the album and its
+    /// artist; "All tracks" is titled with the artist.
+    #[test]
+    fn browsed_tracks_have_the_library_columns() {
+        let mut app = browse_music();
+        open_fixed_row(&mut app, 1);
+        enter_on(&mut app, "Air");
+        enter_on(&mut app, "Moon Safari");
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(screen[0].starts_with("┌ Moon Safari · Air "), "{screen:#?}");
+        assert!(screen[0].ends_with(" 3 tracks ┐"), "{screen:#?}");
+        assert_eq!(
+            row_words(&screen, "Title"),
+            ["Title", "Artist", "Album", "Time"]
+        );
+        let order: Vec<_> = ["La Femme", "Sexy Boy", "Kelly Watch"]
+            .iter()
+            .map(|n| screen.iter().position(|l| l.contains(n)))
+            .collect();
+        assert!(order.is_sorted() && order[0].is_some(), "{screen:#?}");
+        assert!(
+            row_with(&screen, "Sexy Boy").is_some_and(|r| r.contains("Air")
+                && r.contains("Moon Safari")
+                && r.contains("3:20")),
+            "{screen:#?}"
+        );
+
+        press(&mut app, KeyCode::Backspace);
+        enter_on(&mut app, "All tracks");
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(screen[0].starts_with("┌ Air · All tracks "), "{screen:#?}");
+        assert!(screen[0].ends_with(" 5 tracks ┐"), "{screen:#?}");
+        let moon = screen.iter().position(|l| l.contains("Kelly Watch"));
+        let talkie = screen.iter().position(|l| l.contains("Cherry Blossom"));
+        assert!(moon.is_some() && moon < talkie, "{screen:#?}");
+    }
+
+    /// Specs *Album played through Artists* and *Album playing*.
+    #[test]
+    fn album_played_through_artists_is_marked_on_every_level() {
+        let mut app = browse_music();
+        open_fixed_row(&mut app, 1);
+        enter_on(&mut app, "Air");
+        enter_on(&mut app, "Moon Safari");
+        enter_on(&mut app, "Sexy Boy");
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(marked(&screen, "Sexy Boy"), "{screen:#?}");
+        assert!(!marked(&screen, "La Femme"), "{screen:#?}");
+
+        // The playing row is in the playing style.
+        let buffer = draw_buffer(&app, &mut View::default(), NARROW, 20);
+        let y = screen
+            .iter()
+            .position(|l| l.contains("Sexy Boy"))
+            .unwrap_or(0);
+        let y = u16::try_from(y).unwrap_or(0);
+        assert_eq!(buffer[(6, y)].fg, Color::Green);
+
+        press(&mut app, KeyCode::Backspace);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(marked(&screen, "Moon Safari"), "{screen:#?}");
+        assert!(!marked(&screen, "All tracks"), "{screen:#?}");
+        assert!(!marked(&screen, "Talkie"), "{screen:#?}");
+
+        press(&mut app, KeyCode::Backspace);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(marked(&screen, "Air"), "{screen:#?}");
+        assert!(!marked(&screen, "Björk"), "{screen:#?}");
+
+        let wide = draw(&app, &mut View::default(), 100, 20);
+        assert!(
+            sidebar_row(&wide, "Albums").is_some_and(|r| r.contains('▶')),
+            "{wide:#?}"
+        );
+        assert!(
+            sidebar_row(&wide, "Artists").is_some_and(|r| !r.contains('▶')),
+            "{wide:#?}"
+        );
+
+        // Air's "All tracks" is not the play order, so nothing is marked.
+        enter_on(&mut app, "Air");
+        enter_on(&mut app, "All tracks");
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(!any_marked(&screen), "{screen:#?}");
+
+        open_fixed_row(&mut app, 2);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(marked(&screen, "Moon Safari"), "{screen:#?}");
+        assert!(!marked(&screen, "Talkie"), "{screen:#?}");
+
+        // A paused track keeps its rows marked, with the paused marker.
+        press(&mut app, KeyCode::Char(' '));
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(
+            screen.iter().any(|r| r.starts_with("│ ‖ Moon Safari")),
+            "{screen:#?}"
+        );
+    }
+
+    /// An artist's "All tracks" as the play order marks the artist, "All
+    /// tracks" and the track, but no album.
+    #[test]
+    fn artist_play_order_marks_the_artist_and_all_tracks() {
+        let mut app = browse_music();
+        open_fixed_row(&mut app, 1);
+        enter_on(&mut app, "Air");
+        enter_on(&mut app, "All tracks");
+        enter_on(&mut app, "Venus");
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(marked(&screen, "Venus"), "{screen:#?}");
+
+        press(&mut app, KeyCode::Backspace);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(marked(&screen, "All tracks"), "{screen:#?}");
+        assert!(!marked(&screen, "Moon Safari"), "{screen:#?}");
+        assert!(!marked(&screen, "Talkie"), "{screen:#?}");
+
+        // The album holding the track is not the play order.
+        enter_on(&mut app, "Talkie Walkie");
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(!any_marked(&screen), "{screen:#?}");
+
+        open_fixed_row(&mut app, 2);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(!any_marked(&screen), "{screen:#?}");
+
+        open_fixed_row(&mut app, 1);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(marked(&screen, "Air"), "{screen:#?}");
+        let wide = draw(&app, &mut View::default(), 100, 20);
+        assert!(
+            sidebar_row(&wide, "Artists").is_some_and(|r| r.contains('▶')),
+            "{wide:#?}"
+        );
+    }
+
+    /// Spec *Different play order*: with the library as the play order, the
+    /// album holding the playing track marks nothing.
+    #[test]
+    fn library_play_order_marks_no_browse_row() {
+        let mut app = browse_music();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        open_fixed_row(&mut app, 2);
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(!any_marked(&screen), "{screen:#?}");
+        enter_on(&mut app, "Moon Safari");
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(!any_marked(&screen), "{screen:#?}");
+    }
+
+    /// Spec *Empty library* and a filter matching nothing.
+    #[test]
+    fn empty_and_unmatched_levels_say_so() {
         let mut empty = library(0);
-        keys(&mut empty, &[KeyCode::Tab]);
-        keys(&mut empty, &FIRST_PLAYLIST[..2]);
-        press(&mut empty, KeyCode::Enter);
+        open_fixed_row(&mut empty, 1);
         let screen = draw(&empty, &mut View::default(), 100, 20);
         assert!(screen_contains(&screen, "No artists"), "{screen:#?}");
-        keys(&mut empty, &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter]);
+        assert!(
+            !screen_contains(&screen, "Tracks"),
+            "no header: {screen:#?}"
+        );
+        open_fixed_row(&mut empty, 2);
         let screen = draw(&empty, &mut View::default(), 100, 20);
         assert!(screen_contains(&screen, "No albums"), "{screen:#?}");
+
+        let mut app = browse_music();
+        for (value, noun) in [(1, "artists"), (2, "albums")] {
+            open_fixed_row(&mut app, value);
+            press(&mut app, KeyCode::Char('/'));
+            for c in "zzz".chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            let screen = draw(&app, &mut View::default(), NARROW, 20);
+            let message = format!("No {noun} match 'zzz'");
+            assert!(screen_contains(&screen, &message), "{screen:#?}");
+            press(&mut app, KeyCode::Esc);
+        }
+        enter_on(&mut app, "Debut");
+        press(&mut app, KeyCode::Char('/'));
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let screen = draw(&app, &mut View::default(), NARROW, 20);
+        assert!(
+            screen_contains(&screen, "No tracks match 'zzz'"),
+            "{screen:#?}"
+        );
+    }
+
+    /// Long and wide names are cut inside the pane, in the title and in the
+    /// rows, at every width; the counts keep their place.
+    #[test]
+    fn long_names_stay_inside_the_pane() {
+        let long = "Ω".repeat(200);
+        let wide = "音".repeat(100);
+        let mut tracks = vec![track("Song", &wide, &long)];
+        tracks[0].album_artist = Some(wide.clone());
+        let mut app = App::new(
+            tracks,
+            SilentAudio::default(),
+            no_store(),
+            "/music".to_owned(),
+            None,
+        );
+        app.set_lyrics_on(false);
+        let levels: [&[KeyCode]; 4] = [
+            &[],
+            &[KeyCode::Enter],
+            &[KeyCode::Down, KeyCode::Enter],
+            &[KeyCode::Backspace, KeyCode::Home, KeyCode::Enter],
+        ];
+        open_fixed_row(&mut app, 1);
+        for step in levels {
+            keys(&mut app, step);
+            for width in [NARROW, 40, 100] {
+                let screen = draw(&app, &mut View::default(), width, 12);
+                // The body is 12 - 5 rows: now playing, status and keys
+                // below it; at 100 columns the main pane is on the right.
+                let pane = columns(
+                    &screen,
+                    if width >= TWO_PANE_MIN_WIDTH {
+                        usize::from(sidebar_width(width))
+                    } else {
+                        0
+                    },
+                    usize::from(width),
+                );
+                for line in &pane[..7] {
+                    assert!(line.starts_with(['┌', '│', '└']), "{screen:#?}");
+                    assert!(line.ends_with(['┐', '│', '┘']), "{screen:#?}");
+                }
+            }
+        }
+        // The album table keeps the track count beside the cut names (cut
+        // by the table, like the library's columns).
+        open_fixed_row(&mut app, 2);
+        let screen = draw(&app, &mut View::default(), NARROW, 12);
+        assert!(
+            row_with(&screen[2..], "ΩΩ").is_some_and(|r| r.ends_with(" 1 │")),
+            "{screen:#?}"
+        );
+    }
+
+    /// Every level at tiny and odd sizes, with something playing.
+    #[test]
+    fn browse_levels_at_tiny_sizes_do_not_panic() {
+        let mut app = browse_music();
+        open_fixed_row(&mut app, 1);
+        enter_on(&mut app, "Air");
+        enter_on(&mut app, "Moon Safari");
+        enter_on(&mut app, "Sexy Boy");
+        let steps: [&[KeyCode]; 4] = [
+            &[],
+            &[KeyCode::Backspace],
+            &[KeyCode::Backspace],
+            &[KeyCode::Tab, KeyCode::Down, KeyCode::Enter],
+        ];
+        for step in steps {
+            keys(&mut app, step);
+            let mut view = View::default();
+            for (w, h) in [(1, 1), (2, 3), (5, 8), (10, 9), (13, 10), (69, 11), (70, 6)] {
+                draw(&app, &mut view, w, h);
+            }
+        }
     }
 }
 
