@@ -45,6 +45,10 @@
 //! end; the count leaves "All tracks" out. A row has the playing marker
 //! exactly when [`App::browse_row_playing`] says so, so a track list marks
 //! its track only when its own album or artist is the play order.
+//! The queue view lists the queued tracks in queue order with the library's
+//! columns and no playing marker, titled "Queue" with its count; an empty
+//! queue says "Queue is empty". `D` on the sidebar's "Queue" row asks in a
+//! popup ("Clear the queue (N tracks)? y/n").
 //! Popups are centred over the whole body, panes and strip together.
 //!
 //! The key bar and the help overlay are drawn from [`keys`], the single key
@@ -376,9 +380,11 @@ pub fn render<A: Audio>(frame: &mut Frame, app: &App<A>, view: &mut View, now: I
         Mode::Picker(picker) => render_picker(frame, picker, body),
         Mode::NameInput(input) => render_name_input(frame, input, body),
         Mode::ConfirmDelete(name) => render_confirm_delete(frame, name, body),
+        Mode::ConfirmClearQueue => {
+            render_confirm_clear_queue(frame, app.playback().up_next().len(), body);
+        }
         Mode::Help { scroll } => render_help(frame, *scroll, body.union(playing), view),
-        // Interim: the bottom bar asks until the popup (task 5.1).
-        Mode::Normal | Mode::Search | Mode::ConfirmClearQueue => {}
+        Mode::Normal | Mode::Search => {}
     }
 }
 
@@ -854,8 +860,11 @@ fn render_main<A: Audio>(
     }
 }
 
-/// The up-next queue in the main pane, with the library's columns (interim
-/// until task 5.1 of add-play-queue).
+/// The up-next queue in the main pane, in queue order, with the library's
+/// columns and no playing marker (a queued track leaves the queue when it
+/// starts, and the sidebar's "Queue" row marks it then). An empty queue
+/// says so; a filter with no match says what was looked for. Returns the
+/// list rows that fit.
 fn render_queue<A: Audio>(
     frame: &mut Frame,
     app: &App<A>,
@@ -877,8 +886,11 @@ fn render_queue<A: Audio>(
         };
         return render_empty(frame, offset, inner, message);
     }
-    // Rows are positions valid for this frame's queue; the queue view marks
-    // no row as playing.
+    // Rows are positions valid for this frame's queue: `App::handle_key` and
+    // `App::tick` sync the view (`sync_queue_view`) and the event loop always
+    // ticks before it draws, so tests that change the queue through
+    // `playback_mut` must tick (or press a key) before drawing. The queue
+    // view marks no row as playing.
     debug_assert!(
         list.rows.iter().all(|&pos| pos < up_next.len()),
         "queue view rows are synced with the queue"
@@ -1581,6 +1593,29 @@ fn render_confirm_delete(frame: &mut Frame, name: &str, area: Rect) {
     frame.render_widget(
         Line::styled(
             "y deletes the file (songs stay), other keys cancel",
+            theme::DIM,
+        ),
+        hint_line,
+    );
+}
+
+/// The "clear the queue?" question, naming how many tracks are queued.
+fn render_confirm_clear_queue(frame: &mut Frame, queued: usize, area: Rect) {
+    let popup = centered(area, POPUP_MAX_WIDTH, 4);
+    let block = Block::bordered()
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(" Clear queue ", theme::STRONG));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let [question_line, hint_line] = Layout::vertical([Constraint::Length(1); 2]).areas(inner);
+    let noun = if queued == 1 { "track" } else { "tracks" };
+    let question = format!("Clear the queue ({queued} {noun})? y/n");
+    let room = usize::from(question_line.width);
+    frame.render_widget(Line::from(elide_end(&question, room)), question_line);
+    frame.render_widget(
+        Line::styled(
+            elide_end("y empties the queue, other keys cancel", room),
             theme::DIM,
         ),
         hint_line,
@@ -3703,8 +3738,10 @@ mod tests {
         Ok(())
     }
 
-    /// The queue view (interim drawing): empty, no match, rows without a
-    /// playing marker even for the playing track, and its key bar.
+    /// The queue view: spec *Empty queue*, a 3-entry queue in order with
+    /// duplicates, the title and count, the library's columns, rows without
+    /// a playing marker even for the playing track, no match with a filter,
+    /// and its key bar (spec *Queue view bar*).
     #[test]
     fn queue_view_lists_the_queue_with_its_bar() {
         let mut app = library(3);
@@ -3730,6 +3767,14 @@ mod tests {
         let screen = draw(&app, &mut View::default(), 100, 20);
         assert!(screen_contains(&screen, " Queue "), "{screen:#?}");
         assert!(screen_contains(&screen, " 3 tracks "), "{screen:#?}");
+        let main = columns(&screen, usize::from(MAIN_X), 100);
+        assert!(
+            main.iter().any(|l| l.contains("Title")
+                && l.contains("Artist")
+                && l.contains("Album")
+                && l.contains("Time")),
+            "{screen:#?}"
+        );
         let marker = state_marker(PlayState::Playing);
         let main = columns(&screen, usize::from(MAIN_X), 100);
         let rows: Vec<&String> = main.iter().filter(|l| l.contains("Song 0")).collect();
@@ -3746,11 +3791,41 @@ mod tests {
             screen_contains(&screen, "No tracks match 'zzz'"),
             "{screen:#?}"
         );
+        assert!(screen_contains(&screen, " 0 of 3 "), "{screen:#?}");
     }
 
-    /// The clear prompt's bar (the popup comes with task 5.1).
+    /// Below [`TWO_PANE_MIN_WIDTH`] the focused queue view is drawn alone,
+    /// full width, with its rows, title and bar.
     #[test]
-    fn clear_queue_prompt_has_its_bar() {
+    fn queue_view_in_a_narrow_terminal() {
+        let mut app = library(3);
+        app.playback_mut().enqueue(&[1, 0], false);
+        keys(&mut app, &[KeyCode::Tab]);
+        keys(&mut app, &FIRST_PLAYLIST[..FIXED_ROWS]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.main_view(), MainView::Queue);
+        let screen = draw(&app, &mut View::default(), 60, 20);
+        assert!(screen[0].starts_with("┌ Queue "), "{screen:#?}");
+        assert!(!screen_contains(&screen, "Library"), "{screen:#?}");
+        let rows: Vec<&String> = screen.iter().filter(|l| l.contains("Song 0")).collect();
+        assert_eq!(rows.len(), 2, "{screen:#?}");
+        assert!(rows[0].contains("Song 01") && rows[1].contains("Song 00"));
+        assert!(
+            key_bar(&screen).starts_with("Enter play · d remove"),
+            "{screen:#?}"
+        );
+
+        // Emptied while shown: says so.
+        app.playback_mut().clear_queued();
+        app.tick(Instant::now());
+        let screen = draw(&app, &mut View::default(), 60, 20);
+        assert!(screen_contains(&screen, "Queue is empty"), "{screen:#?}");
+    }
+
+    /// The clear prompt: its popup names the queued tracks (singular and
+    /// plural), centred over the body, and its own bar.
+    #[test]
+    fn clear_queue_prompt_has_its_popup_and_bar() {
         let mut app = library(3);
         app.playback_mut().enqueue(&[0], false);
         keys(&mut app, &[KeyCode::Tab]);
@@ -3762,6 +3837,43 @@ mod tests {
             key_bar(&screen).trim_end(),
             "y clear · any other key cancel"
         );
+        assert!(screen_contains(&screen, " Clear queue "), "{screen:#?}");
+        assert!(
+            screen_contains(&screen, "Clear the queue (1 track)? y/n"),
+            "{screen:#?}"
+        );
+        assert!(
+            screen_contains(&screen, "y empties the queue, other keys cancel"),
+            "{screen:#?}"
+        );
+
+        // The count is the queue's at draw time.
+        app.playback_mut().enqueue(&[1, 2], true);
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        assert!(
+            screen_contains(&screen, "Clear the queue (3 tracks)? y/n"),
+            "{screen:#?}"
+        );
+
+        // Cut to fit, never panics, at any size.
+        for (w, h) in [(0, 0), (1, 1), (2, 3), (10, 5), (30, 8), (80, 4), (5, 80)] {
+            draw(&app, &mut View::default(), w, h);
+        }
+        let screen = draw(&app, &mut View::default(), 30, 20);
+        let question = screen.iter().find(|l| l.contains("Clear the queue"));
+        assert!(
+            question.is_some_and(|l| l.contains('…') && !l.contains("y/n")),
+            "{screen:#?}"
+        );
+
+        // Answering closes it.
+        press(&mut app, KeyCode::Char('n'));
+        let screen = draw(&app, &mut View::default(), 100, 20);
+        assert!(
+            !screen_contains(&screen, "Clear the queue ("),
+            "{screen:#?}"
+        );
+        assert_eq!(app.playback().up_next().len(), 3);
     }
 
     /// Short sidebars: the fixed rows are cut from the bottom, the separator

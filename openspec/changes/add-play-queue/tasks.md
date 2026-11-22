@@ -30,7 +30,7 @@ Every group ends green before it is handed off for review: `cargo test` (the who
 
 ## 5. Rendering (`src/ui.rs`)
 
-- [ ] 5.1 Render the queue view and the clear popup: title "Queue" with its count via `count_title`, the library's track columns, no playing marker in its rows, "Queue is empty" through `render_empty` when empty, the library's no-match message with a filter, and `BarContext::Queue` from `bar_context` (replacing the 3.2 interim arms). Only `theme` styles and sanitised text. Update the `ui.rs` `//!` doc and its `CLAUDE.md` line. Verify with `TestBackend` tests: a 3-entry queue, *Empty queue*, a narrow (< 70 columns) terminal, the sidebar "Queue" row with its marker while a queued track plays, the bottom bar in the queue view, and the clear popup ("Clear the queue (N tracks)? y/n") with its bar, replacing the 3.4 interim arm.
+- [x] 5.1 Render the queue view and the clear popup: title "Queue" with its count via `count_title`, the library's track columns, no playing marker in its rows, "Queue is empty" through `render_empty` when empty, the library's no-match message with a filter, and `BarContext::Queue` from `bar_context` (replacing the 3.2 interim arms). Only `theme` styles and sanitised text. Update the `ui.rs` `//!` doc and its `CLAUDE.md` line. Verify with `TestBackend` tests: a 3-entry queue, *Empty queue*, a narrow (< 70 columns) terminal, the sidebar "Queue" row with its marker while a queued track plays, the bottom bar in the queue view, and the clear popup ("Clear the queue (N tracks)? y/n") with its bar, replacing the 3.4 interim arm.
 
 ## 6. Integration
 
