@@ -33,7 +33,7 @@ The system SHALL restore the terminal to its original state (cursor, raw mode, a
 - **THEN** the program quits the same way as `q`
 
 ### Requirement: Screen layout
-The system SHALL show a sidebar ("Library", "Artists" and "Albums" entries followed by the saved playlists) and a main pane with what the entry chosen in it shows (tracks, artists or albums), above a now-playing area of at most three rows. On terminals wide enough for the lyrics pane, with the lyrics pane on, a lyrics pane SHALL be shown as a third column to the right of the main pane. On terminals tall enough for the spectrum strip, with the visualizer on, a spectrum strip SHALL be shown across the full width between the panes and the now-playing area. The now-playing area SHALL show the state, title, artist, album, the volume, shuffle and repeat indicators, and a progress bar with elapsed and total time. Below it SHALL be a status line and a bottom bar with the main keys for the current focus and mode; in Normal mode the bar SHALL end with `? help`.
+The system SHALL show a sidebar ("Library", "Artists", "Albums" and "Queue" entries followed by the saved playlists) and a main pane with what the entry chosen in it shows (tracks, artists, albums or the queued tracks), above a now-playing area of at most three rows. On terminals wide enough for the lyrics pane, with the lyrics pane on, a lyrics pane SHALL be shown as a third column to the right of the main pane. On terminals tall enough for the spectrum strip, with the visualizer on, a spectrum strip SHALL be shown across the full width between the panes and the now-playing area. The now-playing area SHALL show the state, title, artist, album, the volume, shuffle and repeat indicators, and a progress bar with elapsed and total time. Below it SHALL be a status line and a bottom bar with the main keys for the current focus and mode; in Normal mode the bar SHALL end with `? help`.
 
 #### Scenario: Track playing
 - **WHEN** "Song" by "Band" is playing at 1:05 of 3:30
@@ -41,7 +41,7 @@ The system SHALL show a sidebar ("Library", "Artists" and "Albums" entries follo
 
 #### Scenario: Both panes visible
 - **WHEN** the terminal is 100 columns wide and the main pane shows the library
-- **THEN** the sidebar on the left lists "Library", "Artists", "Albums" and every saved playlist with its track count, and the main pane to its right lists the library's tracks
+- **THEN** the sidebar on the left lists "Library", "Artists", "Albums", "Queue" and every saved playlist with its track count, and the main pane to its right lists the library's tracks
 
 #### Scenario: Browsing shown in the main pane
 - **WHEN** the user opens the album "Moon Safari" by "Air" through "Artists"
