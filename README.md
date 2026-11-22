@@ -13,6 +13,8 @@ leaving the terminal.
   tracks) and play one album, or everything by one artist, as its own play
   order
 - Play, pause, stop, next/previous, seek, volume, automatic advance
+- An up-next queue: line up tracks, albums or artists to play next, then
+  carry on with the album, playlist or library you were listening to
 - Shuffle and repeat (off / all / one)
 - Live search with `/` over title, artist and album
 - Playlists saved as `.m3u8` files inside your music folder, playable on
@@ -127,15 +129,16 @@ the status bar says how many entries were left out.
 
 ## The screen
 
-- **Sidebar** (left): "Library", "Artists" and "Albums" (with their track,
-  artist and album counts), then your playlists with their track counts.
-  Read-only playlists are drawn dimmed. While a track is loaded, the entry
-  that is the play order carries the playing marker (`▶`, `‖` or `■`):
-  "Artists" for an artist's tracks, "Albums" for an album (also one opened
-  through "Artists").
+- **Sidebar** (left): "Library", "Artists", "Albums" and "Queue" (with
+  their track, artist, album and queued-track counts), then your playlists
+  with their track counts. Read-only playlists are drawn dimmed. While a
+  track is loaded, the entry that is the play order carries the playing
+  marker (`▶`, `‖` or `■`): "Artists" for an artist's tracks, "Albums" for
+  an album (also one opened through "Artists"), and "Queue" while a queued
+  track plays.
 - **Main pane** (right): what the entry chosen in the sidebar shows: the
-  tracks of the whole library or one playlist (title, artist, album and
-  length), or a browse level (see [Browsing](#browsing-artists-and-albums)).
+  tracks of the whole library, one playlist or the queue (title, artist,
+  album and length), or a browse level (see [Browsing](#browsing-artists-and-albums)).
 - One pane has the keyboard focus: its border is highlighted and its
   selected row is drawn in reverse video; the other pane's selected row is
   only bold and underlined. `Tab` moves the focus.
@@ -250,7 +253,31 @@ four entries, and `D` only clears a non-empty queue on "Queue".
 
 Queued tracks play before the play order (the list you last played from)
 goes on from where it was; playing from another list keeps the queue. The
-queue holds up to 1000 tracks.
+queue holds up to 1000 tracks (duplicates allowed); when adding would go
+over, only the first tracks that fit are added and the status line says so.
+
+- `n`, or the end of a track, plays the first queued track and takes it out
+  of the queue. Once the queue is empty, the play order continues with the
+  track after the one it was on. With nothing loaded, `n` and `Space` start
+  the queue.
+- Shuffle only applies to the play order: queued tracks always play in
+  queue order. Repeat one replays the current track (queued or not) when it
+  ends, so the queue waits for `n`. A played track never goes back into the
+  queue.
+- `p` on a queued track restarts it once it is more than 3 seconds in.
+  Before that it goes back to the play order's track that was playing
+  before the queue took over, from the start (or restarts the queued track
+  if the play order has nothing current).
+- When the queue is empty and the play order is at its last track with
+  repeat off, `n` on a queued track says it is already the last track, and
+  the queued track's end stops playback (`Space` plays it again).
+- A queued track that can't be played is reported, and the next queued
+  track, or else the play order, plays instead. Queued tracks don't count
+  toward stopping when every track of the play order fails.
+- While a queued track plays, "Queue" carries the playing marker in the
+  sidebar and no playlist entry, artist, album or track row of the play
+  order does; the library still marks the playing track. The queue view
+  marks no row: a track leaves the queue when it starts.
 
 ### Browsing
 
@@ -372,9 +399,10 @@ kasset remembers between runs:
   mode, and whether the visualizer and the lyrics pane are shown.
 - **For each music folder** (the last 20 opened, identified by their full
   resolved path): the current track and its position, whether it was played
-  from the library, a playlist, an artist or an album, and which playlist
-  the main pane shows. The artist or album shown in the main pane is not
-  remembered: the library (or the saved playlist) is shown on start.
+  from the library, a playlist, an artist or an album, which playlist the
+  main pane shows, and the queue (in order). The artist or album shown in
+  the main pane is not remembered: the library (or the saved playlist) is
+  shown on start.
 
 When you open a folder again, its track is loaded **paused** at the saved
 position, never playing on its own: `Space` continues it. Next and previous
@@ -387,6 +415,15 @@ became shorter, or can't seek), the track starts paused at 0:00. A resume
 point that can't be used (the track's drive isn't mounted, say) is kept,
 and used on a later start once the track is found again, until you play
 something else in that folder.
+
+The queue comes back in order, without the tracks the scan no longer finds
+(those are dropped, even if their drive is only unmounted). If a queued
+track was playing, it is resumed paused at its position, and once the queue
+is empty the play order continues after the track it was playing before
+the queue took over. If that queued track is gone, the play order's track
+is resumed at 0:00 instead; if only the play order's track is gone, the
+queued track is resumed and the library becomes the play order. A very long queue is cut from its end so the
+file stays within 64 KiB.
 
 The state is saved when you quit (`q`, `Ctrl+C`) and when a `SIGINT`,
 `SIGTERM` or `SIGHUP` stops kasset, as long as the save completes within the
@@ -415,9 +452,10 @@ The file is:
   symlink the `kasset` folder instead.
 - A state file from a newer kasset is left untouched: the older version
   starts with the defaults and says so once.
-- **Privacy:** the file lists the music folders you opened and the track you
-  were last playing in each. On Linux and macOS it is readable by you only
-  (mode `0600`, in a folder created with mode `0700`). Use `--no-state` for
+- **Privacy:** the file lists the music folders you opened, the track you
+  were last playing in each and its queued tracks. On Linux and macOS it
+  is readable by you only (mode `0600`, in a folder created with mode
+  `0700`). Use `--no-state` for
   a session that leaves no trace, or delete the file.
 
 ## Terminal notes
