@@ -34,8 +34,8 @@ Every group ends green before it is handed off for review: `cargo test` (the who
 
 ## 6. Integration
 
-- [ ] 6.1 End to end in a real terminal (pty and pyte harness, reusing `openspec/changes/archive/2026-11-20-add-artist-album-browsing/e2e/e2e_browse.py`): play an album track, queue two tracks with `e` and one with `E`, check the order they play in and the markers, open the queue view and reorder and remove an entry, quit while a queued track plays, restart, and check that it resumes paused with the rest of the queue and then the album continuing. Verify by recording the screens and the state file contents next to the harness under `openspec/changes/add-play-queue/e2e/`.
-- [ ] 6.2 `cargo +1.89 build` (MSRV, no new dependencies) and the full `cargo clippy --all-targets -- -D warnings` / `cargo test` pass. Update `CLAUDE.md`'s OpenSpec section (active change, then none after archive) and the current specs list (`play-queue`), and add a README feature bullet. Verify by reading the README against the specs and `kasset --help`.
+- [x] 6.1 End to end in a real terminal (pty and pyte harness, reusing `openspec/changes/archive/2026-11-20-add-artist-album-browsing/e2e/e2e_browse.py`): play an album track, queue two tracks with `e` and one with `E`, check the order they play in and the markers, open the queue view and reorder and remove an entry, quit while a queued track plays, restart, and check that it resumes paused with the rest of the queue and then the album continuing. Verify by recording the screens and the state file contents next to the harness under `openspec/changes/add-play-queue/e2e/`.
+- [x] 6.2 `cargo +1.89 build` (MSRV, no new dependencies) and the full `cargo clippy --all-targets -- -D warnings` / `cargo test` pass. Update `CLAUDE.md`'s OpenSpec section (active change, then none after archive) and the current specs list (`play-queue`), and add a README feature bullet. Verify by reading the README against the specs and `kasset --help`.
 
 ## Workflow follow-up
 
