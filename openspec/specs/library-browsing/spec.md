@@ -139,7 +139,7 @@ With the main pane focused on an artist's albums, an album, or "All tracks", `Ba
 - **THEN** the first track of Air's second album plays
 
 ### Requirement: Playing markers in browse views
-While a track is loaded, the sidebar SHALL mark "Artists" when an artist is the play order and "Albums" when an album is. An album row SHALL have the playing marker when that album is the play order; an artist row when that artist is the play order or one of its albums is; the "All tracks" row when that artist is the play order. In a list of tracks, the playing track SHALL have the playing marker only when that album or artist is the play order.
+While a track is loaded, the sidebar SHALL mark "Artists" when an artist is the play order and "Albums" when an album is. An album row SHALL have the playing marker when that album is the play order; an artist row when that artist is the play order or one of its albums is; the "All tracks" row when that artist is the play order. In a list of tracks, the playing track SHALL have the playing marker only when that album or artist is the play order. While a queued track is current, none of these rows SHALL have the playing marker, and neither "Artists" nor "Albums" in the sidebar (see the play-queue capability).
 
 #### Scenario: Album playing
 - **WHEN** "Moon Safari" is the play order and the user opens the album list
@@ -152,6 +152,10 @@ While a track is loaded, the sidebar SHALL mark "Artists" when an artist is the 
 #### Scenario: Different play order
 - **WHEN** the library is the play order and the user opens the album holding the playing track
 - **THEN** no track in that album has the playing marker
+
+#### Scenario: Queued track playing
+- **WHEN** "Moon Safari" is the play order, a queued track is playing, and the user opens Artists → "Air"
+- **THEN** neither "Air" nor "Moon Safari" has the playing marker, and the sidebar marks "Queue", not "Albums"
 
 ### Requirement: Add browsed tracks to a playlist
 In a list of tracks, `a` SHALL offer to add the selected track to a playlist and `A` every listed track, as in the library. On an artist, album or "All tracks" row, `a` SHALL offer to add all of that entry's tracks, in the order listed when it is opened.
